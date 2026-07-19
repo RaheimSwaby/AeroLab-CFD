@@ -36,6 +36,7 @@ The current version loads and repairs STL scans, creates OpenFOAM Foundation v13
 - Actual body `y+` verification after a completed run
 - Two-way fidelity audit between the transformed STL and the actual solved OpenFOAM body patch
 - Solver-derived, speed-colored VTK streamlines in the browser when OpenFOAM output is present
+- Shareable Markdown or self-contained HTML result reports from `report-case`
 - Sample STL model for smoke testing
 
 ## Quick Start
@@ -155,6 +156,20 @@ Read available force coefficient results:
 ```powershell
 aerolab report-case .\cases\sample-ref
 ```
+
+Export a shareable summary as Markdown or self-contained HTML:
+
+```powershell
+aerolab report-case .\cases\sample-ref --format markdown --output report.md
+aerolab report-case .\cases\sample-ref --format html --output report.html
+```
+
+The report gathers the verified/unverified status, mean `Cd`/`Cl`, drag and
+downforce in newtons and pounds-force, the case setup, every verification
+check, and mesh/convergence metrics. Fields that are not available yet (for a
+case that has been set up but not solved) render as an em dash. Without
+`--output`, the report prints to standard output; `--format json` and the
+default human-readable text output are unchanged.
 
 The generated cases target OpenFOAM Foundation v13. After a completed run, AeroLab compares sampled points on the transformed STL and the actual OpenFOAM body patch in both directions using exact point-to-triangle distance queries. It checks p95/p99 deviation, dimensions, frontal silhouette, requested feature resolution, final boundary-layer coverage, and the body `y+` distribution. AeroLab only labels a result verified when that body-fidelity audit passes, the solver exits successfully, baseline `checkMesh` passes, velocity/pressure/turbulence residuals meet the selected preset, at least 30 force samples stabilize, and wall treatment is compatible with the generated mesh. A completed process can therefore remain unverified, which is intentional. Final aerodynamic claims still require the three-level accuracy study and real-world validation against measured dimensions or test data.
 

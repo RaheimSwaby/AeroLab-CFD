@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from .case import create_case
+from .report import render_html, render_markdown
 from .solver import case_report, run_case, solver_status
 from .stl import inspect_stl
 from .webapp import run_app
@@ -17,7 +19,32 @@ UNIT_SCALES = {
 }
 
 
+def _report_text(report: dict[str, object]) -> str:
+    lines = [
+        f"Case: {report.get('caseName')}",
+        f"Status: {report.get('status')}",
+    ]
+    assessment = report.get("qualityAssessment") or {}
+    verified = isinstance(assessment, dict) and assessment.get("trusted")
+    lines.append(f"Verified: {'yes' if verified else 'no'}")
+    force_coeffs = report.get("forceCoeffs")
+    if isinstance(force_coeffs, dict):
+        lines.append(f"Mean Cd: {force_coeffs.get('meanCd')}")
+        lines.append(f"Mean Cl: {force_coeffs.get('meanCl')}")
+        lines.append(f"Source: {force_coeffs.get('file')}")
+    else:
+        lines.append("No force coefficient output found.")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Reports contain Unicode (em dash, superscripts, status glyphs); keep console
+    # output from crashing on legacy code pages such as Windows cp1252.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
+
     parser = argparse.ArgumentParser(
         prog="aerolab",
         description="Local-first CFD workflow tools for external aerodynamics.",
@@ -220,9 +247,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     report_parser.add_argument("case", type=Path, help="Path to a generated case folder.")
     report_parser.add_argument(
+        "--format",
+        choices=["text", "json", "markdown", "html"],
+        default="text",
+        help="Output format for the case report.",
+    )
+    report_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Write the report to this file instead of standard output.",
+    )
+    report_parser.add_argument(
         "--json",
         action="store_true",
-        help="Print case report as JSON.",
+        help="Shortcut for --format json.",
     )
 
     args = parser.parse_args(argv)
@@ -314,20 +352,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "report-case":
         report = case_report(args.case)
-        if args.json:
-            print(json.dumps(report, indent=2))
+        report_format = "json" if args.json else args.format
+        if report_format == "json":
+            content = json.dumps(report, indent=2)
+        elif report_format == "markdown":
+            content = render_markdown(report)
+        elif report_format == "html":
+            content = render_html(report)
         else:
-            print(f"Case: {report.get('caseName')}")
-            print(f"Status: {report.get('status')}")
-            assessment = report.get("qualityAssessment") or {}
-            print(f"Verified: {'yes' if assessment.get('trusted') else 'no'}")
-            force_coeffs = report.get("forceCoeffs")
-            if force_coeffs:
-                print(f"Mean Cd: {force_coeffs.get('meanCd')}")
-                print(f"Mean Cl: {force_coeffs.get('meanCl')}")
-                print(f"Source: {force_coeffs.get('file')}")
-            else:
-                print("No force coefficient output found.")
+            content = _report_text(report)
+        if args.output:
+            args.output.write_text(content + "\n", encoding="utf-8")
+            print(f"Report written to {args.output}")
+        else:
+            print(content)
         return 0
 
     parser.error(f"Unknown command: {args.command}")
