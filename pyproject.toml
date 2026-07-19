@@ -15,6 +15,11 @@ dependencies = [
   "numpy>=1.24",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6",
+]
+
 [project.scripts]
 aerolab = "aerolab.cli:main"
 
@@ -23,3 +28,12 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 aerolab = ["web/*", "web/vendor/*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+# pyflakes (F), a focused pycodestyle subset (E4/E7/E9), import sorting (I),
+# and safe pyupgrade rules (UP). Line length (E501) is intentionally not enforced.
+select = ["E4", "E7", "E9", "F", "I", "UP"]

@@ -10,10 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..openfoam import ensure_case_postprocessing
+from .analysis import _latest_body_surface_vtk, assess_meshed_surface_fidelity, case_report
 from .backends import _run_command, _select_backend, solver_status
 from .util import _read_json_object
-from .analysis import _latest_body_surface_vtk, assess_meshed_surface_fidelity, case_report
-
 
 MESH_INPUT_FILES = (
     "constant/geometry/body.stl",

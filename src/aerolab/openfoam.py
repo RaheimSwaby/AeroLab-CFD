@@ -5,7 +5,6 @@ from pathlib import Path
 
 from .stl import Bounds, StlReport, Vector, write_transformed_binary_stl
 
-
 AXES = {"x": 0, "y": 1, "z": 2}
 SIMULATION_MODES = {"steady", "transient"}
 

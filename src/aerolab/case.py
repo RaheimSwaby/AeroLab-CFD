@@ -16,7 +16,6 @@ from .openfoam import (
 from .repair import is_prepared_model_path, repair_fidelity_for_model
 from .stl import inspect_stl, transformed_report, translated_report
 
-
 GEOMETRY_DIMENSION_TOLERANCE = 0.02
 STANDARD_AIR_DENSITY_KG_M3 = 1.225
 STANDARD_KINEMATIC_VISCOSITY_M2_S = 1.5e-5

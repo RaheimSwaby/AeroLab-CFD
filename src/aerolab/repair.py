@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import heapq
+import json
 import math
 import struct
 from collections import defaultdict, deque
@@ -20,7 +20,6 @@ from .stl import (
     report_for_triangles,
     write_binary_stl_triangles,
 )
-
 
 DEFAULT_REPAIR_RESOLUTION = 384
 MAX_REPAIR_DIMENSION_CHANGE = 0.02
@@ -257,7 +256,6 @@ def repair_stl(
             )
 
     voxel_size = longest / float(resolution)
-    detail_resolution = voxel_size / longest
     margin = 3
     shape = tuple(max(8, int(math.ceil(value / voxel_size)) + margin * 2) for value in dimensions)
     origin = np.asarray(bounds.minimum, dtype=np.float64) - voxel_size * margin

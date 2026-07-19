@@ -15,7 +15,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-
 OPENFOAM_BOOTSTRAP = r"""
 if ! command -v foamRun >/dev/null 2>&1; then
   if [ -f /opt/openfoam13/etc/bashrc ]; then

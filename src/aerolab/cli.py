@@ -9,7 +9,6 @@ from .solver import case_report, run_case, solver_status
 from .stl import inspect_stl
 from .webapp import run_app
 
-
 UNIT_SCALES = {
     "m": 1.0,
     "mm": 0.001,

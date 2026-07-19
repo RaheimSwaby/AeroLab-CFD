@@ -7,9 +7,8 @@ import math
 from pathlib import Path
 
 from ..stl import mesh_preview
-from .util import _percentile, _read_json_object
 from .parsing import _vtk_field, _vtk_header, _vtk_values
-
+from .util import _percentile, _read_json_object
 
 CASE_PREVIEW_TRIANGLE_LIMIT = 30_000
 
@@ -406,7 +405,6 @@ def parse_surface_pressure(
         for index in range(len(triangles))
     ]
     skin_drag_coefficient = raw_drag_summary.get("skinFrictionDragCoefficient") if has_wall_shear else None
-    pressure_drag_coefficient = drag_summary.get("pressureDragCoefficient")
     total_drag_coefficient = raw_drag_summary.get("totalDragCoefficient") if has_wall_shear else None
     total_drag_min = min(triangle_total_drag_values, default=0.0)
     total_drag_max = max(triangle_total_drag_values, default=0.0)

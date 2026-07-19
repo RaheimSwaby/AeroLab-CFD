@@ -13,12 +13,12 @@ from aerolab.repair import (
     _nearest_triangle_distances,
     _projected_area_change,
     _repair_local_non_manifold_overlays,
-    _retriangulate_degenerate_faces,
     _repair_rejection_reasons,
+    _retriangulate_degenerate_faces,
     _surface_deviation_metrics,
     _symmetric_surface_deviation,
-    repair_stl,
     repair_fidelity_for_model,
+    repair_stl,
 )
 from aerolab.stl import (
     Bounds,

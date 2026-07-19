@@ -3,10 +3,9 @@ from __future__ import annotations
 import math
 import struct
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
-
 
 Vector = tuple[float, float, float]
 Triangle = tuple[Vector, Vector, Vector]
@@ -60,7 +59,7 @@ class ProjectedAreas:
             return self.z
         raise ValueError(f"Unsupported axis: {axis}")
 
-    def scaled(self, scale: float) -> "ProjectedAreas":
+    def scaled(self, scale: float) -> ProjectedAreas:
         factor = scale * scale
         return ProjectedAreas(
             x=self.x * factor,
@@ -267,7 +266,6 @@ def detect_aero_features_for_triangles(triangles: list[Triangle]) -> dict[str, o
 
     candidates: list[dict[str, object]] = []
     for component in components:
-        vertices = [vertex for index in component for vertex in triangles[index]]
         component_bounds = _bounds([triangles[index] for index in component])
         x_span, y_span, z_span = component_bounds.dimensions
         area = sum(candidate_values[index][0] for index in component)

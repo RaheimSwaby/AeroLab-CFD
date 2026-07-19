@@ -7,10 +7,24 @@ import os
 import re
 from pathlib import Path
 
-from ..stl import Triangle, read_stl_triangles, silhouette_projected_area_for_axis, silhouette_projected_areas_for_triangles
 from ..repair import repair_fidelity_for_model, surface_deviation_metrics
+from ..stl import (
+    Triangle,
+    read_stl_triangles,
+    silhouette_projected_area_for_axis,
+    silhouette_projected_areas_for_triangles,
+)
+from .parsing import (
+    _vtk_header,
+    _vtk_values,
+    parse_check_mesh,
+    parse_force_coeffs,
+    parse_layer_coverage,
+    parse_residuals,
+    parse_transient_state,
+    parse_y_plus,
+)
 from .util import _finite_number, _read_json_object
-from .parsing import _vtk_header, _vtk_values, parse_check_mesh, parse_force_coeffs, parse_layer_coverage, parse_residuals, parse_transient_state, parse_y_plus
 from .visualization import _case_visualization
 
 

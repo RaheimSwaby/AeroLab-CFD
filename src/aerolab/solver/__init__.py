@@ -13,10 +13,15 @@ re-exported here so callers keep importing everything from ``aerolab.solver``:
 
 from __future__ import annotations
 
+from .analysis import (  # noqa: F401
+    assess_meshed_surface_fidelity,
+    case_report,
+    case_run_progress,
+)
 from .backends import (  # noqa: F401
     OPENFOAM_BOOTSTRAP,
-    solver_status,
     _run_command,
+    solver_status,
 )
 from .parsing import (  # noqa: F401
     parse_check_mesh,
@@ -26,20 +31,15 @@ from .parsing import (  # noqa: F401
     parse_transient_state,
     parse_y_plus,
 )
+from .run import (  # noqa: F401
+    SolverRunResult,
+    _clear_previous_solver_outputs,
+    _mesh_input_fingerprint,
+    _mesh_record_reusable,
+    run_case,
+)
 from .visualization import (  # noqa: F401
     CASE_PREVIEW_TRIANGLE_LIMIT,
     parse_streamlines,
     parse_surface_pressure,
-)
-from .analysis import (  # noqa: F401
-    assess_meshed_surface_fidelity,
-    case_report,
-    case_run_progress,
-)
-from .run import (  # noqa: F401
-    SolverRunResult,
-    run_case,
-    _clear_previous_solver_outputs,
-    _mesh_input_fingerprint,
-    _mesh_record_reusable,
 )
