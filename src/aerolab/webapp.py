@@ -1,0 +1,591 @@
+from __future__ import annotations
+
+import json
+import math
+import mimetypes
+import re
+import threading
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+from .case import create_case
+from .repair import repair_fidelity_for_model, repair_stl
+from .solver import case_report, case_run_progress, run_case, solver_status
+from .stl import detect_aero_features, inspect_stl, mesh_preview
+
+
+class AeroLabServer(ThreadingHTTPServer):
+    def __init__(self, server_address: tuple[str, int], root: Path):
+        super().__init__(server_address, AeroLabHandler)
+        self.root = root.resolve()
+        self.web_root = Path(__file__).parent / "web"
+        self.active_runs: dict[Path, threading.Thread] = {}
+        self.active_runs_lock = threading.Lock()
+
+    def start_case_run(
+        self,
+        case_path: Path,
+        backend: str,
+        timeout_seconds: int,
+        run_mode: str,
+        reuse_mesh: bool,
+    ) -> None:
+        with self.active_runs_lock:
+            existing = self.active_runs.get(case_path)
+            if existing is not None and existing.is_alive():
+                raise ValueError("This case already has an active OpenFOAM run.")
+            worker = threading.Thread(
+                target=self._run_case_worker,
+                args=(case_path, backend, timeout_seconds, run_mode, reuse_mesh),
+                name=f"aerolab-{run_mode}-{case_path.name}",
+                daemon=True,
+            )
+            self.active_runs[case_path] = worker
+            worker.start()
+
+    def _run_case_worker(
+        self,
+        case_path: Path,
+        backend: str,
+        timeout_seconds: int,
+        run_mode: str,
+        reuse_mesh: bool,
+    ) -> None:
+        try:
+            run_case(
+                case_path,
+                backend=backend,
+                timeout_seconds=timeout_seconds,
+                run_mode=run_mode,
+                reuse_mesh=reuse_mesh,
+            )
+        except Exception as exc:
+            _record_background_run_failure(case_path, run_mode, backend, exc)
+        finally:
+            with self.active_runs_lock:
+                self.active_runs.pop(case_path, None)
+
+
+class AeroLabHandler(BaseHTTPRequestHandler):
+    server: AeroLabServer
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
+            self._send_file(self.server.web_root / "index.html", "text/html; charset=utf-8")
+            return
+        if parsed.path.startswith("/assets/"):
+            asset = self.server.web_root / parsed.path.removeprefix("/assets/")
+            self._send_file(asset)
+            return
+        if parsed.path == "/api/state":
+            self._send_json(self._state())
+            return
+        if parsed.path == "/api/solver":
+            self._send_json(solver_status())
+            return
+        if parsed.path == "/api/case-progress":
+            try:
+                self._handle_case_progress(parsed.query)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if parsed.path == "/api/model-file":
+            try:
+                self._handle_model_file(parsed.query)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        self.send_error(404)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/api/check":
+                self._handle_upload_check(parsed.query)
+                return
+            if parsed.path == "/api/check-model":
+                self._handle_check_model()
+                return
+            if parsed.path == "/api/repair-model":
+                self._handle_repair_model()
+                return
+            if parsed.path == "/api/analyze-features":
+                self._handle_analyze_features()
+                return
+            if parsed.path == "/api/cases":
+                self._handle_create_case()
+                return
+            if parsed.path == "/api/accuracy-study":
+                self._handle_create_accuracy_study()
+                return
+            if parsed.path == "/api/run-case":
+                self._handle_run_case()
+                return
+            if parsed.path == "/api/case-report":
+                self._handle_case_report()
+                return
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        self.send_error(404)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+    def _handle_upload_check(self, query: str) -> None:
+        params = parse_qs(query)
+        filename = params.get("filename", ["model.stl"])[0]
+        safe_name = _safe_filename(unquote(filename))
+        data = self.rfile.read(_content_length(self.headers.get("Content-Length")))
+        if not data:
+            raise ValueError("No model file was received.")
+        if not safe_name.lower().endswith(".stl"):
+            raise ValueError("Only STL files are supported right now.")
+
+        upload_dir = self.server.root / "models" / "uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        model_path = upload_dir / f"{stamp}-{safe_name}"
+        model_path.write_bytes(data)
+
+        report = inspect_stl(model_path)
+        self._send_json(
+            {
+                "ok": True,
+                "modelPath": str(model_path),
+                "report": _report_payload(model_path, report),
+                "preview": mesh_preview(model_path),
+            }
+        )
+
+    def _handle_check_model(self) -> None:
+        payload = self._json_body()
+        model_path = self._resolve_project_path(str(payload["modelPath"]))
+        report = inspect_stl(model_path)
+        self._send_json(
+            {
+                "ok": True,
+                "modelPath": str(model_path),
+                "report": _report_payload(model_path, report),
+                "preview": mesh_preview(model_path),
+            }
+        )
+
+    def _handle_model_file(self, query: str) -> None:
+        params = parse_qs(query)
+        value = params.get("path", [None])[0]
+        if not value:
+            raise ValueError("A model path is required.")
+        model_path = self._resolve_project_path(unquote(value))
+        if model_path.suffix.lower() != ".stl" or not model_path.is_file():
+            raise ValueError("Only project STL files can be loaded by the viewer.")
+        data = model_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "model/stl")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_case_progress(self, query: str) -> None:
+        params = parse_qs(query)
+        value = params.get("casePath", [None])[0]
+        if not value:
+            raise ValueError("A case path is required.")
+        case_path = self._resolve_project_path(unquote(value))
+        if not (case_path / "case.json").is_file():
+            raise ValueError("The selected folder is not an AeroLab case.")
+        self._send_json({"ok": True, "progress": case_run_progress(case_path)})
+
+    def _handle_repair_model(self) -> None:
+        payload = self._json_body()
+        model_path = self._resolve_project_path(str(payload["modelPath"]))
+        resolution = int(payload.get("resolution") or 384)
+        smallest_feature_m = _optional_float(payload.get("smallestFeatureM"))
+        unit_scale = _optional_float(payload.get("unitScale"))
+        smallest_feature_source_units = (
+            smallest_feature_m / unit_scale
+            if smallest_feature_m and unit_scale
+            else None
+        )
+        prepared_dir = self.server.root / "models" / "prepared"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target_path = prepared_dir / f"{stamp}-{_safe_case_name(model_path.stem)}-prepared.stl"
+        result = repair_stl(
+            model_path,
+            target_path,
+            resolution=resolution,
+            smallest_feature_source_units=smallest_feature_source_units,
+        )
+        self._send_json(
+            {
+                "ok": True,
+                "accepted": result.accepted,
+                "modelPath": str(target_path if result.accepted else model_path),
+                "report": _report_payload(target_path, result.output_report),
+                "preview": mesh_preview(target_path) if result.accepted else None,
+                "repair": result.to_dict(),
+            }
+        )
+
+    def _handle_analyze_features(self) -> None:
+        payload = self._json_body()
+        model_path = self._resolve_project_path(str(payload["modelPath"]))
+        rotation = _model_rotation(payload.get("modelRotationDegrees"))
+        result = detect_aero_features(
+            model_path,
+            scale=float(payload.get("unitScale") or 1.0),
+            source_flow_direction=str(payload.get("sourceFlowDirection") or "+x"),
+            source_up_direction=str(payload.get("sourceUpDirection") or "+z"),
+            rotation_degrees=rotation,
+        )
+        self._send_json({"ok": True, "features": result})
+
+    def _handle_create_case(self) -> None:
+        payload = self._json_body()
+        options = self._case_options(payload)
+        model_path = options["model_path"]
+        case_name = _safe_case_name(str(payload.get("name") or model_path.stem))
+
+        case_path = create_case(
+            case_name=case_name,
+            cases_dir=self.server.root / "cases",
+            generate_openfoam=True,
+            **options,
+        )
+        case_json = json.loads((case_path / "case.json").read_text(encoding="utf-8"))
+        self._send_json(
+            {
+                "ok": True,
+                "casePath": str(case_path),
+                "case": case_json,
+                "files": _case_files(case_path),
+                "state": self._state(),
+            }
+        )
+
+    def _handle_create_accuracy_study(self) -> None:
+        payload = self._json_body()
+        options = self._case_options(payload)
+        model_path = options["model_path"]
+        base_name = _safe_case_name(str(payload.get("name") or model_path.stem))
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        study_id = f"grid-{stamp}"
+        case_paths: list[Path] = []
+        for level in ("draft", "standard", "fine"):
+            level_options = dict(options)
+            level_options["quality"] = level
+            level_options["validation_study"] = {
+                "id": study_id,
+                "level": level,
+                "levels": ["draft", "standard", "fine"],
+                "drag_change_limit_percent": 2.0,
+                "lift_change_limit": 0.02,
+            }
+            case_paths.append(
+                create_case(
+                    case_name=f"{base_name}-{study_id}-{level}",
+                    cases_dir=self.server.root / "cases",
+                    generate_openfoam=True,
+                    **level_options,
+                )
+            )
+        selected = case_paths[-1]
+        self._send_json(
+            {
+                "ok": True,
+                "studyId": study_id,
+                "casePaths": [str(path) for path in case_paths],
+                "selectedCasePath": str(selected),
+                "report": case_report(selected, include_visualization=True),
+                "state": self._state(),
+            }
+        )
+
+    def _case_options(self, payload: dict[str, object]) -> dict[str, object]:
+        return {
+            "model_path": self._resolve_project_path(str(payload["modelPath"])),
+            "speed_mph": float(payload.get("speedMph") or 70),
+            "flow_axis": str(payload.get("flowAxis") or "x"),
+            "include_ground": bool(payload.get("includeGround")),
+            "moving_ground": bool(payload.get("movingGround")),
+            "ground_clearance_m": _nonnegative_float(
+                payload.get("groundClearanceM"),
+                "Ground clearance",
+            ),
+            "unit_scale": float(payload.get("unitScale") or 1.0),
+            "unit_label": str(payload.get("unitLabel") or "m"),
+            "reference_area_m2": _optional_float(payload.get("referenceAreaM2")),
+            "reference_length_m": _optional_float(payload.get("referenceLengthM")),
+            "measured_length_m": _optional_float(payload.get("measuredLengthM")),
+            "measured_width_m": _optional_float(payload.get("measuredWidthM")),
+            "measured_height_m": _optional_float(payload.get("measuredHeightM")),
+            "smallest_aero_feature_m": _optional_float(payload.get("smallestAeroFeatureM")),
+            "quality": str(payload.get("quality") or "standard"),
+            "simulation_mode": str(payload.get("simulationMode") or "steady"),
+            "source_flow_direction": str(payload.get("sourceFlowDirection") or "+x"),
+            "source_up_direction": str(payload.get("sourceUpDirection") or "+z"),
+            "model_rotation_degrees": _model_rotation(payload.get("modelRotationDegrees")),
+        }
+
+    def _handle_run_case(self) -> None:
+        payload = self._json_body()
+        case_path = self._resolve_project_path(str(payload["casePath"]))
+        backend = str(payload.get("backend") or "auto")
+        run_mode = str(payload.get("mode") or "full")
+        default_timeout = 14400 if run_mode == "mesh" else 21600
+        timeout_seconds = int(payload.get("timeoutSeconds") or default_timeout)
+        reuse_mesh = payload.get("reuseMesh") is not False
+        self.server.start_case_run(
+            case_path,
+            backend,
+            timeout_seconds,
+            run_mode,
+            reuse_mesh,
+        )
+        self._send_json(
+            {
+                "ok": True,
+                "accepted": True,
+                "casePath": str(case_path),
+                "mode": run_mode,
+                "timeoutSeconds": timeout_seconds,
+            },
+            status=202,
+        )
+
+    def _handle_case_report(self) -> None:
+        payload = self._json_body()
+        case_path = self._resolve_project_path(str(payload["casePath"]))
+        self._send_json({"ok": True, "report": case_report(case_path, include_visualization=True)})
+
+    def _state(self) -> dict[str, object]:
+        sample = self.server.root / "models" / "sample_box.stl"
+        return {
+            "ok": True,
+            "root": str(self.server.root),
+            "sampleModel": str(sample) if sample.exists() else None,
+            "cases": _list_cases(self.server.root / "cases"),
+        }
+
+    def _json_body(self) -> dict[str, object]:
+        data = self.rfile.read(_content_length(self.headers.get("Content-Length")))
+        if not data:
+            return {}
+        return json.loads(data.decode("utf-8"))
+
+    def _resolve_project_path(self, value: str) -> Path:
+        path = Path(value)
+        if not path.is_absolute():
+            path = self.server.root / path
+        path = path.resolve()
+        if not path.is_relative_to(self.server.root):
+            raise ValueError("Path must be inside the AeroLab project.")
+        if not path.exists():
+            raise FileNotFoundError(path)
+        return path
+
+    def _send_file(self, path: Path, content_type: str | None = None) -> None:
+        path = path.resolve()
+        if not path.exists() or not path.is_file() or not path.is_relative_to(self.server.web_root):
+            self.send_error(404)
+            return
+        data = path.read_bytes()
+        if content_type is None:
+            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_json(self, payload: dict[str, object], status: int = 200) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def _record_background_run_failure(
+    case_path: Path,
+    run_mode: str,
+    backend: str,
+    error: Exception,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    run_path = case_path / "aerolab-run.json"
+    existing: dict[str, object] = {}
+    try:
+        existing = json.loads(run_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    record = {
+        **existing,
+        "status": "failed",
+        "ok": False,
+        "trusted": False,
+        "mode": run_mode,
+        "backend": backend,
+        "returncode": 127,
+        "startedAt": existing.get("startedAt") or now,
+        "finishedAt": now,
+        "error": str(error),
+    }
+    run_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    case_json_path = case_path / "case.json"
+    try:
+        case_payload = json.loads(case_json_path.read_text(encoding="utf-8"))
+        case_payload["status"] = "mesh_failed" if run_mode == "mesh" else "solver_failed"
+        case_json_path.write_text(json.dumps(case_payload, indent=2) + "\n", encoding="utf-8")
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        with (case_path / "aerolab-run.log").open("a", encoding="utf-8") as stream:
+            stream.write(f"\nAeroLab background run failed: {error}\n")
+    except OSError:
+        pass
+
+
+def run_app(host: str, port: int, root: Path) -> None:
+    root = root.resolve()
+    (root / "models" / "uploads").mkdir(parents=True, exist_ok=True)
+    (root / "cases").mkdir(parents=True, exist_ok=True)
+    server = AeroLabServer((host, port), root)
+    print(f"AeroLab app running at http://{host}:{port}")
+    print(f"Project root: {root}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nAeroLab app stopped.")
+
+
+def _content_length(value: str | None) -> int:
+    if value is None:
+        return 0
+    return int(value)
+
+
+def _safe_filename(value: str) -> str:
+    name = Path(value).name
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip(".-")
+    return name or "model.stl"
+
+
+def _safe_case_name(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
+    return name or "aerolab-case"
+
+
+def _optional_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    number = float(value)
+    if number <= 0:
+        raise ValueError("Reference values must be positive.")
+    return number
+
+
+def _nonnegative_float(value: object, label: str) -> float:
+    if value in (None, ""):
+        return 0.0
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"{label} must be a non-negative number.")
+    return number
+
+
+def _model_rotation(value: object) -> tuple[float, float, float]:
+    if not isinstance(value, dict):
+        return (0.0, 0.0, 0.0)
+    result = []
+    for axis in ("x", "y", "z"):
+        try:
+            angle = float(value.get(axis) or 0.0)
+        except (TypeError, ValueError):
+            raise ValueError(f"Model rotation {axis.upper()} must be a number.") from None
+        if not math.isfinite(angle) or abs(angle) > 3600:
+            raise ValueError(f"Model rotation {axis.upper()} must be between -3600 and 3600 degrees.")
+        result.append(angle)
+    return tuple(result)  # type: ignore[return-value]
+
+
+def _report_payload(model_path: Path, report: object) -> dict[str, object]:
+    payload = report.to_dict()  # type: ignore[attr-defined]
+    fidelity = repair_fidelity_for_model(model_path)
+    if fidelity is None:
+        return payload
+    payload["repair_fidelity"] = fidelity
+    readiness = payload.get("readiness")
+    if not isinstance(readiness, dict):
+        readiness = {"score": 100, "status": "ready", "failed": 0, "warnings": 0, "items": []}
+        payload["readiness"] = readiness
+    items = readiness.get("items")
+    if not isinstance(items, list):
+        items = []
+        readiness["items"] = items
+    if fidelity.get("verified"):
+        items.append(
+            {
+                "label": "Repair fidelity",
+                "status": "pass",
+                "detail": (
+                    f"Recorded cell detail {float(fidelity.get('detailResolutionPercent') or 0):.3g}%; "
+                    f"source p99 {float(fidelity.get('sourceSurfaceDeviationP99Percent') or 0):.3g}%; "
+                    f"far sealing area {float(fidelity.get('addedSurfaceFarFractionPercent') or 0):.3g}%."
+                ),
+            }
+        )
+    else:
+        payload["is_cfd_candidate"] = False
+        readiness["score"] = min(int(readiness.get("score") or 0), 60)
+        readiness["status"] = "needs_cleanup"
+        readiness["failed"] = int(readiness.get("failed") or 0) + 1
+        items.append(
+            {
+                "label": "Repair fidelity",
+                "status": "fail",
+                "detail": str(fidelity.get("detail") or "Prepared geometry fidelity is not verified."),
+            }
+        )
+    return payload
+
+
+def _list_cases(cases_dir: Path) -> list[dict[str, object]]:
+    if not cases_dir.exists():
+        return []
+    cases: list[dict[str, object]] = []
+    for case_json in sorted(cases_dir.glob("*/case.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            payload = json.loads(case_json.read_text(encoding="utf-8"))
+            cases.append(
+                {
+                    "name": payload.get("name", case_json.parent.name),
+                    "path": str(case_json.parent),
+                    "status": payload.get("status", "unknown"),
+                    "speedMph": payload.get("flow", {}).get("speed_mph"),
+                    "quality": payload.get("cfd_quality", {}).get("name"),
+                    "studyId": payload.get("validation_study", {}).get("id"),
+                    "studyLevel": payload.get("validation_study", {}).get("level"),
+                    "reference": payload.get("aerodynamic_reference"),
+                    "createdAt": payload.get("created_at"),
+                    "progress": case_run_progress(case_json.parent),
+                }
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+    return cases
+
+
+def _case_files(case_path: Path) -> list[str]:
+    return [
+        str(path.relative_to(case_path))
+        for path in sorted(case_path.rglob("*"))
+        if path.is_file()
+    ]

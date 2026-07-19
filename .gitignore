@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+*.log
+
+cases/*
+!cases/.gitkeep
+outputs/*
+!outputs/.gitkeep
+models/uploads/*
+!models/uploads/.gitkeep
+models/prepared/*
+!models/prepared/.gitkeep

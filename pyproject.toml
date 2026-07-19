@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aerolab-cfd"
+version = "0.1.0"
+description = "Local-first CFD workflow for checking external aerodynamics of 3D models."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "AeroLab" }
+]
+dependencies = [
+  "numpy>=1.24",
+]
+
+[project.scripts]
+aerolab = "aerolab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aerolab = ["web/*", "web/vendor/*"]
