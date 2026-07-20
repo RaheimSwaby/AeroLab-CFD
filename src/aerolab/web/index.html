@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#102433" />
     <title>AeroLab CFD — Local Aerodynamics</title>
-    <link rel="stylesheet" href="/assets/style.css?v=31" />
+    <link rel="stylesheet" href="/assets/style.css?v=32" />
   </head>
   <body data-view-mode="basic">
     <a class="skip-link" href="#mainContent">Skip to analysis</a>
@@ -483,16 +483,26 @@
                   <small>Drag to orbit · scroll to zoom</small>
                 </div>
                 <div class="viewer-controls">
-                  <div class="viewer-segmented" role="group" aria-label="Surface coloring">
-                    <button id="surfaceModeButton" class="active" type="button" aria-pressed="true">Surface</button>
-                    <button id="pressureModeButton" type="button" aria-pressed="false" disabled>Cp</button>
-                    <button id="temperatureModeButton" type="button" aria-pressed="false" disabled>Air temp</button>
-                    <button id="dragModeButton" type="button" aria-pressed="false" disabled>Drag areas</button>
+                  <div class="viewer-control-row">
+                    <div class="viewer-segmented surface-mode-segmented" role="group" aria-label="Surface coloring">
+                      <button id="surfaceModeButton" class="active" type="button" aria-pressed="true">Surface</button>
+                      <button id="pressureModeButton" type="button" aria-pressed="false" disabled>Cp</button>
+                      <button id="temperatureModeButton" type="button" aria-pressed="false" disabled>Air temp</button>
+                      <button id="dragModeButton" type="button" aria-pressed="false" disabled>Drag areas</button>
+                    </div>
+                    <label class="viewer-toggle">
+                      <input id="showEdges" type="checkbox" />
+                      <span>Edges</span>
+                    </label>
                   </div>
-                  <label class="viewer-toggle">
-                    <input id="showEdges" type="checkbox" />
-                    <span>Edges</span>
-                  </label>
+                  <div id="solverFlowControl" class="solver-flow-control unavailable">
+                    <span id="solverFlowStatus" aria-live="polite">Run the solver to generate solved flow</span>
+                    <div class="viewer-segmented flow-mode-segmented" role="group" aria-label="Solved flow display">
+                      <button id="solverLinesButton" type="button" aria-pressed="false" disabled>Lines</button>
+                      <button id="solverParticlesButton" type="button" aria-pressed="false" disabled>Particles</button>
+                      <button id="solverBothButton" type="button" aria-pressed="false" disabled>Both</button>
+                    </div>
+                  </div>
                 </div>
               </div>
             </section>
@@ -568,6 +578,6 @@
       </main>
     </div>
 
-    <script type="module" src="/assets/app.js?v=64"></script>
+    <script type="module" src="/assets/app.js?v=65"></script>
   </body>
 </html>

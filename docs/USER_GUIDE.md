@@ -174,9 +174,9 @@ Progress colors:
 
 The initial animated smoke is geometry-guided setup visualization. It is useful for checking orientation and gross obstruction, but it is not Navier-Stokes solver output and must not be used to judge a diffuser, vortex generator, wake size, `Cd`, or `Cl`.
 
-### Solved Streamlines
+### Solved Flow Traces
 
-After a successful OpenFOAM run, solver-derived streamlines replace preview smoke. Their paths come from the solved velocity field; transient cases use the time-averaged velocity field. Streamline density is a visualization choice and is not mass-flow density.
+After a successful OpenFOAM run, solver-derived streamlines and animated particles replace preview smoke. Use **Lines**, **Particles**, or **Both** to choose the display. Both use the solved local-speed color legend, while `Cp`, temperature, and drag keep separate surface legends. Transient cases are labeled **Mean-flow speed** because their paths use the time-averaged velocity field; the particle motion is visual and must not be interpreted as instantaneous transient structure or elapsed solver time. Trace density is a visualization choice, not physical concentration or mass-flow density.
 
 ### Cp Surface
 

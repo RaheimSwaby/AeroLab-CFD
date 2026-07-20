@@ -3,6 +3,23 @@ import * as THREE from "./vendor/three.module.min.js";
 const INVERT_ORBIT_STORAGE_KEY = "aerolab-invert-orbit";
 const VIEW_MODE_STORAGE_KEY = "aerolab-view-mode";
 const VIEWER_GROUND_Z = -0.58;
+const VIEWER_CAMERA_NEAR = 0.1;
+const VIEWER_CAMERA_FAR = 100;
+const SOLVER_PARTICLE_TARGET_PER_LINE = 24;
+const SOLVER_PARTICLE_MAX_COUNT = 5_200;
+const SOLVER_PARTICLE_SPEED_FLOOR = 0.04;
+const SOLVER_PARTICLE_ANIMATION_RATE = 0.9;
+const SOLVER_PARTICLE_LINE_AVAILABILITY = new WeakMap();
+const SPEED_COLOR_STOPS = [
+  [38, 105, 208],
+  [54, 205, 216],
+  [246, 207, 75],
+  [235, 77, 59],
+];
+const SPEED_COLOR_STOPS_LINEAR = SPEED_COLOR_STOPS.map((stop) => stop.map((channel) => {
+  const value = channel / 255;
+  return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+}));
 
 const state = {
   busy: false,
@@ -40,6 +57,8 @@ const state = {
     flowLayer: null,
     meshSource: "raw",
     surfaceMode: "material",
+    solverFlowMode: "both",
+    solverParticles: null,
     exactMesh: null,
     exactMeshLoading: false,
     exactMeshRequest: 0,
@@ -57,6 +76,7 @@ const state = {
       width: 0,
       height: 0,
       pixelRatio: 0,
+      contextLostHandler: null,
     },
     lastTime: 0,
     running: false,
@@ -166,6 +186,11 @@ const els = {
   canvas: document.querySelector("#flowCanvas"),
   modelCanvas: document.querySelector("#modelCanvas"),
   dragSummary: document.querySelector("#dragSummary"),
+  solverFlowControl: document.querySelector("#solverFlowControl"),
+  solverFlowStatus: document.querySelector("#solverFlowStatus"),
+  solverLinesButton: document.querySelector("#solverLinesButton"),
+  solverParticlesButton: document.querySelector("#solverParticlesButton"),
+  solverBothButton: document.querySelector("#solverBothButton"),
   showEdges: document.querySelector("#showEdges"),
   surfaceModeButton: document.querySelector("#surfaceModeButton"),
   pressureModeButton: document.querySelector("#pressureModeButton"),
@@ -192,6 +217,7 @@ async function boot() {
   syncAdvancedFlowControls();
   syncRotationOutputs();
   initFlowVisualization();
+  syncSolverFlowControls();
   startViewer();
 }
 
@@ -698,6 +724,9 @@ els.caseList.addEventListener("click", async (event) => {
   const requestedCasePath = button.dataset.casePath;
   state.activeCasePath = requestedCasePath;
   state.caseReport = null;
+  resetSolverParticles();
+  state.viewer.flowLayer = null;
+  syncSolverFlowControls();
   state.activeRunProgress = state.cases.find((item) => item.path === requestedCasePath)?.progress || null;
   syncRunLogForActiveCase();
   state.report = null;
@@ -959,6 +988,112 @@ els.surfaceModeButton.addEventListener("click", () => setSurfaceMode("material")
 els.pressureModeButton.addEventListener("click", () => setSurfaceMode("cp"));
 els.temperatureModeButton.addEventListener("click", () => setSurfaceMode("temperature"));
 els.dragModeButton.addEventListener("click", () => setSurfaceMode("drag"));
+els.solverLinesButton.addEventListener("click", () => setSolverFlowMode("lines"));
+els.solverParticlesButton.addEventListener("click", () => setSolverFlowMode("particles"));
+els.solverBothButton.addEventListener("click", () => setSolverFlowMode("both"));
+
+function hasSolverStreamlines() {
+  const flow = state.caseReport?.solverStreamlines;
+  return Boolean(!flow?.error && flow?.lines?.length);
+}
+
+function hasRenderableSolverParticleLines(flow = state.caseReport?.solverStreamlines) {
+  if (!flow || typeof flow !== "object") return false;
+  if (SOLVER_PARTICLE_LINE_AVAILABILITY.has(flow)) return SOLVER_PARTICLE_LINE_AVAILABILITY.get(flow);
+  let renderable = false;
+  for (const path of flow.lines || []) {
+    let previousX = 0;
+    let previousY = 0;
+    let previousZ = 0;
+    let hasPrevious = false;
+    for (const sample of path || []) {
+      const x = Number(sample?.[0]);
+      const y = Number(sample?.[1]);
+      const z = Number(sample?.[2]);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      if (hasPrevious && Math.hypot(x - previousX, y - previousY, z - previousZ) > 1e-8) {
+        renderable = true;
+        break;
+      }
+      previousX = x;
+      previousY = y;
+      previousZ = z;
+      hasPrevious = true;
+    }
+    if (renderable) break;
+  }
+  SOLVER_PARTICLE_LINE_AVAILABILITY.set(flow, renderable);
+  return renderable;
+}
+
+function solverParticleUnavailableReason() {
+  if (state.viewer.webgl.failed) return "WebGL could not start";
+  if (!hasRenderableSolverParticleLines()) return "Solved tracks contain no usable particle segments";
+  const hasSurface = state.mesh?.triangles?.length || state.caseReport?.geometryPreview?.triangles?.length;
+  if (!hasSurface) return "The active report has no renderable model surface";
+  return null;
+}
+
+function shouldDrawSolverLines() {
+  if (!hasSolverStreamlines()) return false;
+  return Boolean(solverParticleUnavailableReason()) || state.viewer.solverFlowMode !== "particles";
+}
+
+function shouldDrawSolverParticles() {
+  return hasSolverStreamlines()
+    && !solverParticleUnavailableReason()
+    && state.viewer.solverFlowMode !== "lines";
+}
+
+function setSolverFlowMode(mode) {
+  const requested = ["lines", "particles", "both"].includes(mode) ? mode : "both";
+  const particlesUnavailable = hasSolverStreamlines() && solverParticleUnavailableReason();
+  state.viewer.solverFlowMode = particlesUnavailable && requested !== "lines" ? "lines" : requested;
+  syncSolverFlowControls();
+  if (state.viewer.solverParticles?.points) {
+    state.viewer.solverParticles.points.visible = shouldDrawSolverParticles();
+  }
+  drawFlow();
+}
+
+function syncSolverFlowControls() {
+  const flow = state.caseReport?.solverStreamlines;
+  const available = hasSolverStreamlines();
+  const particleReason = available ? solverParticleUnavailableReason() : null;
+  const particleAvailable = available && !particleReason;
+  if (available && !particleAvailable && state.viewer.solverFlowMode !== "lines") {
+    state.viewer.solverFlowMode = "lines";
+  }
+
+  els.solverLinesButton.disabled = !available;
+  els.solverParticlesButton.disabled = !particleAvailable;
+  els.solverBothButton.disabled = !particleAvailable;
+  for (const [button, mode] of [
+    [els.solverLinesButton, "lines"],
+    [els.solverParticlesButton, "particles"],
+    [els.solverBothButton, "both"],
+  ]) {
+    const active = available && state.viewer.solverFlowMode === mode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+
+  let status = "Run the solver to generate solved flow";
+  let detail = status;
+  if (flow?.error) {
+    status = String(flow.error);
+    detail = `Solved flow unavailable: ${status}`;
+  } else if (available) {
+    const fieldLabel = flow.timeAveraged ? "Mean-flow speed" : "Final-field speed";
+    status = particleReason ? `${fieldLabel} · ${particleReason}` : fieldLabel;
+    detail = particleReason
+      ? `${fieldLabel}; particles unavailable: ${particleReason}`
+      : `${fieldLabel}; particle time is visual, not solver time`;
+  }
+  els.solverFlowStatus.textContent = status;
+  els.solverFlowControl.title = detail;
+  els.solverFlowControl.classList.toggle("unavailable", !available);
+}
 
 function hasSurfacePressure() {
   const pressure = state.caseReport?.surfacePressure;
@@ -985,9 +1120,10 @@ function hasSurfaceWallShear() {
 }
 
 function setSurfaceMode(mode) {
-  if (mode === "cp" && hasSurfacePressure()) state.viewer.surfaceMode = "cp";
-  else if (mode === "temperature" && hasSurfaceTemperature()) state.viewer.surfaceMode = "temperature";
-  else if (mode === "drag" && hasSurfaceDrag()) state.viewer.surfaceMode = "drag";
+  const webglAvailable = !state.viewer.webgl.failed;
+  if (webglAvailable && mode === "cp" && hasSurfacePressure()) state.viewer.surfaceMode = "cp";
+  else if (webglAvailable && mode === "temperature" && hasSurfaceTemperature()) state.viewer.surfaceMode = "temperature";
+  else if (webglAvailable && mode === "drag" && hasSurfaceDrag()) state.viewer.surfaceMode = "drag";
   else state.viewer.surfaceMode = "material";
   syncSurfaceModeControls();
   invalidateThreeGeometry();
@@ -999,6 +1135,8 @@ function syncSurfaceModeControls() {
   const hasPressure = hasSurfacePressure();
   const hasTemperature = hasSurfaceTemperature();
   const hasDrag = hasSurfaceDrag();
+  const webglAvailable = !state.viewer.webgl.failed;
+  if (!webglAvailable) state.viewer.surfaceMode = "material";
   if (!hasPressure && state.viewer.surfaceMode === "cp") state.viewer.surfaceMode = "material";
   if (!hasTemperature && state.viewer.surfaceMode === "temperature") state.viewer.surfaceMode = "material";
   if (!hasDrag && state.viewer.surfaceMode === "drag") state.viewer.surfaceMode = "material";
@@ -1014,31 +1152,37 @@ function syncSurfaceModeControls() {
   els.pressureModeButton.setAttribute("aria-pressed", String(showPressure));
   els.temperatureModeButton.setAttribute("aria-pressed", String(showTemperature));
   els.dragModeButton.setAttribute("aria-pressed", String(showDrag));
-  els.pressureModeButton.disabled = !hasPressure;
-  els.temperatureModeButton.disabled = !hasTemperature;
-  els.dragModeButton.disabled = !hasDrag;
+  els.pressureModeButton.disabled = !webglAvailable || !hasPressure;
+  els.temperatureModeButton.disabled = !webglAvailable || !hasTemperature;
+  els.dragModeButton.disabled = !webglAvailable || !hasDrag;
   const pressureSetup = state.caseReport?.surfacePressureSetup;
-  const pressureLabel = hasPressure
-    ? "Show solved pressure coefficient Cp"
-    : pressureSetup?.configured
-      ? "Pressure coefficient Cp is pending a completed solver run"
-      : "Pressure coefficient Cp will be configured when this case is run";
+  const pressureLabel = !webglAvailable
+    ? "Solved surface coloring is unavailable because WebGL could not start"
+    : hasPressure
+      ? "Show solved pressure coefficient Cp"
+      : pressureSetup?.configured
+        ? "Pressure coefficient Cp is pending a completed solver run"
+        : "Pressure coefficient Cp will be configured when this case is run";
   els.pressureModeButton.setAttribute("aria-label", pressureLabel);
   els.pressureModeButton.title = pressureLabel;
-  const temperatureLabel = hasTemperature
-    ? "Show solved adjacent-air temperature on the body surface"
-    : pressureSetup?.temperatureConfigured
-      ? "Adjacent-air temperature is pending a completed solver run"
-      : "Air temperature requires a compressible + thermal case";
+  const temperatureLabel = !webglAvailable
+    ? "Solved surface coloring is unavailable because WebGL could not start"
+    : hasTemperature
+      ? "Show solved adjacent-air temperature on the body surface"
+      : pressureSetup?.temperatureConfigured
+        ? "Adjacent-air temperature is pending a completed solver run"
+        : "Air temperature requires a compressible + thermal case";
   els.temperatureModeButton.setAttribute("aria-label", temperatureLabel);
   els.temperatureModeButton.title = temperatureLabel;
-  const dragLabel = hasDrag
-    ? hasSurfaceWallShear()
-      ? "Show solved local total drag from pressure and wall shear"
-      : "Show solved local pressure-drag contribution"
-    : pressureSetup?.configured
-      ? "Pressure-drag areas are pending a completed solver run"
-      : "Pressure-drag areas will be configured when this case is run";
+  const dragLabel = !webglAvailable
+    ? "Solved surface coloring is unavailable because WebGL could not start"
+    : hasDrag
+      ? hasSurfaceWallShear()
+        ? "Show solved local total drag from pressure and wall shear"
+        : "Show solved local pressure-drag contribution"
+      : pressureSetup?.configured
+        ? "Pressure-drag areas are pending a completed solver run"
+        : "Pressure-drag areas will be configured when this case is run";
   els.dragModeButton.setAttribute("aria-label", dragLabel);
   els.dragModeButton.title = dragLabel;
   renderDragSummary();
@@ -1168,6 +1312,9 @@ function loadReport(modelPath, report, preview = null, exactData = null) {
   state.aeroFeatures = null;
   state.aeroFeatureScanStatus = "idle";
   state.caseReport = null;
+  resetSolverParticles();
+  state.viewer.flowLayer = null;
+  syncSolverFlowControls();
   state.activeCasePath = null;
   state.activeRunProgress = null;
   syncRunLogForActiveCase();
@@ -1327,6 +1474,9 @@ async function beginSourceAlignment() {
     state.report = payload.report;
     state.mesh = payload.preview;
     state.caseReport = null;
+    resetSolverParticles();
+    state.viewer.flowLayer = null;
+    syncSolverFlowControls();
     state.activeCasePath = null;
     state.activeRunProgress = null;
     syncRunLogForActiveCase();
@@ -2643,9 +2793,12 @@ async function refreshCaseReport(casePath) {
   });
   if (state.activeCasePath !== requestedCasePath) return;
   state.caseReport = payload.report;
+  resetSolverParticles();
+  state.viewer.flowLayer = null;
   state.activeRunProgress = payload.report.runProgress || null;
   state.viewer.surfaceMode = hasSurfacePressure() ? "cp" : "material";
   syncSurfaceModeControls();
+  syncSolverFlowControls();
   restoreCaseContext(payload.report);
   if (payload.report.geometryPreview?.triangles?.length) {
     state.mesh = payload.report.geometryPreview;
@@ -3087,7 +3240,7 @@ function renderResultSummary() {
 }
 
 function drawFlow() {
-  renderFlowScene(performance.now());
+  renderFlowScene(performance.now(), 0);
 }
 
 function startViewer() {
@@ -3100,9 +3253,13 @@ function startViewer() {
 function tickViewer(time) {
   const dt = Math.min(0.04, Math.max(0.001, (time - state.viewer.lastTime) / 1000));
   state.viewer.lastTime = time;
-  void dt;
-  renderFlowScene(time);
-  requestAnimationFrame(tickViewer);
+  try {
+    if (!document.hidden) renderFlowScene(time, dt);
+  } catch (error) {
+    disableThreeViewer(error);
+  } finally {
+    requestAnimationFrame(tickViewer);
+  }
 }
 
 function initFlowVisualization() {
@@ -3152,7 +3309,7 @@ function initSmokeTrails(env = bodyEnvelope()) {
   state.viewer.smokeTrails = lanes;
 }
 
-function renderFlowScene(time) {
+function renderFlowScene(time, dt = 0) {
   const canvas = els.canvas;
   const rect = canvas.getBoundingClientRect();
   const scale = window.devicePixelRatio || 1;
@@ -3173,14 +3330,15 @@ function renderFlowScene(time) {
 
   const camera = makeCamera(w, h);
   drawTunnelGrid(ctx, camera);
-  if (state.caseReport?.solverStreamlines?.lines?.length) {
-    drawSolverStreamlines(ctx, camera, time);
+  if (hasSolverStreamlines()) {
+    if (shouldDrawSolverLines()) drawSolverStreamlines(ctx, camera, time);
   } else {
     drawSmokeRibbons(ctx, camera, time);
   }
-  drawModel(ctx, camera);
+  drawModel(ctx, camera, dt);
   drawViewerHud(ctx, w, h);
-  drawPressureLegend(ctx, w, h);
+  const surfaceLegendDrawn = drawPressureLegend(ctx, w, h);
+  drawSpeedLegend(ctx, w, h, surfaceLegendDrawn ? 66 : 0);
   drawWindDirectionIndicator(ctx, camera, w, h);
 }
 
@@ -3316,12 +3474,12 @@ function drawSmokeRibbons(ctx, camera, time) {
 function drawSolverStreamlines(ctx, camera, time) {
   const flow = state.caseReport?.solverStreamlines;
   if (!flow?.lines?.length) return;
-  const layer = pressureAirLayer(camera, flow);
+  const layer = solverFlowLayer(camera, flow);
   ctx.drawImage(layer.canvas, 0, 0);
 
-  const pressureMin = Number(flow.pressureRange?.[0] || 0);
-  const pressureMax = Number(flow.pressureRange?.[1] || 0);
-  const pressureLimit = Math.max(Math.abs(pressureMin), Math.abs(pressureMax), 1e-6);
+  const speedMin = Number(flow.speedRange?.[0] ?? 0);
+  const speedMax = Number(flow.speedRange?.[1] ?? speedMin);
+  const speedSpan = Math.max(speedMax - speedMin, 1e-6);
 
   ctx.save();
   ctx.globalCompositeOperation = "screen";
@@ -3329,23 +3487,19 @@ function drawSolverStreamlines(ctx, camera, time) {
   ctx.lineJoin = "round";
   for (let pathIndex = 0; pathIndex < layer.projectedPaths.length; pathIndex += 1) {
     const projected = layer.projectedPaths[pathIndex];
-    const meanPressure = projected.reduce((sum, sample) => sum + sample.pressure, 0) / Math.max(1, projected.length);
-    const compression = clamp(Math.max(0, meanPressure) / pressureLimit, 0, 1);
+    const meanSpeed = projected.reduce((sum, sample) => sum + sample.speed, 0) / Math.max(1, projected.length);
+    const speedAmount = clamp((meanSpeed - speedMin) / speedSpan, 0, 1);
     ctx.beginPath();
     projected.forEach((sample, index) => {
       if (index === 0) ctx.moveTo(sample.point.x, sample.point.y);
       else ctx.lineTo(sample.point.x, sample.point.y);
     });
-    ctx.setLineDash([5 + compression * 5, 29 - compression * 8]);
-    ctx.lineDashOffset = -(time * (0.024 + compression * 0.012) + pathIndex * 7);
-    ctx.strokeStyle = flow.hasPressure
-      ? pressureColor(meanPressure, pressureMin, pressureMax, 0.76)
-      : "rgba(112,222,232,0.72)";
-    ctx.lineWidth = 1.5 + compression * 2.6;
-    ctx.shadowColor = flow.hasPressure
-      ? pressureColor(meanPressure, pressureMin, pressureMax, 0.48)
-      : "rgba(112,222,232,0.4)";
-    ctx.shadowBlur = 5 + compression * 8;
+    ctx.setLineDash([5 + speedAmount * 4, 29 - speedAmount * 10]);
+    ctx.lineDashOffset = -(time * (0.021 + speedAmount * 0.027) + pathIndex * 7);
+    ctx.strokeStyle = "rgba(232,252,255,0.62)";
+    ctx.lineWidth = 1.05 + speedAmount * 0.65;
+    ctx.shadowColor = "rgba(112,222,232,0.38)";
+    ctx.shadowBlur = 4 + speedAmount * 5;
     ctx.stroke();
     ctx.setLineDash([]);
   }
@@ -3353,15 +3507,107 @@ function drawSolverStreamlines(ctx, camera, time) {
   ctx.restore();
 }
 
-function pressureAirLayer(camera, flow) {
+function solverFlowCameraSample(point, camera, zOffset) {
+  const x = Number(point?.[0]);
+  const y = Number(point?.[1]);
+  const z = Number(point?.[2]) + zOffset;
+  const speed = Number(point?.[3] ?? 0);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+  const yawCos = Math.cos(camera.yaw);
+  const yawSin = Math.sin(camera.yaw);
+  const pitchCos = Math.cos(camera.pitch);
+  const pitchSin = Math.sin(camera.pitch);
+  const cameraX = x * yawCos - y * yawSin;
+  const yawDepth = x * yawSin + y * yawCos;
+  const cameraY = z * pitchCos - yawDepth * pitchSin;
+  const cameraDepth = camera.focal + yawDepth * pitchCos + z * pitchSin;
+  return { x: cameraX, y: cameraY, depth: cameraDepth, speed: Number.isFinite(speed) ? speed : 0 };
+}
+
+function interpolateSolverFlowCameraSample(start, end, amount) {
+  return {
+    x: lerp(start.x, end.x, amount),
+    y: lerp(start.y, end.y, amount),
+    depth: lerp(start.depth, end.depth, amount),
+    speed: lerp(start.speed, end.speed, amount),
+  };
+}
+
+function clipSolverFlowSegment(start, end) {
+  const depthDelta = end.depth - start.depth;
+  let firstAmount = 0;
+  let lastAmount = 1;
+  if (Math.abs(depthDelta) <= 1e-12) {
+    if (start.depth < VIEWER_CAMERA_NEAR || start.depth > VIEWER_CAMERA_FAR) return null;
+  } else {
+    const nearAmount = (VIEWER_CAMERA_NEAR - start.depth) / depthDelta;
+    const farAmount = (VIEWER_CAMERA_FAR - start.depth) / depthDelta;
+    firstAmount = Math.max(0, Math.min(nearAmount, farAmount));
+    lastAmount = Math.min(1, Math.max(nearAmount, farAmount));
+    if (firstAmount >= lastAmount) return null;
+  }
+  return [
+    interpolateSolverFlowCameraSample(start, end, firstAmount),
+    interpolateSolverFlowCameraSample(start, end, lastAmount),
+  ];
+}
+
+function projectSolverFlowCameraSample(sample, camera) {
+  const perspective = camera.focal / sample.depth;
+  return {
+    point: {
+      x: camera.centerX + sample.x * camera.unit * perspective,
+      y: camera.centerY - sample.y * camera.unit * perspective,
+      scale: perspective,
+      depth: sample.depth,
+    },
+    speed: sample.speed,
+  };
+}
+
+function projectSolverFlowPaths(lines, camera, zOffset) {
+  const projectedPaths = [];
+  for (const path of lines || []) {
+    let projected = [];
+    let previousEnd = null;
+    for (let index = 1; index < path.length; index += 1) {
+      const start = solverFlowCameraSample(path[index - 1], camera, zOffset);
+      const end = solverFlowCameraSample(path[index], camera, zOffset);
+      const clipped = start && end ? clipSolverFlowSegment(start, end) : null;
+      if (!clipped) {
+        if (projected.length >= 2) projectedPaths.push(projected);
+        projected = [];
+        previousEnd = null;
+        continue;
+      }
+      const [clippedStart, clippedEnd] = clipped;
+      const continuous = previousEnd
+        && Math.abs(clippedStart.x - previousEnd.x) <= 1e-7
+        && Math.abs(clippedStart.y - previousEnd.y) <= 1e-7
+        && Math.abs(clippedStart.depth - previousEnd.depth) <= 1e-7;
+      if (!continuous) {
+        if (projected.length >= 2) projectedPaths.push(projected);
+        projected = [projectSolverFlowCameraSample(clippedStart, camera)];
+      }
+      projected.push(projectSolverFlowCameraSample(clippedEnd, camera));
+      previousEnd = clippedEnd;
+    }
+    if (projected.length >= 2) projectedPaths.push(projected);
+  }
+  return projectedPaths;
+}
+
+function solverFlowLayer(camera, flow) {
   const key = [
     flow.file || "solved-flow",
     flow.pointCount || 0,
+    flow.speedRange?.join(":") || "no-speed",
     Math.round(camera.width),
     Math.round(camera.height),
     camera.yaw.toFixed(4),
     camera.pitch.toFixed(4),
     camera.unit.toFixed(2),
+    meshGroundOffset().toFixed(6),
   ].join("|");
   if (state.viewer.flowLayer?.key === key) return state.viewer.flowLayer;
 
@@ -3369,14 +3615,11 @@ function pressureAirLayer(camera, flow) {
   canvas.width = Math.max(1, Math.ceil(camera.width));
   canvas.height = Math.max(1, Math.ceil(camera.height));
   const layerCtx = canvas.getContext("2d");
-  const pressureMin = Number(flow.pressureRange?.[0] || 0);
-  const pressureMax = Number(flow.pressureRange?.[1] || 0);
-  const pressureLimit = Math.max(Math.abs(pressureMin), Math.abs(pressureMax), 1e-6);
+  const speedMin = Number(flow.speedRange?.[0] ?? 0);
+  const speedMax = Number(flow.speedRange?.[1] ?? speedMin);
+  const speedSpan = Math.max(speedMax - speedMin, 1e-6);
   const zOffset = meshGroundOffset();
-  const projectedPaths = flow.lines.map((path) => path.map((point) => ({
-    point: project({ x: point[0], y: point[1], z: point[2] + zOffset }, camera),
-    pressure: Number(point[4] || 0),
-  })));
+  const projectedPaths = projectSolverFlowPaths(flow.lines, camera, zOffset);
 
   layerCtx.save();
   layerCtx.globalCompositeOperation = "screen";
@@ -3386,16 +3629,12 @@ function pressureAirLayer(camera, flow) {
     for (let index = 1; index < projected.length; index += 1) {
       const previous = projected[index - 1];
       const current = projected[index];
-      const compression = clamp(Math.max(0, current.pressure) / pressureLimit, 0, 1);
-      layerCtx.strokeStyle = flow.hasPressure
-        ? pressureColor(current.pressure, pressureMin, pressureMax, 0.12 + compression * 0.08)
-        : "rgba(103,221,231,0.13)";
-      layerCtx.lineWidth = Math.max(3.4, (5.4 + compression * 5.2) * current.point.scale);
+      const speedAmount = clamp((current.speed - speedMin) / speedSpan, 0, 1);
+      layerCtx.strokeStyle = speedColor(current.speed, speedMin, speedMax, 0.12 + speedAmount * 0.08);
+      layerCtx.lineWidth = Math.max(3.2, (5 + speedAmount * 3.8) * current.point.scale);
       line(layerCtx, previous.point, current.point);
-      layerCtx.strokeStyle = flow.hasPressure
-        ? pressureColor(current.pressure, pressureMin, pressureMax, 0.64)
-        : "rgba(103,221,231,0.62)";
-      layerCtx.lineWidth = Math.max(0.9, (1.35 + compression * 1.6) * current.point.scale);
+      layerCtx.strokeStyle = speedColor(current.speed, speedMin, speedMax, 0.66);
+      layerCtx.lineWidth = Math.max(0.9, (1.25 + speedAmount * 1.3) * current.point.scale);
       line(layerCtx, previous.point, current.point);
     }
   }
@@ -3418,6 +3657,22 @@ function pressureColorChannels(value, minimum, maximum) {
 
 function pressureColor(value, minimum, maximum, alpha = 1) {
   const color = pressureColorChannels(value, minimum, maximum);
+  return `rgba(${color[0]},${color[1]},${color[2]},${alpha})`;
+}
+
+function speedColorChannels(value, minimum, maximum) {
+  const span = maximum - minimum;
+  const amount = span > 1e-9 ? clamp((value - minimum) / span, 0, 1) : 0.5;
+  const scaled = amount * (SPEED_COLOR_STOPS.length - 1);
+  const index = Math.min(SPEED_COLOR_STOPS.length - 2, Math.floor(scaled));
+  const blend = scaled - index;
+  return SPEED_COLOR_STOPS[index].map(
+    (channel, channelIndex) => Math.round(lerp(channel, SPEED_COLOR_STOPS[index + 1][channelIndex], blend)),
+  );
+}
+
+function speedColor(value, minimum, maximum, alpha = 1) {
+  const color = speedColorChannels(value, minimum, maximum);
   return `rgba(${color[0]},${color[1]},${color[2]},${alpha})`;
 }
 
@@ -3461,15 +3716,14 @@ function drawPressureLegend(ctx, width, height) {
   ) && hasSurfacePressure()
     ? state.caseReport.surfacePressure
     : null;
-  const flow = state.caseReport?.solverStreamlines;
-  if (!surfacePressure && (!flow?.lines?.length || !flow.hasPressure || !flow.pressureRange)) return;
+  if (!surfacePressure) return false;
   const range = showTemperature
-    ? surfacePressure?.temperatureDisplayRangeK || surfacePressure?.temperatureKRange
+    ? surfacePressure.temperatureDisplayRangeK || surfacePressure.temperatureKRange
     : showDrag
       ? hasSurfaceWallShear()
-        ? surfacePressure?.totalDragDisplayRange || surfacePressure?.totalDragDensityRange
-        : surfacePressure?.pressureDragDisplayRange || surfacePressure?.pressureDragDensityRange
-      : surfacePressure?.cpDisplayRange || surfacePressure?.cpRange || flow.pressureRange;
+        ? surfacePressure.totalDragDisplayRange || surfacePressure.totalDragDensityRange
+        : surfacePressure.pressureDragDisplayRange || surfacePressure.pressureDragDensityRange
+      : surfacePressure.cpDisplayRange || surfacePressure.cpRange;
   const rangeMin = Number(range?.[0] ?? 0);
   const rangeMax = Number(range?.[1] ?? 0);
   const limit = Math.max(Math.abs(rangeMin), Math.abs(rangeMax), 1e-6);
@@ -3507,14 +3761,14 @@ function drawPressureLegend(ctx, width, height) {
         ? showDrag ? "Relative drag areas" : "Relative pressure"
         : showDrag
           ? hasSurfaceWallShear() ? "Local total drag areas" : "Local pressure-drag areas"
-          : surfacePressure ? "Pressure coefficient Cp" : "Relative pressure",
+          : "Pressure coefficient Cp",
     x + panelWidth / 2,
     y + 16,
   );
   ctx.font = "600 10px Inter, system-ui, sans-serif";
   ctx.textAlign = "left";
   ctx.fillText(
-    showTemperature ? `${fmt(rangeMin - 273.15)} °C` : basic ? "Low" : showDrag ? "Offset" : surfacePressure ? fmt(-limit) : "Low",
+    showTemperature ? `${fmt(rangeMin - 273.15)} °C` : basic ? "Low" : showDrag ? "Offset" : fmt(-limit),
     barX,
     y + 47,
   );
@@ -3526,11 +3780,50 @@ function drawPressureLegend(ctx, width, height) {
   );
   ctx.textAlign = "right";
   ctx.fillText(
-    showTemperature ? `${fmt(rangeMax - 273.15)} °C` : basic ? "High" : showDrag ? "High drag" : surfacePressure ? fmt(limit) : "High",
+    showTemperature ? `${fmt(rangeMax - 273.15)} °C` : basic ? "High" : showDrag ? "High drag" : fmt(limit),
     x + panelWidth - 14,
     y + 47,
   );
   ctx.restore();
+  return true;
+}
+
+function drawSpeedLegend(ctx, width, height, verticalOffset = 0) {
+  if (!hasSolverStreamlines()) return false;
+  const flow = state.caseReport.solverStreamlines;
+  const rangeMin = Number(flow.speedRange?.[0] ?? 0);
+  const rangeMax = Number(flow.speedRange?.[1] ?? rangeMin);
+  const panelWidth = Math.min(250, width - 28);
+  const x = 14;
+  const y = Math.max(104, height - 72 - verticalOffset);
+  const barX = x + 14;
+  const barY = y + 24;
+  const barWidth = panelWidth - 28;
+
+  ctx.save();
+  ctx.fillStyle = "rgba(15,24,34,0.78)";
+  roundRectPath(ctx, x, y, panelWidth, 58, 8);
+  ctx.fill();
+  for (let pixel = 0; pixel < barWidth; pixel += 1) {
+    const amount = pixel / Math.max(1, barWidth - 1);
+    const value = rangeMin + amount * (rangeMax - rangeMin);
+    const color = speedColorChannels(value, rangeMin, rangeMax);
+    ctx.fillStyle = `rgb(${color[0]},${color[1]},${color[2]})`;
+    ctx.fillRect(barX + pixel, barY, 1.2, 8);
+  }
+  ctx.fillStyle = "#dfeaf1";
+  ctx.font = "600 11px Inter, system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(flow.timeAveraged ? "Mean-flow speed" : "Final-field speed", x + panelWidth / 2, y + 16);
+  ctx.font = "600 10px Inter, system-ui, sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(`${fmt(rangeMin)} m/s`, barX, y + 47);
+  ctx.textAlign = "center";
+  ctx.fillText(`${fmt((rangeMin + rangeMax) / 2)} m/s`, x + panelWidth / 2, y + 47);
+  ctx.textAlign = "right";
+  ctx.fillText(`${fmt(rangeMax)} m/s`, x + panelWidth - 14, y + 47);
+  ctx.restore();
+  return true;
 }
 
 function drawWindDirectionIndicator(ctx, camera, width, height) {
@@ -3729,9 +4022,9 @@ function deflectAroundObstacle(point, time) {
   };
 }
 
-function drawModel(ctx, camera) {
+function drawModel(ctx, camera, dt = 0) {
   if (state.mesh?.triangles?.length) {
-    if (renderThreeStlModel(camera)) return;
+    if (renderThreeStlModel(camera, dt)) return;
     drawCachedStlMesh(ctx, camera);
     return;
   }
@@ -3740,36 +4033,269 @@ function drawModel(ctx, camera) {
   drawPreviewVehicle(ctx, camera);
 }
 
-function renderThreeStlModel(cameraState) {
-  const view = ensureThreeViewer();
-  if (!view) return false;
-  const geometryKey = [
-    state.modelPath || "model",
-    state.mesh?.triangleCount || 0,
-    state.mesh?.sampledTriangleCount || 0,
-    modelOrientationKey(),
-    state.viewer.surfaceMode,
-    state.caseReport?.surfacePressure?.file || "no-cp",
-    state.caseReport?.surfacePressure?.triangleCount || 0,
-  ].join("|");
-  if (view.geometryKey !== geometryKey) rebuildThreeGeometry(view, geometryKey);
-  if (!view.mesh) return false;
+function prepareSolverParticles(flow) {
+  resetSolverParticles();
+  const speedMin = Number(flow.speedRange?.[0] ?? 0);
+  const speedMax = Number(flow.speedRange?.[1] ?? speedMin);
+  const uniformSpeed = !Number.isFinite(speedMin)
+    || !Number.isFinite(speedMax)
+    || speedMax - speedMin <= 1e-9
+    || speedMax <= 1e-9;
+  const speedReference = Math.max(Number.isFinite(speedMax) ? speedMax : 0, 1e-9);
+  const lines = [];
 
-  const width = Math.max(1, Math.round(cameraState.width));
-  const height = Math.max(1, Math.round(cameraState.height));
-  const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
-  if (view.width !== width || view.height !== height || view.pixelRatio !== pixelRatio) {
-    view.renderer.setPixelRatio(pixelRatio);
-    view.renderer.setSize(width, height, false);
-    view.width = width;
-    view.height = height;
-    view.pixelRatio = pixelRatio;
+  for (const rawLine of flow.lines || []) {
+    const coordinates = [];
+    const speeds = [];
+    for (const sample of rawLine || []) {
+      const x = Number(sample?.[0]);
+      const y = Number(sample?.[1]);
+      const z = Number(sample?.[2]);
+      const speed = Number(sample?.[3]);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      if (coordinates.length) {
+        const previous = coordinates.length - 3;
+        if (Math.hypot(x - coordinates[previous], y - coordinates[previous + 1], z - coordinates[previous + 2]) <= 1e-8) {
+          speeds[speeds.length - 1] = Number.isFinite(speed) ? Math.max(0, speed) : 0;
+          continue;
+        }
+      }
+      coordinates.push(x, y, z);
+      speeds.push(Number.isFinite(speed) ? Math.max(0, speed) : 0);
+    }
+    if (speeds.length < 2) continue;
+
+    const travelTimes = new Float32Array(speeds.length);
+    let totalTravelTime = 0;
+    for (let index = 1; index < speeds.length; index += 1) {
+      const previousOffset = (index - 1) * 3;
+      const currentOffset = index * 3;
+      const distance = Math.hypot(
+        coordinates[currentOffset] - coordinates[previousOffset],
+        coordinates[currentOffset + 1] - coordinates[previousOffset + 1],
+        coordinates[currentOffset + 2] - coordinates[previousOffset + 2],
+      );
+      const meanSpeed = (speeds[index - 1] + speeds[index]) * 0.5;
+      const speedRatio = uniformSpeed
+        ? 0.55
+        : clamp(meanSpeed / speedReference, SOLVER_PARTICLE_SPEED_FLOOR, 1);
+      totalTravelTime += distance / speedRatio;
+      travelTimes[index] = totalTravelTime;
+    }
+    if (!Number.isFinite(totalTravelTime) || totalTravelTime <= 1e-8) continue;
+    lines.push({
+      coordinates: new Float32Array(coordinates),
+      speeds: new Float32Array(speeds),
+      travelTimes,
+      totalTravelTime,
+    });
   }
 
-  updateThreeCamera(view, cameraState);
-  view.wireframe.visible = els.showEdges.checked;
-  view.renderer.render(view.scene, view.camera);
-  return true;
+  if (!lines.length) {
+    state.viewer.solverParticles = { source: flow, lines: [], points: null };
+    return;
+  }
+  const targetCount = Math.min(SOLVER_PARTICLE_MAX_COUNT, lines.length * SOLVER_PARTICLE_TARGET_PER_LINE);
+  const totalTravelTime = lines.reduce((sum, line) => sum + line.totalTravelTime, 0);
+  const counts = [];
+  let allocated = 0;
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const remainingLines = lines.length - lineIndex - 1;
+    const remainingCapacity = targetCount - allocated - remainingLines * 2;
+    const weightedCount = Math.round(targetCount * lines[lineIndex].totalTravelTime / totalTravelTime);
+    const count = lineIndex === lines.length - 1
+      ? targetCount - allocated
+      : clamp(weightedCount, 2, remainingCapacity);
+    counts.push(count);
+    allocated += count;
+  }
+
+  const lineIndices = new Uint16Array(targetCount);
+  const travelPositions = new Float32Array(targetCount);
+  const segmentIndices = new Uint16Array(targetCount);
+  let particleIndex = 0;
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
+    const count = counts[lineIndex];
+    const stagger = (lineIndex * 0.38196601125) % 1;
+    for (let localIndex = 0; localIndex < count; localIndex += 1) {
+      const phase = ((localIndex + 0.5) / count + stagger) % 1;
+      const travel = phase * line.totalTravelTime;
+      let segment = 0;
+      while (segment < line.travelTimes.length - 2 && travel >= line.travelTimes[segment + 1]) segment += 1;
+      lineIndices[particleIndex] = lineIndex;
+      travelPositions[particleIndex] = travel;
+      segmentIndices[particleIndex] = segment;
+      particleIndex += 1;
+    }
+  }
+
+  state.viewer.solverParticles = {
+    source: flow,
+    lines,
+    lineIndices,
+    travelPositions,
+    segmentIndices,
+    positions: new Float32Array(targetCount * 3),
+    colors: new Float32Array(targetCount * 3),
+    speedMin: Number.isFinite(speedMin) ? speedMin : 0,
+    speedMax: Number.isFinite(speedMax) ? speedMax : 0,
+    points: null,
+  };
+}
+
+function createSolverParticleTexture() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d");
+  const glow = ctx.createRadialGradient(32, 32, 0, 32, 32, 31);
+  glow.addColorStop(0, "rgba(255,255,255,1)");
+  glow.addColorStop(0.32, "rgba(255,255,255,0.96)");
+  glow.addColorStop(0.72, "rgba(255,255,255,0.42)");
+  glow.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, 64, 64);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+function ensureSolverParticlePoints(view, particles) {
+  if (particles.points) return;
+  const geometry = new THREE.BufferGeometry();
+  const positions = new THREE.BufferAttribute(particles.positions, 3);
+  const colors = new THREE.BufferAttribute(particles.colors, 3);
+  positions.setUsage(THREE.DynamicDrawUsage);
+  colors.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute("position", positions);
+  geometry.setAttribute("color", colors);
+  const material = new THREE.PointsMaterial({
+    alphaTest: 0.02,
+    blending: THREE.AdditiveBlending,
+    depthTest: true,
+    depthWrite: false,
+    map: createSolverParticleTexture(),
+    opacity: 0.92,
+    size: 0.052,
+    sizeAttenuation: true,
+    toneMapped: false,
+    transparent: true,
+    vertexColors: true,
+  });
+  particles.points = new THREE.Points(geometry, material);
+  particles.points.frustumCulled = false;
+  particles.points.renderOrder = 2;
+  view.group.add(particles.points);
+}
+
+function writeSolverParticleColor(colors, offset, value, minimum, maximum) {
+  const span = maximum - minimum;
+  const amount = span > 1e-9 ? clamp((value - minimum) / span, 0, 1) : 0.5;
+  const scaled = amount * (SPEED_COLOR_STOPS_LINEAR.length - 1);
+  const index = Math.min(SPEED_COLOR_STOPS_LINEAR.length - 2, Math.floor(scaled));
+  const blend = scaled - index;
+  const from = SPEED_COLOR_STOPS_LINEAR[index];
+  const to = SPEED_COLOR_STOPS_LINEAR[index + 1];
+  colors[offset] = lerp(from[0], to[0], blend);
+  colors[offset + 1] = lerp(from[1], to[1], blend);
+  colors[offset + 2] = lerp(from[2], to[2], blend);
+}
+
+function updateSolverParticles(view, dt) {
+  const flow = state.caseReport?.solverStreamlines;
+  if (!shouldDrawSolverParticles()) {
+    if (state.viewer.solverParticles?.points) state.viewer.solverParticles.points.visible = false;
+    return;
+  }
+  if (state.viewer.solverParticles?.source !== flow) prepareSolverParticles(flow);
+  const particles = state.viewer.solverParticles;
+  if (!particles?.lines?.length) return;
+  ensureSolverParticlePoints(view, particles);
+  particles.points.visible = true;
+
+  const advance = Math.max(0, Number(dt) || 0) * SOLVER_PARTICLE_ANIMATION_RATE;
+  const zOffset = meshGroundOffset();
+  for (let particleIndex = 0; particleIndex < particles.lineIndices.length; particleIndex += 1) {
+    const line = particles.lines[particles.lineIndices[particleIndex]];
+    let travel = particles.travelPositions[particleIndex] + advance;
+    let segment = particles.segmentIndices[particleIndex];
+    if (travel >= line.totalTravelTime) {
+      travel %= line.totalTravelTime;
+      segment = 0;
+    }
+    while (segment < line.travelTimes.length - 2 && travel >= line.travelTimes[segment + 1]) segment += 1;
+    while (segment > 0 && travel < line.travelTimes[segment]) segment -= 1;
+    particles.travelPositions[particleIndex] = travel;
+    particles.segmentIndices[particleIndex] = segment;
+
+    const segmentStart = line.travelTimes[segment];
+    const segmentEnd = line.travelTimes[segment + 1];
+    const amount = clamp((travel - segmentStart) / Math.max(segmentEnd - segmentStart, 1e-9), 0, 1);
+    const fromOffset = segment * 3;
+    const toOffset = fromOffset + 3;
+    const outputOffset = particleIndex * 3;
+    particles.positions[outputOffset] = lerp(line.coordinates[fromOffset], line.coordinates[toOffset], amount);
+    particles.positions[outputOffset + 1] = lerp(line.coordinates[fromOffset + 1], line.coordinates[toOffset + 1], amount);
+    particles.positions[outputOffset + 2] = lerp(
+      line.coordinates[fromOffset + 2],
+      line.coordinates[toOffset + 2],
+      amount,
+    ) + zOffset;
+    const speed = lerp(line.speeds[segment], line.speeds[segment + 1], amount);
+    writeSolverParticleColor(particles.colors, outputOffset, speed, particles.speedMin, particles.speedMax);
+  }
+  particles.points.geometry.getAttribute("position").needsUpdate = true;
+  particles.points.geometry.getAttribute("color").needsUpdate = true;
+}
+
+function resetSolverParticles() {
+  const particles = state.viewer.solverParticles;
+  if (particles?.points) {
+    particles.points.parent?.remove(particles.points);
+    particles.points.geometry.dispose();
+    particles.points.material.map?.dispose();
+    particles.points.material.dispose();
+  }
+  state.viewer.solverParticles = null;
+}
+
+function renderThreeStlModel(cameraState, dt = 0) {
+  const view = ensureThreeViewer();
+  if (!view) return false;
+  try {
+    const geometryKey = [
+      state.modelPath || "model",
+      state.mesh?.triangleCount || 0,
+      state.mesh?.sampledTriangleCount || 0,
+      modelOrientationKey(),
+      state.viewer.surfaceMode,
+      state.caseReport?.surfacePressure?.file || "no-cp",
+      state.caseReport?.surfacePressure?.triangleCount || 0,
+    ].join("|");
+    if (view.geometryKey !== geometryKey) rebuildThreeGeometry(view, geometryKey);
+    if (!view.mesh) return false;
+
+    const width = Math.max(1, Math.round(cameraState.width));
+    const height = Math.max(1, Math.round(cameraState.height));
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    if (view.width !== width || view.height !== height || view.pixelRatio !== pixelRatio) {
+      view.renderer.setPixelRatio(pixelRatio);
+      view.renderer.setSize(width, height, false);
+      view.width = width;
+      view.height = height;
+      view.pixelRatio = pixelRatio;
+    }
+
+    updateThreeCamera(view, cameraState);
+    view.wireframe.visible = els.showEdges.checked;
+    updateSolverParticles(view, dt);
+    view.renderer.render(view.scene, view.camera);
+    return true;
+  } catch (error) {
+    disableThreeViewer(error);
+    return false;
+  }
 }
 
 function ensureThreeViewer() {
@@ -3784,12 +4310,18 @@ function ensureThreeViewer() {
       preserveDrawingBuffer: true,
       powerPreference: "high-performance",
     });
+    view.contextLostHandler = (event) => {
+      event.preventDefault();
+      disableThreeViewer(new Error("WebGL context was lost."));
+      drawFlow();
+    };
+    els.modelCanvas.addEventListener("webglcontextlost", view.contextLostHandler, { once: true });
     view.renderer.setClearColor(0x000000, 0);
     view.renderer.outputColorSpace = THREE.SRGBColorSpace;
     view.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     view.renderer.toneMappingExposure = 1.1;
     view.scene = new THREE.Scene();
-    view.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+    view.camera = new THREE.PerspectiveCamera(45, 1, VIEWER_CAMERA_NEAR, VIEWER_CAMERA_FAR);
     view.group = new THREE.Group();
     view.scene.add(view.group);
     view.scene.add(new THREE.HemisphereLight(0xdcebf0, 0x17232c, 2.25));
@@ -3801,10 +4333,47 @@ function ensureThreeViewer() {
     view.scene.add(rimLight);
     return view;
   } catch (error) {
-    console.warn("WebGL model viewer unavailable; using Canvas2D fallback.", error);
-    view.failed = true;
+    disableThreeViewer(error);
     return null;
   }
+}
+
+function disableThreeViewer(error) {
+  const view = state.viewer.webgl;
+  if (!view.failed) console.warn("Three.js viewer failed; using Canvas2D solved lines.", error);
+  resetSolverParticles();
+  try {
+    if (view.group) disposeThreeGeometry(view);
+  } catch (_disposeError) {
+    // Continue clearing the failed viewer even when a partial resource cannot be disposed.
+  }
+  if (view.contextLostHandler) {
+    els.modelCanvas.removeEventListener("webglcontextlost", view.contextLostHandler);
+    view.contextLostHandler = null;
+  }
+  try {
+    view.renderer?.clear();
+    view.renderer?.dispose();
+  } catch (_rendererError) {
+    // Resetting the canvas below removes any stale frame left by a failed renderer.
+  }
+  view.failed = true;
+  view.renderer = null;
+  view.scene = null;
+  view.camera = null;
+  view.group = null;
+  view.mesh = null;
+  view.wireframe = null;
+  view.geometryKey = null;
+  view.width = 0;
+  view.height = 0;
+  view.pixelRatio = 0;
+  els.modelCanvas.width = Math.max(1, els.modelCanvas.width);
+  state.viewer.modelLayer = null;
+  state.viewer.surfaceMode = "material";
+  state.viewer.solverFlowMode = "lines";
+  syncSurfaceModeControls();
+  syncSolverFlowControls();
 }
 
 function rebuildThreeGeometry(view, geometryKey) {
@@ -4009,9 +4578,16 @@ function updateThreeCamera(view, cameraState) {
   view.camera.position.copy(depth).multiplyScalar(-focal);
   view.camera.up.copy(up);
   view.camera.lookAt(0, 0, 0);
+  view.camera.setViewOffset(
+    cameraState.width,
+    cameraState.height,
+    0,
+    -cameraState.height * 0.05,
+    cameraState.width,
+    cameraState.height,
+  );
   view.camera.updateProjectionMatrix();
-  const verticalShift = (cameraState.height * 0.05) / Math.max(cameraState.unit, 1);
-  view.group.position.copy(up).multiplyScalar(-verticalShift);
+  view.group.position.set(0, 0, 0);
 }
 
 function invalidateThreeGeometry() {
@@ -4366,7 +4942,11 @@ function drawViewerHud(ctx, width, height) {
         ? hasSurfaceWallShear() ? "OpenFOAM total drag" : "OpenFOAM pressure drag"
         : state.viewer.surfaceMode === "cp" && hasSurfacePressure()
           ? "OpenFOAM body Cp"
-        : solvedFlow ? "OpenFOAM pressure air" : report ? "surface-guided air preview" : "sample airflow preview",
+        : solvedFlow
+          ? state.caseReport.solverStreamlines.timeAveraged
+            ? "OpenFOAM mean-flow speed"
+            : "OpenFOAM final-field speed"
+          : report ? "surface-guided air preview" : "sample airflow preview",
     ];
   ctx.fillStyle = "rgba(15,24,34,0.68)";
   roundRectPath(ctx, 14, 14, 238, 78, 8);

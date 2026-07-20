@@ -1,25 +1,31 @@
-# Animated Particle Traces — Design Plan
+# Animated Particle Traces — Implementation Plan
 
-Status: **proposed, not implemented.** This covers the Phase 7 roadmap item
+Status: **implementation-ready.** This defines the browser-only Phase 7 feature
 "Add particle traces from OpenFOAM velocity fields."
 
 ## Summary
 
-Particle traces can be built as a **browser-only feature**. No OpenFOAM
-dictionary changes, no new backend parsing, no new API endpoint, and no change
-to case generation. Everything required is already in the payload that
-`parse_streamlines` sends today.
+Particle traces can be implemented entirely in the existing browser viewer. No
+OpenFOAM dictionary changes, backend parsing, API endpoint, or case-generation
+changes are required. OpenFOAM has already integrated the paths, and
+`parse_streamlines` already returns the geometry and local speed needed to
+animate particles along them.
 
-This was the main finding while scoping the work, and it changes the size of the
-job considerably.
+The first version will:
 
-## What already exists
+- animate particles along solved streamline paths;
+- offer `Lines | Particles | Both`, defaulting to `Both`;
+- color both solved lines and particles by local speed;
+- label transient results as mean-flow visualization;
+- retain pressure, temperature, and drag as separate surface fields; and
+- fall back to solved lines if WebGL particle rendering is unavailable.
+
+## Existing data and viewer architecture
 
 AeroLab writes an OpenFOAM `streamlines` function object into every case
-(`system/streamlines`), seeded from explicit points, sampling `U`/`UMean`,
+(`system/streamlines`) with `direction forward`. It samples `U`/`UMean`,
 `p`/`pMean`, and a turbulence field. After a completed run,
-`aerolab.solver.visualization.parse_streamlines` reads the resulting legacy
-ASCII VTK track file and returns:
+`aerolab.solver.visualization.parse_streamlines` returns a bounded payload:
 
 ```jsonc
 {
@@ -29,168 +35,224 @@ ASCII VTK track file and returns:
   "speedRange": [0.0, 46.2],
   "pressureRange": [-1200.0, 900.0],
   "lines": [
-    [ [x, y, z, speed, pressure], ... ],   // one polyline per streamline
-    ...
+    [ [x, y, z, speed, pressure], ... ]
   ]
 }
 ```
 
-Three properties of this payload matter for the design:
+Important properties:
 
-1. **Geometry is already in viewer space.** Points are transformed to the
-   canonical flow frame, then centred and scaled with the same
-   `normalizedCenter`/`normalizedScale` used by the geometry preview. They align
-   with the rendered STL with no extra transform.
-2. **Per-point speed is already present** (index 3 of each point), along with a
-   global `speedRange` for normalisation.
-3. **It is already decimated** for the browser (`max_lines=220`,
-   `max_points_per_line=500`), so the payload size is bounded.
+1. Points are already transformed into the canonical flow frame, centered, and
+   scaled with the geometry preview's `normalizedCenter` and `normalizedScale`.
+2. Per-point physical speed is at index 3, with a global `speedRange`.
+3. `timeAveraged` distinguishes transient `UMean` tracks from final-field `U`
+   tracks.
+4. The parser limits output to 220 lines and about 500 points per line.
+5. The viewer uses two stacked canvases: Canvas2D renders the tunnel and solved
+   lines, while Three.js renders the model. Particles belong in the existing
+   Three.js scene so they can be depth-tested against the model.
 
-OpenFOAM has, in effect, already performed the path integration. The browser
-does not need to integrate a velocity field itself.
+The points still require the same runtime `meshGroundOffset()` applied to the
+model and Canvas2D solved lines.
 
-## Rejected alternative: volumetric advection
+## Design decisions
 
-The conventional way to build particle traces is to sample the full 3-D velocity
-field onto a regular grid, ship it to the browser, and advect particles through
-it (often on the GPU). That was considered and rejected:
+### Flow-field semantics
 
-- It requires **new OpenFOAM output** (volume field sampling or a full field
-  export) and therefore changes case generation.
-- The payload is **large**. A standard-quality case targets 2.8 M cells; even a
-  coarse resampling is orders of magnitude above the existing 128 MB streamline
-  guard.
-- It requires **runtime interpolation** in the browser, with its own
-  correctness and performance risks.
+The current implementation colors solved ribbons by pressure even though the
+product documentation describes them as speed-colored. Particle traces require
+a speed scale, so the first version will make the solved-flow semantics
+consistent:
 
-The only thing it buys is particles in arbitrary regions of the domain rather
-than along seeded paths. That trade is not worth it for the first version — see
-*Known limitations* below.
+- solved ribbons use the speed ramp;
+- particles use the same speed ramp;
+- a dedicated speed legend is shown whenever solved flow is visible; and
+- surface `Cp`, temperature, and drag retain their existing independent legend.
 
-## Design
+When both a solved-flow legend and a surface-field legend are visible, they are
+stacked rather than sharing a scale.
 
-### 1. Data preparation
+### Visual time, not physical time
 
-When a `solverStreamlines` payload arrives, precompute once per line:
+Streamline coordinates are normalized viewer units while speed values are
+physical metres per second. They must not be combined directly as
+`distance += speed * dt`.
 
-- cumulative arc length `s[i]` along the polyline
-- total length `L`
-- per-vertex speed `v[i]`
+For each usable segment, compute its viewer-space length `ds` and a dimensionless
+speed ratio:
 
-Lines with fewer than two points are skipped.
-
-### 2. Advection model
-
-Each particle stores a single scalar: its arc position `u` along its assigned
-line. Per animation frame:
-
-```
-u += v(u) * dt * timeScale     // v(u) linearly interpolated from v[i] at s[i]
-u %= L                          // recycle at the end of the line
+```text
+speedRatio = max(meanSegmentSpeed / globalMaximumSpeed, speedFloor)
+segmentTravelTime = ds / speedRatio
 ```
 
-The particle's world position is the linear interpolation of the polyline
-vertices at arc length `u`.
+For a degenerate speed range, use one constant visual speed ratio. A particle
+stores its position in this cumulative **visual travel-time** coordinate:
 
-Advancing at a rate proportional to **local** speed is the point of the feature:
-particles bunch up in slow and separated regions and streak through fast ones,
-which is what makes wakes, stagnation, and reattachment legible. A constant-rate
-animation would look plausible and communicate nothing.
+```text
+travel += dt * animationRate
+travel %= totalTravelTime
+```
 
-### 3. Rendering
+The segment's cumulative travel-time interval determines the interpolation
+amount between its endpoints. This preserves relative local-speed differences
+without pretending that the animation clock is solver time.
 
-- A single `THREE.Points` object with one `BufferGeometry`.
-- One preallocated `Float32Array` for positions, updated in place each frame with
-  `needsUpdate = true`. No allocation inside the animation loop.
-- Per-particle colour from speed, normalised by the existing `speedRange` so the
-  particles and the streamline ribbons share one legend and one colour ramp.
-- Additive blending with a small round sprite for a smoke/spark appearance.
+Particles are initially spaced uniformly in visual travel time. They therefore
+appear closer together in slow regions immediately instead of waiting for an
+initially uniform arc-length distribution to distort.
 
-This is one draw call and `O(N)` scalar work per frame.
+## Data preparation
 
-### 4. Budget
+Prepare data once for each new `solverStreamlines` object:
 
-Target **3,000–6,000 particles** — roughly 15–30 per line across 220 lines. At
-that count a single `Points` object with a typed-array update is comfortably
-60 fps. Particle count should scale down when `lineCount` is small.
+1. Reject lines with fewer than two finite points.
+2. Collapse consecutive duplicate positions.
+3. Store coordinates and speeds in typed arrays.
+4. Precompute cumulative visual travel time for every line.
+5. Allocate particles across lines in proportion to line travel time, targeting
+   roughly 24 particles per source line and capping the total near 5,200.
+6. Store each particle's line index, travel position, and current segment index.
+7. Preallocate position and color `Float32Array` buffers.
 
-### 5. Integration with the existing viewer
+Keeping a segment cursor makes normal per-frame interpolation `O(N)`. A particle
+that crosses multiple short segments advances the cursor until it reaches the
+correct interval; wrapping resets the cursor to zero.
 
-Particle traces are a **display option on top of solver streamlines**, not a
-separate surface mode:
+## Animation and rendering
 
-- A control offering `lines | particles | both`.
-- Reuse the existing speed legend and colour ramp.
-- Reuse the animation loop that already drives the airflow preview. Do not add a
-  second `requestAnimationFrame` loop.
-- Disable the control, with the reason shown, when `solverStreamlines` is absent
-  or carries an `error` key.
+### Shared animation loop
 
-### 6. Edge cases
+Reuse the existing `requestAnimationFrame` loop. `tickViewer` already computes a
+clamped `dt`; pass it into the render path instead of discarding it.
 
-| Case | Behaviour |
+The shared loop remains active for the viewer. Particle buffer updates are
+skipped when:
+
+- the mode is `Lines`;
+- solved streamlines are unavailable;
+- the document is hidden; or
+- WebGL initialization failed.
+
+A direct redraw caused by orbit, zoom, or a control change uses `dt = 0`, which
+updates projected state without advancing particles.
+
+### Three.js layer
+
+Use one `THREE.Points` object attached to the existing viewer group:
+
+- one `BufferGeometry`;
+- one preallocated position attribute;
+- one preallocated color attribute;
+- a small radial sprite texture for round particles;
+- additive blending;
+- depth testing enabled and depth writes disabled; and
+- the same camera, group translation, and `meshGroundOffset()` as the model.
+
+Both position and color attributes are updated in place. Color must change as a
+particle enters a segment with a different speed.
+
+### Canvas2D solved lines
+
+Keep solved ribbons on Canvas2D, but cache their projected geometry and local
+speed instead of pressure. Draw the underlay with the shared local-speed ramp
+and use a thin neutral moving dash as the direction cue so a path-average color
+does not obscure local values. The line animation remains based on absolute
+frame time; the particle animation uses `dt`.
+
+## Controls and labels
+
+Add a second viewer control group:
+
+```text
+Solved flow   Lines | Particles | Both
+```
+
+Behavior:
+
+- default to `Both` when solved streamlines are available;
+- keep the selected mode while switching cases in the current session;
+- disable all three buttons when solved streamlines are absent or contain an
+  `error`;
+- show the parser error, or explain that a solver run is required;
+- disable particle modes and select `Lines` if WebGL is unavailable;
+- label transient results `Mean-flow speed`; and
+- label steady/final results `Final-field speed`.
+
+The mean-flow label is required because animating `UMean` paths must not imply
+that instantaneous transient structures are being displayed.
+
+## Lifecycle and disposal
+
+Particle state is keyed by the `solverStreamlines` object returned for the
+active report. On model load, case switch, report replacement, or missing flow:
+
+1. remove the old `THREE.Points` object from the group;
+2. dispose its geometry, material, and sprite texture;
+3. clear typed-array and prepared-line references; and
+4. reset the cached Canvas2D solved-flow layer.
+
+Changing surface mode may rebuild model geometry but must not dispose the
+independent particle object.
+
+## Edge cases
+
+| Case | Behavior |
 | --- | --- |
-| `solverStreamlines.error` present | Control disabled, message surfaced |
-| Line with fewer than 2 points | Skipped during preparation |
-| `speedRange` degenerate (min == max) | Uniform colour, constant advection rate |
-| Zero-speed segment | Clamp advection to a small floor so particles cannot freeze permanently |
-| Case switched, or panel hidden | Stop animating — same discipline as the run-log polling |
+| `solverStreamlines.error` present | Disable flow controls and surface the message |
+| Fewer than two finite distinct points | Skip the line |
+| Degenerate `speedRange` | Uniform color and constant visual advection |
+| Zero or near-zero local speed | Clamp to a small visual floor so particles recycle |
+| Particle-only mode with WebGL failure | Fall back to `Lines`, use the neutral Canvas model, disable solved surface-field modes, and explain why |
+| Case switched or model loaded | Dispose stale particle state before redraw |
+| Browser tab hidden | Keep rendering lifecycle intact but skip particle advancement |
+
+## Performance budget
+
+Target about 24 particles per usable line, capped near 5,200. With at most 220
+source lines, this remains one draw call and linear typed-array work per active
+frame. No arrays, vectors, colors, or materials are allocated inside the
+particle loop.
 
 ## Known limitations
 
-These are intrinsic to the approach and should be stated in the UI rather than
-papered over.
+1. **Transient cases show mean-flow paths, not instantaneous flow.** The label
+   must say `Mean-flow speed` when `timeAveraged` is true.
+2. **Particles remain confined to seeded streamlines.** Arbitrary free-space
+   particles would require volumetric velocity output and browser interpolation,
+   which is a different feature.
+3. **Streamlines are browser-decimated.** Particle density is a visualization of
+   relative residence time along the sampled tracks, not physical concentration
+   or mass-flow density.
+4. **Animation time is intentionally visual.** It preserves local speed ratios
+   but does not represent elapsed solver seconds.
 
-1. **Transient cases show mean-flow paths, not instantaneous ones.** When the
-   case is transient, the streamlines function object samples `UMean`, so the
-   tracks are pathlines of the *time-averaged* field. Animating them can imply
-   unsteady structure that is not being shown. The payload already carries
-   `timeAveraged`; the label must reflect it, in the same spirit as the
-   "Mean field" / "Final field" distinction used for surface temperature.
+## Delivery stages
 
-2. **Particles are confined to the seeded streamline set.** They show the
-   topology of the seeded flow, not arbitrary regions of the tunnel. Particles
-   anywhere in the domain would require the rejected volumetric approach and is a
-   genuinely different design — worth deciding deliberately rather than drifting
-   into it.
+### Version 1 — this implementation
 
-3. **Streamlines are decimated for the browser.** The rendered paths are a
-   sampled subset of the solver's tracks. This is existing behaviour, but it
-   means particle density is not a physical quantity and must not be read as one.
+- typed-array path preparation and visual-time advection;
+- one Three.js particle draw call;
+- speed-colored solved lines and particles;
+- `Lines | Particles | Both` controls;
+- separate speed and surface-field legends;
+- mean/final-field labeling; and
+- lifecycle cleanup and WebGL fallback.
 
-## Staging
+### Future polish
 
-1. **Stage 1** — arc-length precompute, advection, `Points` rendering. Rendered
-   alongside the existing lines; no new control yet.
-2. **Stage 2** — the `lines | particles | both` control, legend integration, and
-   the transient/mean-flow labelling.
-3. **Stage 3** — polish: particle density control, size or opacity varying with
-   speed.
+- particle density control;
+- particle size or opacity controls;
+- pause or animation-rate control; and
+- executable JavaScript unit tests if the project adopts a JS test runner.
 
-Stage 1 is self-contained and independently reviewable.
+## Validation
 
-## Testing
+The repository currently has no JavaScript test runner. Validate the feature by:
 
-No backend changes means no new Python unit tests for the feature itself.
-
-The repository has no JavaScript test runner, and the existing convention is to
-assert that front-end behaviour is wired by checking the contents of
-`index.html` and `app.js` — see
-`tests/test_webapp.py::test_inverted_orbit_control_is_wired_and_persistent`.
-New tests should follow that convention:
-
-- assert the mode control id exists in `index.html`
-- assert the advection and particle-setup functions are referenced in `app.js`
-- assert the transient/mean-flow label text is present
-
-If stronger guarantees are wanted later, the arc-length and interpolation
-helpers are pure functions and could be extracted for a real JS test runner.
-That is a separate decision about adding front-end tooling.
-
-## Open questions
-
-- Should particles default to on when solver streamlines are available, or stay
-  opt-in?
-- Is the seeded-set limitation acceptable long term, or is free-space particle
-  seeding a real requirement? That answer determines whether the volumetric
-  approach ever needs revisiting.
+1. running Ruff and the complete Python unit-test suite;
+2. loading a report with final-field streamlines and checking all three modes;
+3. loading a transient report and verifying the `Mean-flow speed` label;
+4. orbiting and zooming to verify particle/model alignment and depth testing;
+5. switching cases to verify stale particles disappear; and
+6. confirming speed and surface-field legends remain distinct in `Both` mode.

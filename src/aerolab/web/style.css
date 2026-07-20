@@ -370,13 +370,43 @@ select {
 }
 
 .viewer-controls {
-  align-items: stretch;
+  align-items: flex-end;
   display: flex;
+  flex-direction: column;
   gap: 6px;
   position: absolute;
   right: 12px;
   top: 12px;
   z-index: 3;
+}
+
+.viewer-control-row {
+  align-items: stretch;
+  display: flex;
+  gap: 6px;
+}
+
+.solver-flow-control {
+  align-items: center;
+  background: rgba(15, 24, 34, 0.78);
+  border: 1px solid rgba(191, 211, 220, 0.2);
+  border-radius: 6px;
+  color: #dfeaf1;
+  display: flex;
+  gap: 8px;
+  max-width: min(100%, 430px);
+  padding-left: 9px;
+}
+
+.solver-flow-control > span {
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  max-width: 150px;
+}
+
+.solver-flow-control.unavailable > span {
+  color: rgba(174, 191, 200, 0.65);
 }
 
 .drag-summary {
@@ -463,8 +493,19 @@ select {
   border: 1px solid rgba(191, 211, 220, 0.2);
   border-radius: 6px;
   display: grid;
-  grid-template-columns: repeat(3, minmax(48px, auto));
   overflow: hidden;
+}
+
+.surface-mode-segmented {
+  grid-template-columns: repeat(4, minmax(48px, auto));
+}
+
+.flow-mode-segmented {
+  background: transparent;
+  border-bottom: 0;
+  border-right: 0;
+  border-top: 0;
+  grid-template-columns: repeat(3, minmax(48px, auto));
 }
 
 .viewer-segmented button {
@@ -2100,11 +2141,20 @@ body[data-view-mode="basic"] #runCaseButton:hover:not(:disabled) {
 }
 
 .viewer-segmented,
-.viewer-toggle {
+.viewer-toggle,
+.solver-flow-control {
   backdrop-filter: blur(12px);
   background: rgba(7, 21, 30, 0.74);
   border-color: rgba(191, 211, 220, 0.17);
   border-radius: 9px;
+}
+
+.solver-flow-control .flow-mode-segmented {
+  background: transparent;
+  border-bottom: 0;
+  border-right: 0;
+  border-top: 0;
+  border-radius: 0 9px 9px 0;
 }
 
 .viewer-segmented button {
