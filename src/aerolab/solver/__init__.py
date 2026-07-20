@@ -20,7 +20,9 @@ from .analysis import (  # noqa: F401
 )
 from .backends import (  # noqa: F401
     OPENFOAM_BOOTSTRAP,
+    OPENFOAM_PARALLEL_EXECUTABLES,
     _run_command,
+    probe_backend_resources,
     solver_status,
 )
 from .comparison import compare_cases  # noqa: F401
@@ -38,6 +40,8 @@ from .run import (  # noqa: F401
     _clear_previous_solver_outputs,
     _mesh_input_fingerprint,
     _mesh_record_reusable,
+    normalize_file_handler,
+    normalize_process_request,
     run_case,
 )
 from .statistics import analyze_transient_history  # noqa: F401
@@ -45,7 +49,11 @@ from .studies import (  # noqa: F401
     SENSITIVITY_PARAMETERS,
     create_sensitivity_study,
     create_sensitivity_study_from_case,
+    normalize_study_process_budget,
+    plan_study_schedule,
+    run_study,
     sensitivity_study_report,
+    study_members,
 )
 from .visualization import (  # noqa: F401
     CASE_PREVIEW_TRIANGLE_LIMIT,

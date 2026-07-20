@@ -39,6 +39,51 @@ OPENFOAM_EXECUTABLES = (
     "foamPostProcess",
 )
 
+OPENFOAM_PARALLEL_EXECUTABLES = (
+    "mpirun",
+    "decomposePar",
+    "reconstructParMesh",
+    "reconstructPar",
+)
+
+
+def _resource_probe_script() -> str:
+    lines = [
+        "set +e\n",
+        "if command -v nproc >/dev/null 2>&1; then\n",
+        "  AEROLAB_LOGICAL_CPUS=$(nproc 2>/dev/null)\n",
+        "else\n",
+        "  AEROLAB_LOGICAL_CPUS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')\n",
+        "fi\n",
+        "printf 'AEROLAB_RESOURCE_LOGICAL_CPUS=%s\\n' \"$AEROLAB_LOGICAL_CPUS\"\n",
+        "if [ -r /proc/meminfo ]; then\n",
+        "  awk '/^MemAvailable:/ {printf \"AEROLAB_RESOURCE_MEM_AVAILABLE_KIB=%s\\n\", $2}' /proc/meminfo\n",
+        "fi\n",
+        "for AEROLAB_CPU_MAX in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/cpu/cpu.cfs_quota_us; do\n",
+        "  if [ -r \"$AEROLAB_CPU_MAX\" ]; then printf 'AEROLAB_RESOURCE_CPU_LIMIT=%s\\n' \"$(tr '\\n' ' ' < \"$AEROLAB_CPU_MAX\")\"; break; fi\n",
+        "done\n",
+        "if [ -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then\n",
+        "  printf 'AEROLAB_RESOURCE_CPU_PERIOD=%s\\n' \"$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)\"\n",
+        "fi\n",
+        "for AEROLAB_CPUSET in /sys/fs/cgroup/cpuset.cpus.effective /sys/fs/cgroup/cpuset/cpuset.cpus; do\n",
+        "  if [ -r \"$AEROLAB_CPUSET\" ]; then printf 'AEROLAB_RESOURCE_CPUSET=%s\\n' \"$(cat \"$AEROLAB_CPUSET\")\"; break; fi\n",
+        "done\n",
+        "for AEROLAB_MEMORY_MAX in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do\n",
+        "  if [ -r \"$AEROLAB_MEMORY_MAX\" ]; then printf 'AEROLAB_RESOURCE_MEMORY_MAX=%s\\n' \"$(cat \"$AEROLAB_MEMORY_MAX\")\"; break; fi\n",
+        "done\n",
+        "for AEROLAB_MEMORY_CURRENT in /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory/memory.usage_in_bytes; do\n",
+        "  if [ -r \"$AEROLAB_MEMORY_CURRENT\" ]; then printf 'AEROLAB_RESOURCE_MEMORY_CURRENT=%s\\n' \"$(cat \"$AEROLAB_MEMORY_CURRENT\")\"; break; fi\n",
+        "done\n",
+    ]
+    for executable in OPENFOAM_PARALLEL_EXECUTABLES:
+        lines.extend(
+            (
+                f"AEROLAB_TOOL_PATH=$(command -v {shlex.quote(executable)} 2>/dev/null || true)\n",
+                f"printf 'AEROLAB_PARALLEL_TOOL_{executable}=%s\\n' \"$AEROLAB_TOOL_PATH\"\n",
+            )
+        )
+    return "".join(lines)
+
 
 def solver_status(timeout_seconds: int = 40) -> dict[str, object]:
     native_tools = {
@@ -172,6 +217,157 @@ def solver_status(timeout_seconds: int = 40) -> dict[str, object]:
                 status["preferredBackend"] = "docker"
 
     return status
+
+
+def probe_backend_resources(
+    backend: str,
+    timeout_seconds: int = 40,
+    solver_identity: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Measure resources and MPI tools inside the exact execution backend."""
+    script = _resource_probe_script()
+    if backend == "native":
+        command = ["bash", "-lc", script]
+    elif backend == "wsl":
+        if not shutil.which("wsl"):
+            raise RuntimeError("The WSL executable is not available for resource probing.")
+        command = ["wsl", "bash", "-lc", f"{OPENFOAM_BOOTSTRAP}\n{script}"]
+    elif backend == "docker":
+        if not shutil.which("docker"):
+            raise RuntimeError("The Docker executable is not available for resource probing.")
+        image: object = os.environ.get("AEROLAB_OPENFOAM_IMAGE")
+        if solver_identity is not None and solver_identity.get("imageId"):
+            image = solver_identity["imageId"]
+        if not isinstance(image, str) or not image:
+            raise RuntimeError("AEROLAB_OPENFOAM_IMAGE is not configured.")
+        command = [
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "bash",
+            image,
+            "-lc",
+            script,
+        ]
+    else:
+        raise RuntimeError(f"Unsupported resource-probe backend: {backend}")
+
+    probe = _run_quick(command, timeout_seconds, raise_errors=True)
+    if probe.returncode != 0:
+        detail = _trim(probe.stderr or probe.stdout)
+        raise RuntimeError(
+            f"The {backend} resource probe returned {probe.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    return _parse_resource_probe(probe.stdout, backend)
+
+
+def _parse_resource_probe(output: str, backend: str) -> dict[str, object]:
+    logical_cpus = _positive_int(_probe_marker(output, "AEROLAB_RESOURCE_LOGICAL_CPUS")) or 1
+    cpu_candidates = [logical_cpus]
+    cpuset = _probe_marker(output, "AEROLAB_RESOURCE_CPUSET")
+    cpuset_cpus = _cpuset_count(cpuset)
+    if cpuset_cpus:
+        cpu_candidates.append(cpuset_cpus)
+
+    cpu_limit = _probe_marker(output, "AEROLAB_RESOURCE_CPU_LIMIT")
+    cpu_period = _probe_marker(output, "AEROLAB_RESOURCE_CPU_PERIOD")
+    quota_cpus = _cpu_quota_count(cpu_limit, cpu_period)
+    if quota_cpus:
+        cpu_candidates.append(quota_cpus)
+    effective_cpus = max(1, min(cpu_candidates))
+
+    mem_available_kib = _positive_int(
+        _probe_marker(output, "AEROLAB_RESOURCE_MEM_AVAILABLE_KIB")
+    )
+    memory_candidates: list[int] = []
+    if mem_available_kib:
+        memory_candidates.append(mem_available_kib * 1024)
+    memory_max = _finite_cgroup_limit(
+        _probe_marker(output, "AEROLAB_RESOURCE_MEMORY_MAX")
+    )
+    memory_current = _positive_int(
+        _probe_marker(output, "AEROLAB_RESOURCE_MEMORY_CURRENT")
+    ) or 0
+    if memory_max is not None:
+        memory_candidates.append(max(0, memory_max - memory_current))
+    memory_available = min(memory_candidates) if memory_candidates else None
+
+    parallel_tools = {
+        executable: _probe_marker(output, f"AEROLAB_PARALLEL_TOOL_{executable}")
+        for executable in OPENFOAM_PARALLEL_EXECUTABLES
+    }
+    missing_tools = [name for name, path in parallel_tools.items() if not path]
+    return {
+        "backend": backend,
+        "logicalCpus": logical_cpus,
+        "cpuset": cpuset,
+        "cpusetCpus": cpuset_cpus,
+        "quotaCpus": quota_cpus,
+        "effectiveCpus": effective_cpus,
+        "memoryAvailableBytes": memory_available,
+        "memoryLimitBytes": memory_max,
+        "memoryCurrentBytes": memory_current if memory_max is not None else None,
+        "parallelAvailable": not missing_tools,
+        "parallelTools": parallel_tools,
+        "missingParallelTools": missing_tools,
+    }
+
+
+def _positive_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        number = int(value.strip())
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
+def _cpuset_count(value: str | None) -> int | None:
+    if not value:
+        return None
+    cpus: set[int] = set()
+    try:
+        for token in value.split(","):
+            bounds = token.strip().split("-", 1)
+            start = int(bounds[0])
+            end = int(bounds[-1])
+            if start < 0 or end < start:
+                return None
+            cpus.update(range(start, end + 1))
+    except ValueError:
+        return None
+    return len(cpus) or None
+
+
+def _cpu_quota_count(limit: str | None, period: str | None) -> int | None:
+    if not limit:
+        return None
+    parts = limit.split()
+    if parts[0] == "max":
+        return None
+    try:
+        quota = int(parts[0])
+        period_value = int(parts[1]) if len(parts) > 1 else int(period or "0")
+    except ValueError:
+        return None
+    if quota <= 0 or period_value <= 0:
+        return None
+    return max(1, quota // period_value)
+
+
+def _finite_cgroup_limit(value: str | None) -> int | None:
+    if not value or value.strip() == "max":
+        return None
+    try:
+        limit = int(value.strip())
+    except ValueError:
+        return None
+    if limit <= 0 or limit >= 1 << 60:
+        return None
+    return limit
 
 
 def openfoam_identity(backend: str, timeout_seconds: int = 40) -> dict[str, object]:
@@ -440,15 +636,36 @@ def _run_command(
     script_name: str = "Allrun",
     execution_id: str | None = None,
     solver_identity: dict[str, object] | None = None,
+    processes: int = 1,
+    file_handler: str = "auto",
+    resume: bool = False,
+    feature_cache_key: str = "disabled",
+    block_cache_key: str = "disabled",
 ) -> list[str]:
     if script_name not in {"Allrun", "Allmesh", "Allsolve"}:
         raise ValueError(f"Unsupported case script: {script_name}")
+    if isinstance(processes, bool) or not isinstance(processes, int) or processes < 1:
+        raise ValueError("OpenFOAM processes must be a positive integer.")
+    if file_handler not in {"auto", "uncollated", "collated", "masterUncollated"}:
+        raise ValueError(f"Unsupported OpenFOAM file handler: {file_handler}")
+    if not isinstance(resume, bool):
+        raise ValueError("Resume must be a boolean.")
+    for cache_key in (feature_cache_key, block_cache_key):
+        if cache_key != "disabled" and not re.fullmatch(r"[0-9a-f]{64}", cache_key):
+            raise ValueError("Stage-cache keys must be lowercase SHA-256 values.")
     identity_guard = _execution_identity_guard(solver_identity, backend)
+    process_export = f"export AEROLAB_PROCESSES={processes}\n"
+    file_handler_export = f"export AEROLAB_FILE_HANDLER={shlex.quote(file_handler)}\n"
+    cache_export = (
+        f"export AEROLAB_RESUME={1 if resume else 0}\n"
+        f"export AEROLAB_FEATURE_CACHE_KEY={shlex.quote(feature_cache_key)}\n"
+        f"export AEROLAB_BLOCK_CACHE_KEY={shlex.quote(block_cache_key)}\n"
+    )
     if backend == "native":
         return [
             "bash",
             "-lc",
-            f"{identity_guard}chmod +x {script_name} && ./{script_name}",
+            f"{identity_guard}{process_export}{file_handler_export}{cache_export}chmod +x {script_name} && ./{script_name}",
         ]
     if backend == "wsl":
         wsl_case_path = _windows_path_to_wsl(case_path)
@@ -458,6 +675,9 @@ def _run_command(
             f"{OPENFOAM_BOOTSTRAP}\n"
             "set -eu\n"
             f"{identity_guard}"
+            f"{process_export}"
+            f"{file_handler_export}"
+            f"{cache_export}"
             f"SOURCE_CASE={shlex.quote(wsl_case_path)}\n"
             'STAGE_ROOT="${AEROLAB_WSL_STAGE_ROOT:-$HOME/.cache/aerolab-cfd/runs}"\n'
             'mkdir -p -- "$STAGE_ROOT"\n'
@@ -527,6 +747,28 @@ def _run_command(
                 raise RuntimeError("The attested Docker image ID is missing.")
             execution_image = image_id
         container_name = _docker_container_name(case_path, execution_id)
+        docker_script = (
+            "set -eu\n"
+            f"{identity_guard}"
+            'SOURCE_CASE=/source\n'
+            'STAGE_CASE=/work\n'
+            'printf "=== AEROLAB DOCKER: staging case on Linux volume ===\\n"\n'
+            'cp -a -- "$SOURCE_CASE/." "$STAGE_CASE/"\n'
+            'copy_back() {\n'
+            '  run_status=$?\n'
+            '  trap - EXIT\n'
+            '  printf "=== AEROLAB DOCKER: copying results back to host ===\\n"\n'
+            '  rm -f -- "$STAGE_CASE/aerolab-run.log" "$STAGE_CASE/aerolab-run.json"\n'
+            '  if ! cp -a -- "$STAGE_CASE/." "$SOURCE_CASE/"; then\n'
+            '    printf "AeroLab Docker copy-back failed.\\n" >&2\n'
+            '    run_status=91\n'
+            '  fi\n'
+            '  exit "$run_status"\n'
+            '}\n'
+            'trap copy_back EXIT\n'
+            'cd "$STAGE_CASE"\n'
+            f"chmod +x {script_name} && ./{script_name}"
+        )
         return [
             "docker",
             "run",
@@ -535,15 +777,27 @@ def _run_command(
             container_name,
             "--stop-timeout",
             "30",
+            "--env",
+            f"AEROLAB_PROCESSES={processes}",
+            "--env",
+            f"AEROLAB_FILE_HANDLER={file_handler}",
+            "--env",
+            f"AEROLAB_RESUME={1 if resume else 0}",
+            "--env",
+            f"AEROLAB_FEATURE_CACHE_KEY={feature_cache_key}",
+            "--env",
+            f"AEROLAB_BLOCK_CACHE_KEY={block_cache_key}",
             "-v",
-            f"{case_path}:/case",
+            f"{case_path}:/source",
+            "--mount",
+            "type=volume,target=/work",
             "-w",
-            "/case",
+            "/work",
             "--entrypoint",
             "bash",
             execution_image,
             "-lc",
-            f"{identity_guard}chmod +x {script_name} && ./{script_name}",
+            docker_script,
         ]
     raise RuntimeError(f"Unsupported backend: {backend}")
 
@@ -564,6 +818,7 @@ def _backend_cleanup_command(
             "docker",
             "rm",
             "--force",
+            "--volumes",
             _docker_container_name(case_path, execution_id),
         ]
     return None

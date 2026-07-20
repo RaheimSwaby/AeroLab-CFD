@@ -141,6 +141,44 @@ class AccuracyStudyApiTests(unittest.TestCase):
         self.assertIn("STL coordinates calculate", app)
         self.assertIn("Measured length m", index)
 
+    def test_particle_trace_controls_and_rendering_are_wired(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        index = (project / "src" / "aerolab" / "web" / "index.html").read_text(encoding="utf-8")
+        app = (project / "src" / "aerolab" / "web" / "app.js").read_text(encoding="utf-8")
+
+        for control_id in (
+            "solverFlowStatus",
+            "solverLinesButton",
+            "solverParticlesButton",
+            "solverBothButton",
+        ):
+            with self.subTest(control_id=control_id):
+                self.assertIn(f'id="{control_id}"', index)
+
+        for function_name in (
+            "prepareSolverParticles",
+            "updateSolverParticles",
+            "resetSolverParticles",
+            "setSolverFlowMode",
+            "ensureSolverParticlePoints",
+            "syncSolverFlowControls",
+        ):
+            with self.subTest(function_name=function_name):
+                self.assertIn(f"function {function_name}(", app)
+
+        for label in ("Mean-flow speed", "Final-field speed"):
+            with self.subTest(label=label):
+                self.assertIn(label, app)
+
+        for button_name, mode in (
+            ("solverLinesButton", "lines"),
+            ("solverParticlesButton", "particles"),
+            ("solverBothButton", "both"),
+        ):
+            with self.subTest(mode=mode):
+                self.assertIn(f'[els.{button_name}, "{mode}"]', app)
+        self.assertIn('button.setAttribute("aria-pressed", String(active))', app)
+
     def test_creates_thermal_case_with_heat_zone_through_api(self) -> None:
         project = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -200,6 +238,195 @@ class AccuracyStudyApiTests(unittest.TestCase):
             self.assertIn("Q 5000;", fv_models)
             self.assertIn("fields (p wallShearStress T);", body_pressure)
 
+    def test_local_optimization_controls_and_study_wiring_are_present(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        index = (project / "src" / "aerolab" / "web" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        app = (project / "src" / "aerolab" / "web" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        for control_id in (
+            "solverProcesses",
+            "solverFileHandler",
+            "studyProcessBudget",
+            "resumeSolver",
+            "runStudyButton",
+            "optimizationStatus",
+        ):
+            with self.subTest(control_id=control_id):
+                self.assertIn(f'id="{control_id}"', index)
+        self.assertIn('src="/assets/app.js?v=67"', index)
+        self.assertIn('processes: els.solverProcesses.value', app)
+        self.assertIn('fileHandler: els.solverFileHandler.value', app)
+        self.assertIn('resume: !meshOnly && els.resumeSolver.checked', app)
+        self.assertIn('processBudget: els.studyProcessBudget.value', app)
+        self.assertIn('fetchJson("/api/run-study"', app)
+        self.assertIn('/api/study-progress?casePath=', app)
+        self.assertIn('function renderOptimizationStatus()', app)
+
+    def test_run_case_api_normalizes_and_propagates_optimization_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            case_path = root / "cases" / "api-optimization"
+            case_path.mkdir(parents=True)
+            server = AeroLabServer(("127.0.0.1", 0), root)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with patch.object(server, "start_case_run") as start_case_run:
+                    request = Request(
+                        f"http://127.0.0.1:{server.server_port}/api/run-case",
+                        data=json.dumps(
+                            {
+                                "casePath": str(case_path),
+                                "backend": "docker",
+                                "mode": "full",
+                                "timeoutSeconds": 1234,
+                                "reuseMesh": False,
+                                "processes": "4",
+                                "fileHandler": "masteruncollated",
+                                "resume": True,
+                            }
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urlopen(request, timeout=10) as response:
+                        self.assertEqual(response.status, 202)
+                        payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            start_case_run.assert_called_once_with(
+                case_path.resolve(),
+                "docker",
+                1234,
+                "full",
+                False,
+                4,
+                "masterUncollated",
+                True,
+            )
+            self.assertEqual(payload["processes"], 4)
+            self.assertEqual(payload["fileHandler"], "masterUncollated")
+            self.assertTrue(payload["resume"])
+
+    def test_study_progress_endpoint_returns_the_shared_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            case_path = root / "cases" / "study-progress"
+            case_path.mkdir(parents=True)
+            case_path.joinpath("case.json").write_text(
+                json.dumps({"name": "study-progress"}),
+                encoding="utf-8",
+            )
+            expected = {
+                "status": "running",
+                "completedCases": 1,
+                "totalCases": 3,
+                "percent": 33,
+            }
+            case_path.joinpath("aerolab-study-run.json").write_text(
+                json.dumps(expected),
+                encoding="utf-8",
+            )
+            server = AeroLabServer(("127.0.0.1", 0), root)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = (
+                    f"http://127.0.0.1:{server.server_port}/api/study-progress"
+                    f"?casePath={quote(str(case_path))}"
+                )
+                with urlopen(url, timeout=10) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["exists"])
+            self.assertEqual(payload["studyRun"], expected)
+
+    def test_study_run_reserves_every_member_against_duplicate_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "cases" / "study-first"
+            second = root / "cases" / "study-second"
+            first.mkdir(parents=True)
+            second.mkdir()
+            descriptor = {
+                "studyId": "reserved-study",
+                "kind": "grid_convergence",
+                "casePaths": [str(first), str(second)],
+            }
+            server = AeroLabServer(("127.0.0.1", 0), root)
+            started = threading.Event()
+            release = threading.Event()
+
+            def fake_run_study(*args: object, **kwargs: object) -> None:
+                started.set()
+                release.wait(timeout=5)
+
+            try:
+                with (
+                    patch("aerolab.webapp.study_members", return_value=descriptor),
+                    patch(
+                        "aerolab.webapp.run_study",
+                        side_effect=fake_run_study,
+                    ) as mocked_run,
+                ):
+                    result = server.start_study_run(
+                        first,
+                        "docker",
+                        3600,
+                        "full",
+                        True,
+                        "auto",
+                        6,
+                        "auto",
+                    )
+                    self.assertEqual(result, descriptor)
+                    self.assertTrue(started.wait(timeout=2))
+                    with server.active_runs_lock:
+                        worker = server.active_runs[first.resolve()]
+                        self.assertIs(worker, server.active_runs[second.resolve()])
+                    with self.assertRaisesRegex(ValueError, "already has an active"):
+                        server.start_case_run(
+                            second,
+                            "docker",
+                            3600,
+                            "full",
+                            True,
+                            "auto",
+                            "auto",
+                            False,
+                        )
+                    release.set()
+                    worker.join(timeout=2)
+                    self.assertFalse(worker.is_alive())
+                    mocked_run.assert_called_once_with(
+                        first.resolve(),
+                        backend="docker",
+                        timeout_seconds=3600,
+                        run_mode="full",
+                        reuse_mesh=True,
+                        processes="auto",
+                        process_budget=6,
+                        file_handler="auto",
+                    )
+                    with server.active_runs_lock:
+                        self.assertNotIn(first.resolve(), server.active_runs)
+                        self.assertNotIn(second.resolve(), server.active_runs)
+            finally:
+                release.set()
+                server.server_close()
+
     def test_case_runs_start_in_background_and_reject_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -214,16 +441,44 @@ class AccuracyStudyApiTests(unittest.TestCase):
                 release.wait(timeout=5)
 
             try:
-                with patch("aerolab.webapp.run_case", side_effect=fake_run_case):
-                    server.start_case_run(case_path, "wsl", 14400, "mesh", True)
+                with patch("aerolab.webapp.run_case", side_effect=fake_run_case) as mocked_run:
+                    server.start_case_run(
+                        case_path,
+                        "wsl",
+                        14400,
+                        "mesh",
+                        True,
+                        "auto",
+                        "auto",
+                        False,
+                    )
                     self.assertTrue(started.wait(timeout=2))
                     with self.assertRaisesRegex(ValueError, "already has an active"):
-                        server.start_case_run(case_path, "wsl", 14400, "mesh", True)
+                        server.start_case_run(
+                            case_path,
+                            "wsl",
+                            14400,
+                            "mesh",
+                            True,
+                            "auto",
+                            "auto",
+                            False,
+                        )
                     with server.active_runs_lock:
-                        worker = server.active_runs[case_path]
+                        worker = server.active_runs[case_path.resolve()]
                     release.set()
                     worker.join(timeout=2)
                     self.assertFalse(worker.is_alive())
+                    mocked_run.assert_called_once_with(
+                        case_path.resolve(),
+                        backend="wsl",
+                        timeout_seconds=14400,
+                        run_mode="mesh",
+                        reuse_mesh=True,
+                        processes="auto",
+                        file_handler="auto",
+                        resume=False,
+                    )
             finally:
                 release.set()
                 server.server_close()

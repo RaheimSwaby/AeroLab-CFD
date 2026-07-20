@@ -28,29 +28,120 @@ aerolab app
 
 Open `http://127.0.0.1:8765/` in your browser. The app runs locally on your machine.
 
-## Solver Check
+## Solver Backends
+
+Check the machine before attempting a run:
 
 ```powershell
-aerolab solver-status
+aerolab solver-status --json
 ```
 
-If no backend is available, install WSL2 and OpenFOAM. The app can generate cases without OpenFOAM, but real drag/lift results require the solver.
+Case generation and reports work without OpenFOAM. Meshing, solving, resume, and real performance measurements require OpenFOAM Foundation v13 in one of these environments:
 
-## Run A Case
+### Windows: WSL2 (recommended)
+
+1. Install a WSL2 Linux distribution and make the distribution containing Foundation v13 the WSL default.
+2. Install OpenFOAM Foundation v13 inside that distribution.
+3. From PowerShell, verify the distribution and required tools:
 
 ```powershell
-aerolab run-case .\cases\your-case-name
+wsl --status
+wsl --list --verbose
+wsl bash -lc "command -v foamRun blockMesh snappyHexMesh mpirun decomposePar reconstructParMesh reconstructPar"
+aerolab solver-status --json
+```
+
+AeroLab copies each case from the Windows filesystem to `$HOME/.cache/aerolab-cfd/runs` inside WSL, runs it on the Linux filesystem, and copies results back even after normal solver failure. This avoids running OpenFOAM's many small-file operations directly under `/mnt/c`. A marked interrupted stage is recovered on the next run; unmarked paths are never replaced.
+
+### Linux: native Foundation v13
+
+Install Foundation v13 so its environment and required commands are available to `bash -lc`, then run `aerolab solver-status --json`. Native execution does not need WSL or Docker.
+
+### Docker: optional, not required
+
+Docker is not required and is not installed or configured by AeroLab. If you intentionally choose it later:
+
+1. install and start a Docker-compatible local engine;
+2. complete any organization-required sign-in or policy setup;
+3. build or pull a vetted image containing OpenFOAM Foundation v13 and all commands reported by `solver-status`;
+4. configure the image explicitly; and
+5. rerun the status check.
+
+PowerShell:
+
+```powershell
+$env:AEROLAB_OPENFOAM_IMAGE = "your-vetted-foundation-v13-image"
+aerolab solver-status --json
+```
+
+Bash:
+
+```bash
+export AEROLAB_OPENFOAM_IMAGE=your-vetted-foundation-v13-image
+aerolab solver-status --json
+```
+
+AeroLab never pulls an image automatically. Docker runs bind-mount the durable case at `/source`, copy it to an anonymous Linux volume at `/work`, run there, copy results back, and remove the container with attached volumes. This avoids direct macOS/Windows bind-mount execution for OpenFOAM's small-file workload. Do not claim Docker support for an image until `solver-status` verifies the Foundation v13 identity and complete toolchain on the target architecture.
+
+## Run And Accelerate A Case
+
+The CLI and browser default to backend-aware automatic process selection:
+
+```powershell
+# Validate and fingerprint the mesh first.
+aerolab run-case .\cases\your-case-name --mode mesh --processes auto
+
+# Reuse the matching mesh for the full solve.
+aerolab run-case .\cases\your-case-name --processes auto
+
+# Request an exact rank count; invalid CPU/memory requests fail clearly.
+aerolab run-case .\cases\your-case-name --processes 4
+
+# Resume only a compatible failed full run.
+aerolab run-case .\cases\your-case-name --processes auto --resume
+
 aerolab report-case .\cases\your-case-name
 ```
 
-## CFD Solver Setup Later
+For an accuracy or sensitivity study, select any member:
 
-For full CFD runs on Windows, the cleanest options are:
+```powershell
+aerolab run-study .\cases\one-study-member --processes auto --process-budget auto
+```
 
-- WSL2 with OpenFOAM installed inside Linux
-- Docker Desktop with an OpenFOAM image
+The process budget is shared across every concurrent member. AeroLab estimates the largest member's memory need, bounds worker count, and falls back to concurrent serial cases when MPI is unavailable.
 
-The Python CLI will remain the local controller. The solver can run in WSL2/Docker so your Windows project files stay easy to manage.
+## Performance And Safety Contract
+
+Automatic rank selection uses resources visible **inside** the selected backend, not browser CPU counts or host-only values. It:
+
+- reserves one effective CPU;
+- reserves 25% of available memory, with a 1 GiB minimum reserve;
+- budgets 2 GiB per automatic MPI rank;
+- considers the configured maximum cell count at roughly 250,000 cells per useful rank;
+- caps one case at eight ranks; and
+- selects one rank if CPU, memory, case size, or MPI availability does not justify parallel execution.
+
+An explicit positive rank count is validated against backend CPU and memory data and is never silently clamped. `--file-handler auto` preserves the OpenFOAM default and is the safe choice until another handler has been verified with that MPI build.
+
+Generated cases cache only fingerprint-matched `surfaceFeatures` and `blockMesh` stages. Final mesh reuse additionally requires the validated mesh record, matching geometry/mesh inputs, `constant/polyMesh/points`, and the audited body surface. Any relevant input change causes rebuilding instead of stale reuse.
+
+`--resume` is intentionally strict. It requires a previously failed full run, unchanged solver inputs, a reusable mesh, and the latest reconstructed numeric time with both `U` and `p`. It skips initialization and uses `-latestTime`; it is rejected for mesh-only runs, successful runs, changed numerics, missing reconstructed fields, and disabled mesh reuse.
+
+Steady cases retain Foundation v13 `residualControl`; transient cases retain their fixed physical warmup and averaging windows. Resume and acceleration do not weaken any mesh, convergence, force-stability, Courant, field-completeness, or fidelity gate.
+
+### Performance expectations
+
+These are engineering expectations, not measured claims:
+
+- MPI can reduce expensive mesh and solve stages on sufficiently large cases, but scaling is not linear.
+- Small cases may be slower with MPI because decomposition, communication, reconstruction, and cleanup add overhead.
+- Stage-cache hits and validated mesh reuse can save more time than extra ranks on repeated unchanged work.
+- WSL/Docker Linux-volume staging targets filesystem overhead; it does not accelerate solver mathematics.
+- Concurrent study scheduling improves total throughput while respecting one aggregate resource budget.
+- Standard Foundation v13 workflows use CPU execution; AeroLab does not currently provide GPU acceleration.
+
+Benchmark serial and automatic modes on the actual target computer before quoting a speedup. Preserve the generated run records with the comparison because they contain backend resources, requested/resolved ranks, cache state, and solver identity.
 
 ## Recommended Local Tools
 

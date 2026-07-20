@@ -33,6 +33,278 @@ from aerolab.stl import write_binary_stl_triangles
 
 
 class SolverQualityTests(unittest.TestCase):
+    def test_backend_resource_probe_applies_cpu_memory_and_mpi_limits(self) -> None:
+        from aerolab.solver.backends import _parse_resource_probe
+
+        gib = 1024**3
+        output = "\n".join(
+            (
+                "AEROLAB_RESOURCE_LOGICAL_CPUS=12",
+                "AEROLAB_RESOURCE_CPUSET=0-5",
+                "AEROLAB_RESOURCE_CPU_LIMIT=400000 100000",
+                "AEROLAB_RESOURCE_CPU_PERIOD=100000",
+                f"AEROLAB_RESOURCE_MEM_AVAILABLE_KIB={32 * 1024**2}",
+                f"AEROLAB_RESOURCE_MEMORY_MAX={16 * gib}",
+                f"AEROLAB_RESOURCE_MEMORY_CURRENT={4 * gib}",
+                "AEROLAB_PARALLEL_TOOL_mpirun=/usr/bin/mpirun",
+                "AEROLAB_PARALLEL_TOOL_decomposePar=/opt/openfoam13/bin/decomposePar",
+                "AEROLAB_PARALLEL_TOOL_reconstructParMesh=/opt/openfoam13/bin/reconstructParMesh",
+                "AEROLAB_PARALLEL_TOOL_reconstructPar=/opt/openfoam13/bin/reconstructPar",
+            )
+        )
+
+        resources = _parse_resource_probe(output, "docker")
+
+        self.assertEqual(resources["logicalCpus"], 12)
+        self.assertEqual(resources["cpusetCpus"], 6)
+        self.assertEqual(resources["quotaCpus"], 4)
+        self.assertEqual(resources["effectiveCpus"], 4)
+        self.assertEqual(resources["memoryAvailableBytes"], 12 * gib)
+        self.assertTrue(resources["parallelAvailable"])
+        self.assertEqual(resources["missingParallelTools"], [])
+
+    def test_auto_process_selection_respects_case_and_backend_caps(self) -> None:
+        from unittest import mock
+
+        from aerolab.solver.run import _resolve_processes
+
+        gib = 1024**3
+        resources = {
+            "effectiveCpus": 12,
+            "memoryAvailableBytes": 32 * gib,
+            "parallelAvailable": True,
+            "missingParallelTools": [],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            case_path = Path(temp_dir)
+            case_path.joinpath("case.json").write_text(
+                json.dumps(
+                    {
+                        "cfd_quality": {"name": "standard"},
+                        "mesh_resolution": {
+                            "configured_max_global_cells": 1_500_000,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "aerolab.solver.run.probe_backend_resources",
+                return_value=resources,
+            ):
+                resolved, selection = _resolve_processes(
+                    case_path,
+                    "auto",
+                    "docker",
+                    parallel_script=True,
+                    solver_identity=None,
+                )
+                with self.assertRaisesRegex(ValueError, "exposes 12 CPUs"):
+                    _resolve_processes(
+                        case_path,
+                        13,
+                        "docker",
+                        parallel_script=True,
+                        solver_identity=None,
+                    )
+
+        self.assertEqual(resolved, 6)
+        self.assertEqual(selection["autoCaps"]["cellBudget"], 6)
+        self.assertEqual(selection["qualityRecommendation"]["status"], "comfortable")
+
+    def test_wsl_and_docker_commands_propagate_optimization_settings(self) -> None:
+        import os
+        from unittest import mock
+
+        feature_key = "a" * 64
+        block_key = "b" * 64
+        with tempfile.TemporaryDirectory() as temp_dir:
+            case_path = Path(temp_dir) / "case with spaces"
+            case_path.mkdir()
+            wsl_command = _run_command(
+                case_path,
+                "wsl",
+                processes=3,
+                file_handler="masterUncollated",
+                resume=True,
+                feature_cache_key=feature_key,
+                block_cache_key=block_key,
+            )
+            wsl_script = base64.b64decode(
+                shlex.split(wsl_command[-1])[2]
+            ).decode("utf-8")
+            self.assertIn("export AEROLAB_PROCESSES=3", wsl_script)
+            self.assertIn("export AEROLAB_FILE_HANDLER=masterUncollated", wsl_script)
+            self.assertIn("export AEROLAB_RESUME=1", wsl_script)
+            self.assertIn(f"export AEROLAB_FEATURE_CACHE_KEY={feature_key}", wsl_script)
+            self.assertIn(f"export AEROLAB_BLOCK_CACHE_KEY={block_key}", wsl_script)
+
+            with mock.patch.dict(
+                os.environ,
+                {"AEROLAB_OPENFOAM_IMAGE": "local/openfoam:13"},
+            ):
+                docker_command = _run_command(
+                    case_path,
+                    "docker",
+                    processes=4,
+                    file_handler="collated",
+                    resume=True,
+                    feature_cache_key=feature_key,
+                    block_cache_key=block_key,
+                )
+
+            for setting in (
+                "AEROLAB_PROCESSES=4",
+                "AEROLAB_FILE_HANDLER=collated",
+                "AEROLAB_RESUME=1",
+                f"AEROLAB_FEATURE_CACHE_KEY={feature_key}",
+                f"AEROLAB_BLOCK_CACHE_KEY={block_key}",
+            ):
+                self.assertIn(setting, docker_command)
+            self.assertIn(f"{case_path}:/source", docker_command)
+            self.assertEqual(
+                docker_command[docker_command.index("--mount") + 1],
+                "type=volume,target=/work",
+            )
+            self.assertIn('cp -a -- "$SOURCE_CASE/." "$STAGE_CASE/"', docker_command[-1])
+            self.assertIn("trap copy_back EXIT", docker_command[-1])
+
+    def test_resume_requires_matching_inputs_and_preserves_valid_state(self) -> None:
+        from aerolab.case import create_case
+        from aerolab.solver.run import (
+            _latest_numeric_time,
+            _resume_compatibility,
+            _solver_input_fingerprint,
+        )
+
+        project = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            case_path = create_case(
+                model_path=project / "models" / "sample_box.stl",
+                case_name="resume-contract",
+                speed_mph=70,
+                flow_axis="x",
+                cases_dir=Path(temp_dir),
+                quality="draft",
+            )
+            poly_mesh = case_path / "constant" / "polyMesh"
+            poly_mesh.mkdir(parents=True)
+            poly_mesh.joinpath("points").write_text("points", encoding="utf-8")
+            mesh_surface = case_path / "postProcessing" / "meshSurface" / "0"
+            mesh_surface.mkdir(parents=True)
+            mesh_surface.joinpath("body.vtk").write_text("surface", encoding="utf-8")
+            mesh_fingerprint = _mesh_input_fingerprint(case_path)
+            case_path.joinpath("aerolab-mesh.json").write_text(
+                json.dumps(
+                    {
+                        "reusable": True,
+                        "inputFingerprint": mesh_fingerprint,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            solver_fingerprint = _solver_input_fingerprint(case_path)
+            self.assertIsNotNone(solver_fingerprint)
+            case_path.joinpath("aerolab-run.json").write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "mode": "full",
+                        "solverInputFingerprint": solver_fingerprint,
+                        "processes": 4,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for time_name, fields in (("25", ("U", "p")), ("50", ("U",))):
+                time_path = case_path / time_name
+                time_path.mkdir()
+                for field in fields:
+                    time_path.joinpath(field).write_text(field, encoding="utf-8")
+
+            self.assertEqual(_latest_numeric_time(case_path), 25.0)
+            state = _resume_compatibility(case_path, solver_fingerprint)
+            self.assertEqual(state["latestTime"], 25.0)
+
+            case_path.joinpath("processor0").mkdir()
+            case_path.joinpath("postProcessing", "forceCoeffs").mkdir()
+            _clear_previous_solver_outputs(
+                case_path,
+                preserve_mesh=True,
+                preserve_solver_state=True,
+            )
+            self.assertTrue(case_path.joinpath("25", "U").is_file())
+            self.assertTrue(case_path.joinpath("postProcessing", "forceCoeffs").is_dir())
+            self.assertFalse(case_path.joinpath("processor0").exists())
+
+            decomposition = case_path / "system" / "decomposeParDict"
+            decomposition.write_text(
+                decomposition.read_text(encoding="utf-8") + "\n// changed ranks\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_solver_input_fingerprint(case_path), solver_fingerprint)
+            fv_solution = case_path / "system" / "fvSolution"
+            fv_solution.write_text(
+                fv_solution.read_text(encoding="utf-8") + "\n// changed numerics\n",
+                encoding="utf-8",
+            )
+            changed_fingerprint = _solver_input_fingerprint(case_path)
+            with self.assertRaisesRegex(ValueError, "Solver inputs changed"):
+                _resume_compatibility(case_path, changed_fingerprint)
+
+    def test_progress_exposes_optimization_and_study_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            case_path = Path(temp_dir)
+            case_path.joinpath("case.json").write_text(
+                json.dumps(
+                    {
+                        "status": "solver_running",
+                        "cfd_quality": {"end_time": 100},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            process_selection = {
+                "stageCache": {"featureHit": True, "blockMeshHit": False},
+                "qualityRecommendation": {"status": "comfortable"},
+            }
+            convergence = {"controller": "foundationResidualControl"}
+            case_path.joinpath("aerolab-run.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "mode": "full",
+                        "requestedProcesses": "auto",
+                        "processes": 6,
+                        "fileHandler": "auto",
+                        "resumed": False,
+                        "resumeFromTime": None,
+                        "convergencePolicy": convergence,
+                        "processSelection": process_selection,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            study_run = {"status": "running", "completedCases": 1, "totalCases": 3}
+            case_path.joinpath("aerolab-study-run.json").write_text(
+                json.dumps(study_run),
+                encoding="utf-8",
+            )
+
+            progress = case_run_progress(case_path)
+
+            self.assertEqual(progress["optimization"]["requestedProcesses"], "auto")
+            self.assertEqual(progress["optimization"]["processes"], 6)
+            self.assertEqual(
+                progress["optimization"]["convergencePolicy"],
+                convergence,
+            )
+            self.assertEqual(
+                progress["optimization"]["processSelection"],
+                process_selection,
+            )
+            self.assertEqual(progress["studyRun"], study_run)
+
     def test_transient_force_and_residual_gates_accept_stable_oscillation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             case_path = Path(temp_dir)

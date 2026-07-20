@@ -38,6 +38,8 @@ const state = {
   activeRunProgress: null,
   runProgressTimer: null,
   runProgressToken: 0,
+  studyRunTimer: null,
+  studyRunToken: 0,
   runLogTimer: null,
   runLogToken: 0,
   repair: null,
@@ -159,8 +161,13 @@ const els = {
   createCaseButton: document.querySelector("#createCaseButton"),
   createStudyButton: document.querySelector("#createStudyButton"),
   checkSolverButton: document.querySelector("#checkSolverButton"),
+  solverProcesses: document.querySelector("#solverProcesses"),
+  solverFileHandler: document.querySelector("#solverFileHandler"),
+  studyProcessBudget: document.querySelector("#studyProcessBudget"),
+  resumeSolver: document.querySelector("#resumeSolver"),
   meshCaseButton: document.querySelector("#meshCaseButton"),
   runCaseButton: document.querySelector("#runCaseButton"),
+  runStudyButton: document.querySelector("#runStudyButton"),
   runProgress: document.querySelector("#runProgress"),
   runProgressLabel: document.querySelector("#runProgressLabel"),
   runProgressPercent: document.querySelector("#runProgressPercent"),
@@ -170,6 +177,7 @@ const els = {
   runLogStatus: document.querySelector("#runLogStatus"),
   runLogOutput: document.querySelector("#runLogOutput"),
   solverStatus: document.querySelector("#solverStatus"),
+  optimizationStatus: document.querySelector("#optimizationStatus"),
   resultSummary: document.querySelector("#resultSummary"),
   modelName: document.querySelector("#modelName"),
   modelStatus: document.querySelector("#modelStatus"),
@@ -569,6 +577,7 @@ els.checkSolverButton.addEventListener("click", async () => {
 
 els.meshCaseButton.addEventListener("click", () => runActiveCase("mesh"));
 els.runCaseButton.addEventListener("click", () => runActiveCase("full"));
+els.runStudyButton.addEventListener("click", () => runActiveStudy());
 els.runLogDetails.addEventListener("toggle", () => {
   if (els.runLogDetails.open) startRunLogPolling();
   else stopRunLogPolling();
@@ -690,11 +699,15 @@ async function runActiveCase(mode) {
       body: JSON.stringify({
         casePath: runningCasePath,
         backend: "auto",
+        processes: els.solverProcesses.value,
+        fileHandler: els.solverFileHandler.value,
+        resume: !meshOnly && els.resumeSolver.checked,
         timeoutSeconds,
         mode,
         reuseMesh: true,
       }),
     });
+    if (!meshOnly) els.resumeSolver.checked = false;
     const progress = await startRunProgressPolling(
       runningCasePath,
       (timeoutSeconds + 1800) * 1000,
@@ -715,6 +728,128 @@ async function runActiveCase(mode) {
     }
     renderCases();
     setBusy(false);
+  }
+}
+
+async function runActiveStudy() {
+  if (!state.activeCasePath) return;
+  const selectedCase = state.cases.find((item) => item.path === state.activeCasePath);
+  if (!selectedCase?.studyId && !selectedCase?.sensitivityStudyId) return;
+  const runningCasePath = state.activeCasePath;
+  const timeoutSeconds = 21600;
+  applyRunProgress(runningCasePath, {
+    state: "running",
+    tone: "running",
+    phase: "Starting study scheduler",
+    percent: 1,
+    label: "Starting study scheduler - 1%",
+    detail: "Measuring backend resources and allocating a shared process budget.",
+    isRunning: true,
+    isComplete: false,
+    isMeshComplete: false,
+    runMode: "full",
+  });
+  setBusy(true, "Running study");
+  try {
+    await fetchJson("/api/run-study", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        casePath: runningCasePath,
+        backend: "auto",
+        processes: els.solverProcesses.value,
+        processBudget: els.studyProcessBudget.value,
+        fileHandler: els.solverFileHandler.value,
+        timeoutSeconds,
+        mode: "full",
+        reuseMesh: true,
+      }),
+    });
+    const studyRun = await startStudyProgressPolling(
+      runningCasePath,
+      (timeoutSeconds * 12 + 1800) * 1000,
+    );
+    if (studyRun?.status !== "complete") {
+      throw new Error("One or more study members did not complete successfully.");
+    }
+  } catch (error) {
+    showError(error);
+  } finally {
+    stopStudyProgressPolling();
+    try {
+      const latestState = await apiGet("/api/state");
+      state.cases = latestState.cases || state.cases;
+      if (state.activeCasePath === runningCasePath) {
+        await refreshCaseReport(runningCasePath);
+      }
+    } catch (refreshError) {
+      showError(refreshError);
+    }
+    renderCases();
+    setBusy(false);
+  }
+}
+
+function startStudyProgressPolling(casePath, maximumWaitMs) {
+  stopStudyProgressPolling();
+  const token = state.studyRunToken + 1;
+  state.studyRunToken = token;
+  const deadline = Date.now() + maximumWaitMs;
+  return new Promise((resolve, reject) => {
+    const poll = async () => {
+      if (state.studyRunToken !== token) return;
+      try {
+        const payload = await apiGet(`/api/study-progress?casePath=${encodeURIComponent(casePath)}`);
+        if (state.studyRunToken !== token) return;
+        const studyRun = payload.studyRun;
+        if (studyRun) {
+          if (state.caseReport) state.caseReport.studyRun = studyRun;
+          const complete = studyRun.status === "complete";
+          const failed = ["failed", "partial_failure"].includes(studyRun.status);
+          const completedCases = Number(studyRun.completedCases || 0);
+          const totalCases = Number(studyRun.totalCases || studyRun.plan?.casePaths?.length || 0);
+          const percent = clamp(Number(studyRun.percent || 0), 0, 100);
+          applyRunProgress(casePath, {
+            state: complete ? "complete" : failed ? "failed" : "running",
+            tone: complete ? "verified" : failed ? "failed" : "running",
+            phase: complete ? "Study complete" : failed ? "Study needs attention" : "Running study",
+            percent,
+            label: `${complete ? "Study complete" : failed ? "Study needs attention" : "Running study"} - ${Math.round(percent)}%`,
+            detail: `${completedCases} of ${totalCases} members finished within the shared process budget.`,
+            isRunning: !complete && !failed,
+            isComplete: complete,
+            isMeshComplete: false,
+            runMode: "full",
+            studyRun,
+          });
+          renderOptimizationStatus();
+          if (complete || failed) {
+            state.studyRunTimer = null;
+            resolve(studyRun);
+            return;
+          }
+        }
+      } catch (_error) {
+        // The worker may still be probing resources before its first record is visible.
+      }
+      if (Date.now() >= deadline) {
+        state.studyRunTimer = null;
+        reject(new Error("AeroLab stopped waiting for study status; member runs may still be active."));
+        return;
+      }
+      if (state.studyRunToken === token) {
+        state.studyRunTimer = window.setTimeout(poll, 1500);
+      }
+    };
+    state.studyRunTimer = window.setTimeout(poll, 400);
+  });
+}
+
+function stopStudyProgressPolling() {
+  state.studyRunToken += 1;
+  if (state.studyRunTimer != null) {
+    window.clearTimeout(state.studyRunTimer);
+    state.studyRunTimer = null;
   }
 }
 
@@ -741,6 +876,7 @@ els.caseList.addEventListener("click", async (event) => {
   renderMetrics();
   renderReadiness();
   renderRunProgress();
+  renderOptimizationStatus();
   let loaded = false;
   try {
     await refreshCaseReport(requestedCasePath);
@@ -2722,6 +2858,7 @@ function applyRunProgress(casePath, progress) {
   if (state.activeCasePath === casePath) {
     state.activeRunProgress = progress;
     renderRunProgress();
+    renderOptimizationStatus();
     if (progress.isRunning) {
       els.modelStatus.textContent = `${progress.phase} ${Math.round(progress.percent || 0)}% - current 3D view is preview`;
       els.candidateBadge.textContent = `${Math.round(progress.percent || 0)}%`;
@@ -2796,6 +2933,7 @@ async function refreshCaseReport(casePath) {
   resetSolverParticles();
   state.viewer.flowLayer = null;
   state.activeRunProgress = payload.report.runProgress || null;
+  renderOptimizationStatus();
   state.viewer.surfaceMode = hasSurfacePressure() ? "cp" : "material";
   syncSurfaceModeControls();
   syncSolverFlowControls();
@@ -3016,6 +3154,39 @@ function restoreCaseContext(report) {
   renderWarnings();
 }
 
+function renderOptimizationStatus() {
+  const progress = state.activeRunProgress || state.caseReport?.runProgress;
+  const lastRun = state.caseReport?.lastRun || {};
+  const optimization = progress?.optimization || lastRun;
+  const studyRun = progress?.studyRun || state.caseReport?.studyRun;
+  const studyPlan = studyRun?.plan;
+  if (studyPlan) {
+    const memory = studyPlan.memoryWarning ? ` | ${studyPlan.memoryWarning}` : "";
+    els.optimizationStatus.textContent = `Study allocation: ${studyPlan.maxConcurrentCases} concurrent x ${studyPlan.processesPerCase} processes, aggregate budget ${studyPlan.processBudget}${memory}`;
+    return;
+  }
+  const selection = optimization?.processSelection || {};
+  const stageCache = selection.stageCache || {};
+  const recommendation = selection.qualityRecommendation;
+  const parts = [];
+  if (optimization?.processes != null) {
+    parts.push(`Selected ${optimization.processes} process${Number(optimization.processes) === 1 ? "" : "es"}`);
+  }
+  if (optimization?.fileHandler) parts.push(`file handler ${optimization.fileHandler}`);
+  if (stageCache.featureHit != null || stageCache.blockMeshHit != null) {
+    parts.push(`cache: features ${stageCache.featureHit ? "hit" : "miss"}, block mesh ${stageCache.blockMeshHit ? "hit" : "miss"}`);
+  }
+  if (optimization?.resumed) parts.push(`resumed from time ${fmt(optimization.resumeFromTime)}`);
+  const controller = optimization?.convergencePolicy?.controller;
+  if (controller) parts.push(`convergence ${controller}`);
+  if (recommendation?.status) {
+    parts.push(`memory ${recommendation.status}: ${recommendation.detail || ""}`.trim());
+  }
+  els.optimizationStatus.textContent = parts.length
+    ? `Optimization: ${parts.join(" | ")}`
+    : "Optimization status appears after backend resource selection starts.";
+}
+
 function renderSolverStatus() {
   const preferred = state.solver?.preferredBackend || "none";
   const version = preferred === "none" ? null : state.solver?.backends?.[preferred]?.version;
@@ -3028,6 +3199,7 @@ function renderSolverStatus() {
       ? "Airflow solver unavailable. Open Engineering for setup details."
       : "Airflow solver ready."
     : `Solver: ${unavailable}${version ? ` (${version})` : ""}`;
+  renderOptimizationStatus();
   renderReadiness();
 }
 
@@ -3064,6 +3236,14 @@ function updateActionAvailability() {
   els.checkSolverButton.disabled = state.busy;
   els.meshCaseButton.disabled = state.busy || !state.activeCasePath || state.solver?.preferredBackend == null;
   els.runCaseButton.disabled = state.busy || !state.activeCasePath || state.solver?.preferredBackend == null;
+  const activeCase = state.cases.find((item) => item.path === state.activeCasePath);
+  const activeStudy = Boolean(activeCase?.studyId || activeCase?.sensitivityStudyId);
+  els.runStudyButton.disabled = state.busy
+    || !activeStudy
+    || state.solver?.preferredBackend == null;
+  els.resumeSolver.disabled = state.busy || !state.activeCasePath;
+  els.solverFileHandler.disabled = state.busy;
+  els.studyProcessBudget.disabled = state.busy || !activeStudy;
 }
 
 function basicAirflowState() {

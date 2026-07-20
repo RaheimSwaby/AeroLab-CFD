@@ -5,11 +5,25 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import NormalDist
 
 from ..case import create_case
+from .backends import _select_backend, probe_backend_resources, solver_status
+from .run import (
+    AUTO_BYTES_PER_PROCESS,
+    AUTO_CELLS_PER_PROCESS,
+    AUTO_MAX_PROCESSES,
+    MANUAL_MIN_BYTES_PER_PROCESS,
+    QUALITY_ESTIMATED_BYTES_PER_CELL,
+    QUALITY_FIXED_MEMORY_BYTES,
+    _case_cell_budget,
+    normalize_file_handler,
+    normalize_process_request,
+    run_case,
+)
 from .util import _finite_number, _read_json_object
 
 SENSITIVITY_PARAMETERS: dict[str, dict[str, object]] = {
@@ -40,6 +54,465 @@ SENSITIVITY_PARAMETERS: dict[str, dict[str, object]] = {
 }
 
 _COEFFICIENT_CHANNELS = ("Cd", "Cl", "Cs", "CmRoll", "CmPitch", "CmYaw")
+
+
+def normalize_study_process_budget(value: object) -> str | int:
+    """Normalize the aggregate rank budget shared by all concurrent members."""
+    try:
+        return normalize_process_request(value)
+    except ValueError as exc:
+        raise ValueError(
+            "Study process budget must be 'auto' or a positive integer."
+        ) from exc
+
+
+def study_members(case_path: Path) -> dict[str, object]:
+    """Return an ordered, validated set of sibling cases in one AeroLab study."""
+    descriptor, member_paths = _discover_study(case_path.resolve())
+    return {
+        **descriptor,
+        "casePaths": [str(path) for path in member_paths],
+        "selectedCasePath": str(case_path.resolve()),
+    }
+
+
+def plan_study_schedule(
+    case_path: Path,
+    *,
+    backend: str = "auto",
+    processes: str | int = "auto",
+    process_budget: str | int = "auto",
+    solver_identity: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build one aggregate CPU/memory allocation for all independent members."""
+    descriptor, member_paths = _discover_study(case_path.resolve())
+    for member_path in member_paths:
+        if not (member_path / "Allrun").is_file():
+            raise ValueError(
+                f"Study member {member_path.name} has no generated Allrun script."
+            )
+    status = solver_status()
+    selected_backend = _select_backend(status, backend)
+    resources = probe_backend_resources(
+        selected_backend,
+        solver_identity=solver_identity,
+    )
+    allocation = _study_resource_allocation(
+        member_paths,
+        resources,
+        processes=processes,
+        process_budget=process_budget,
+    )
+    return {
+        **descriptor,
+        "backend": selected_backend,
+        "casePaths": [str(path) for path in member_paths],
+        "resources": resources,
+        **allocation,
+    }
+
+
+def run_study(
+    case_path: Path,
+    *,
+    backend: str = "auto",
+    timeout_seconds: int = 3600,
+    run_mode: str = "full",
+    reuse_mesh: bool = True,
+    processes: str | int = "auto",
+    process_budget: str | int = "auto",
+    file_handler: str = "auto",
+    solver_identity: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Run independent study members without exceeding one shared resource plan."""
+    selected_file_handler = normalize_file_handler(file_handler)
+    plan = plan_study_schedule(
+        case_path,
+        backend=backend,
+        processes=processes,
+        process_budget=process_budget,
+        solver_identity=solver_identity,
+    )
+    member_paths = [Path(str(value)) for value in plan["casePaths"]]
+    ranks_per_case = int(plan["processesPerCase"])
+    max_workers = int(plan["maxConcurrentCases"])
+    started_at = datetime.now(timezone.utc).isoformat()
+    running_record = {
+        "status": "running",
+        "ok": None,
+        "studyId": plan["studyId"],
+        "kind": plan["kind"],
+        "startedAt": started_at,
+        "finishedAt": None,
+        "completedCases": 0,
+        "totalCases": len(member_paths),
+        "percent": 0,
+        "plan": plan,
+        "results": [],
+    }
+    _write_study_run_record(member_paths, running_record)
+
+    indexed_results: dict[int, dict[str, object]] = {}
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="aerolab-study",
+    ) as executor:
+        futures = {
+            executor.submit(
+                run_case,
+                member_path,
+                backend=str(plan["backend"]),
+                timeout_seconds=timeout_seconds,
+                run_mode=run_mode,
+                reuse_mesh=reuse_mesh,
+                solver_identity=solver_identity,
+                processes=ranks_per_case,
+                file_handler=selected_file_handler,
+            ): (index, member_path)
+            for index, member_path in enumerate(member_paths)
+        }
+        for future in as_completed(futures):
+            index, member_path = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                indexed_results[index] = {
+                    "casePath": str(member_path),
+                    "ok": False,
+                    "trusted": False,
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                }
+            else:
+                indexed_results[index] = {
+                    "casePath": str(member_path),
+                    "ok": result.ok,
+                    "trusted": result.trusted,
+                    "returncode": result.returncode,
+                    "processes": result.processes,
+                    "fileHandler": result.file_handler,
+                    "reusedMesh": result.reused_mesh,
+                    "logPath": str(result.log_path),
+                    "qualityRecommendation": result.process_selection.get(
+                        "qualityRecommendation"
+                    ),
+                    "stageCache": result.process_selection.get("stageCache"),
+                }
+            partial_results = [
+                indexed_results[result_index]
+                for result_index in sorted(indexed_results)
+            ]
+            completed_cases = len(partial_results)
+            _write_study_run_record(
+                member_paths,
+                {
+                    **running_record,
+                    "completedCases": completed_cases,
+                    "percent": round(completed_cases / len(member_paths) * 100),
+                    "results": partial_results,
+                },
+            )
+
+    results = [indexed_results[index] for index in range(len(member_paths))]
+    ok = bool(results and all(result.get("ok") for result in results))
+    trusted = bool(results and all(result.get("trusted") for result in results))
+    finished_at = datetime.now(timezone.utc).isoformat()
+    final_record = {
+        "status": "complete" if ok else "partial_failure",
+        "ok": ok,
+        "trusted": trusted,
+        "studyId": plan["studyId"],
+        "kind": plan["kind"],
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+        "completedCases": len(member_paths),
+        "totalCases": len(member_paths),
+        "percent": 100,
+        "plan": plan,
+        "results": results,
+    }
+    _write_study_run_record(member_paths, final_record)
+    return final_record
+
+
+def _discover_study(case_path: Path) -> tuple[dict[str, object], list[Path]]:
+    selected_payload = _read_json_object(case_path / "case.json")
+    if not selected_payload:
+        raise ValueError(f"{case_path} is not an AeroLab case with readable metadata.")
+    sensitivity = selected_payload.get("sensitivity_study")
+    if isinstance(sensitivity, dict) and sensitivity.get("id"):
+        return _discover_sensitivity_members(case_path, sensitivity)
+    validation = selected_payload.get("validation_study")
+    if isinstance(validation, dict) and validation.get("id"):
+        return _discover_accuracy_members(case_path, validation)
+    raise ValueError("The selected case is not part of an AeroLab study.")
+
+
+def _discover_sensitivity_members(
+    case_path: Path,
+    selected_study: dict[str, object],
+) -> tuple[dict[str, object], list[Path]]:
+    study_id = str(selected_study["id"])
+    parameter = str(selected_study.get("parameter") or "")
+    specification = _parameter_specification(parameter)
+    raw_values = selected_study.get("values")
+    if not isinstance(raw_values, list):
+        raise ValueError("Sensitivity-study metadata has no valid value list.")
+    values = _sensitivity_values(raw_values, specification)
+    expected_count = int(selected_study.get("count") or 0)
+    baseline_index = int(selected_study.get("baseline_index") or 0)
+    plan_lock = str(selected_study.get("plan_lock_hash") or "")
+    if expected_count != len(values) or not plan_lock:
+        raise ValueError("Sensitivity-study metadata is incomplete or inconsistent.")
+
+    members: dict[int, tuple[Path, dict[str, object], dict[str, object]]] = {}
+    for case_json_path in case_path.parent.glob("*/case.json"):
+        payload = _read_json_object(case_json_path)
+        study = payload.get("sensitivity_study")
+        if not isinstance(study, dict) or str(study.get("id") or "") != study_id:
+            continue
+        try:
+            index = int(study.get("index"))
+        except (TypeError, ValueError):
+            raise ValueError("A sensitivity-study member has an invalid index.") from None
+        if index in members:
+            raise ValueError(f"Sensitivity-study index {index} appears more than once.")
+        members[index] = (case_json_path.parent.resolve(), payload, study)
+
+    if sorted(members) != list(range(expected_count)):
+        raise ValueError("Sensitivity-study members are missing or have non-contiguous indices.")
+    ordered: list[Path] = []
+    for index in range(expected_count):
+        member_path, payload, study = members[index]
+        if (
+            str(study.get("parameter") or "") != parameter
+            or study.get("values") != raw_values
+            or int(study.get("count") or 0) != expected_count
+            or int(study.get("baseline_index") or 0) != baseline_index
+            or str(study.get("plan_lock_hash") or "") != plan_lock
+        ):
+            raise ValueError("Sensitivity-study member metadata does not match the selected plan.")
+        if _member_plan_lock(payload, member_path, parameter, values) != plan_lock:
+            raise ValueError("Sensitivity-study plan lock no longer matches a member case.")
+        ordered.append(member_path)
+    return (
+        {
+            "studyId": study_id,
+            "kind": "one_factor_sensitivity",
+            "parameter": parameter,
+            "values": values,
+            "baselineIndex": baseline_index,
+            "planLockHash": plan_lock,
+        },
+        ordered,
+    )
+
+
+def _discover_accuracy_members(
+    case_path: Path,
+    selected_study: dict[str, object],
+) -> tuple[dict[str, object], list[Path]]:
+    study_id = str(selected_study["id"])
+    raw_levels = selected_study.get("levels")
+    levels = (
+        [str(level).strip().lower() for level in raw_levels]
+        if isinstance(raw_levels, list)
+        else ["draft", "standard", "fine"]
+    )
+    if not levels or len(set(levels)) != len(levels):
+        raise ValueError("Accuracy-study level metadata is invalid.")
+    members: dict[str, Path] = {}
+    for case_json_path in case_path.parent.glob("*/case.json"):
+        payload = _read_json_object(case_json_path)
+        study = payload.get("validation_study")
+        if not isinstance(study, dict) or str(study.get("id") or "") != study_id:
+            continue
+        level = str(study.get("level") or "").lower()
+        if level not in levels:
+            continue
+        if level in members:
+            raise ValueError(f"Accuracy-study level {level} appears more than once.")
+        member_levels = study.get("levels")
+        if isinstance(member_levels, list) and [
+            str(value).strip().lower() for value in member_levels
+        ] != levels:
+            raise ValueError("Accuracy-study member level metadata is inconsistent.")
+        members[level] = case_json_path.parent.resolve()
+    if set(members) != set(levels):
+        raise ValueError("Accuracy-study members are missing one or more mesh levels.")
+    return (
+        {
+            "studyId": study_id,
+            "kind": "grid_convergence",
+            "levels": levels,
+        },
+        [members[level] for level in levels],
+    )
+
+
+def _study_resource_allocation(
+    member_paths: list[Path],
+    resources: dict[str, object],
+    *,
+    processes: str | int,
+    process_budget: str | int,
+) -> dict[str, object]:
+    requested_processes = normalize_process_request(processes)
+    requested_budget = normalize_study_process_budget(process_budget)
+    effective_cpus = max(1, int(resources.get("effectiveCpus") or 1))
+    memory_value = resources.get("memoryAvailableBytes")
+    available_memory = (
+        int(memory_value)
+        if isinstance(memory_value, int | float)
+        and not isinstance(memory_value, bool)
+        and memory_value >= 0
+        else None
+    )
+    reserved_memory = (
+        max(1024**3, available_memory // 4)
+        if available_memory is not None
+        else None
+    )
+    usable_memory = (
+        max(0, available_memory - reserved_memory)
+        if available_memory is not None and reserved_memory is not None
+        else None
+    )
+
+    budget_caps: dict[str, int] = {}
+    if requested_budget == "auto":
+        budget_caps["cpu"] = max(1, effective_cpus - 1)
+        budget_caps["safety"] = AUTO_MAX_PROCESSES
+        if usable_memory is not None:
+            budget_caps["memory"] = max(1, usable_memory // AUTO_BYTES_PER_PROCESS)
+        resolved_budget = max(1, min(budget_caps.values()))
+    else:
+        resolved_budget = requested_budget
+        if resolved_budget > effective_cpus:
+            raise ValueError(
+                f"Study process budget {resolved_budget} exceeds {effective_cpus} backend CPUs."
+            )
+        if (
+            available_memory is not None
+            and available_memory
+            < resolved_budget * MANUAL_MIN_BYTES_PER_PROCESS
+        ):
+            raise ValueError(
+                "Study process budget exceeds the backend's minimum aggregate memory allowance."
+            )
+        budget_caps["manual"] = resolved_budget
+
+    parallel_available = bool(resources.get("parallelAvailable"))
+    if isinstance(requested_processes, int) and requested_processes > 1:
+        if not parallel_available:
+            raise RuntimeError("The selected backend does not provide complete MPI tools.")
+        if requested_processes > resolved_budget:
+            raise ValueError(
+                "Per-case processes cannot exceed the aggregate study process budget."
+            )
+
+    memory_estimates: list[dict[str, object]] = []
+    for member_path in member_paths:
+        cell_budget = _case_cell_budget(member_path)
+        estimated_memory = QUALITY_FIXED_MEMORY_BYTES + (
+            (cell_budget or 0) * QUALITY_ESTIMATED_BYTES_PER_CELL
+        )
+        memory_estimates.append(
+            {
+                "casePath": str(member_path),
+                "configuredMaxCells": cell_budget,
+                "estimatedMemoryBytes": estimated_memory,
+            }
+        )
+    largest_estimate = max(
+        int(item["estimatedMemoryBytes"]) for item in memory_estimates
+    )
+    memory_worker_cap = len(member_paths)
+    if usable_memory is not None:
+        memory_worker_cap = max(1, usable_memory // max(1, largest_estimate))
+
+    if isinstance(requested_processes, int):
+        ranks_per_case = requested_processes
+        rank_worker_cap = max(1, resolved_budget // ranks_per_case)
+        max_workers = min(len(member_paths), rank_worker_cap, memory_worker_cap)
+        selection_reason = (
+            "Packed validated manual per-case ranks into one aggregate CPU/memory budget."
+        )
+    elif not parallel_available:
+        ranks_per_case = 1
+        max_workers = min(len(member_paths), resolved_budget, memory_worker_cap)
+        selection_reason = (
+            "MPI is unavailable; scheduled independent serial cases within the shared budget."
+        )
+    else:
+        initial_workers = (
+            1
+            if len(member_paths) == 1
+            else min(len(member_paths), max(1, resolved_budget // 2))
+        )
+        max_workers = max(1, min(initial_workers, memory_worker_cap))
+        ranks_per_case = max(1, resolved_budget // max_workers)
+        cell_rank_caps = [
+            max(1, cell_budget // AUTO_CELLS_PER_PROCESS)
+            for cell_budget in (_case_cell_budget(path) for path in member_paths)
+            if cell_budget is not None
+        ]
+        if cell_rank_caps:
+            ranks_per_case = min(ranks_per_case, min(cell_rank_caps))
+        ranks_per_case = min(ranks_per_case, AUTO_MAX_PROCESSES)
+        max_workers = max(
+            1,
+            min(
+                len(member_paths),
+                resolved_budget // ranks_per_case,
+                memory_worker_cap,
+            ),
+        )
+        selection_reason = (
+            "Balanced concurrent study throughput against per-case MPI ranks, CPU, memory, "
+            "and cell budgets."
+        )
+
+    aggregate_allocation = max_workers * ranks_per_case
+    memory_warning = None
+    if available_memory is not None and largest_estimate > available_memory:
+        memory_warning = (
+            "At least one case exceeds the conservative local-memory estimate; the scheduler "
+            "will run only one such case at a time, but more backend memory or lower quality "
+            "may still be required."
+        )
+    return {
+        "requestedProcessesPerCase": requested_processes,
+        "processesPerCase": ranks_per_case,
+        "requestedProcessBudget": requested_budget,
+        "processBudget": resolved_budget,
+        "budgetCaps": budget_caps,
+        "maxConcurrentCases": max_workers,
+        "maximumAllocatedProcesses": aggregate_allocation,
+        "estimatedWaves": math.ceil(len(member_paths) / max_workers),
+        "caseMemoryEstimates": memory_estimates,
+        "memoryWorkerCap": memory_worker_cap,
+        "memoryWarning": memory_warning,
+        "selectionReason": selection_reason,
+        "allocations": [
+            {"casePath": str(path), "processes": ranks_per_case}
+            for path in member_paths
+        ],
+    }
+
+
+def _write_study_run_record(
+    member_paths: list[Path],
+    record: dict[str, object],
+) -> None:
+    content = json.dumps(record, indent=2) + "\n"
+    for member_path in member_paths:
+        destination = member_path / "aerolab-study-run.json"
+        temporary = member_path / ".aerolab-study-run.json.tmp"
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(destination)
 
 
 def create_sensitivity_study(

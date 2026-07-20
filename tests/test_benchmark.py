@@ -602,8 +602,19 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(command[command.index("--entrypoint") + 1], "bash")
         self.assertEqual(command[command.index("bash") + 1], "sha256:verified-image")
         self.assertNotIn(image, command)
+        self.assertIn(f"{case_path}:/source", command)
+        self.assertEqual(command[command.index("--mount") + 1], "type=volume,target=/work")
+        self.assertIn("AEROLAB_PROCESSES=1", command)
+        self.assertIn("AEROLAB_FILE_HANDLER=auto", command)
+        self.assertIn("AEROLAB_RESUME=0", command)
+        self.assertIn("SOURCE_CASE=/source", command[-1])
+        self.assertIn("STAGE_CASE=/work", command[-1])
+        self.assertIn('trap copy_back EXIT', command[-1])
         self.assertIn("EXPECTED_TOOL_PATH_0=/opt/openfoam13/bin/foamRun", command[-1])
-        self.assertEqual(cleanup, ["docker", "rm", "--force", expected_name])
+        self.assertEqual(
+            cleanup,
+            ["docker", "rm", "--force", "--volumes", expected_name],
+        )
         self.assertEqual(
             verification,
             [

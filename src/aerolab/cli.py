@@ -21,7 +21,11 @@ from .solver import (
     case_report,
     compare_cases,
     create_sensitivity_study_from_case,
+    normalize_file_handler,
+    normalize_process_request,
+    normalize_study_process_budget,
     run_case,
+    run_study,
     sensitivity_study_report,
     solver_status,
 )
@@ -603,6 +607,25 @@ def main(argv: list[str] | None = None) -> int:
         help="OpenFOAM backend to use.",
     )
     run_parser.add_argument(
+        "--processes",
+        type=normalize_process_request,
+        default="auto",
+        metavar="auto|N",
+        help="MPI processes: auto-select for backend hardware, or use a positive integer (1 is serial).",
+    )
+    run_parser.add_argument(
+        "--file-handler",
+        type=normalize_file_handler,
+        default="auto",
+        metavar="auto|uncollated|collated|masterUncollated",
+        help="OpenFOAM parallel file handler; auto preserves the backend default.",
+    )
+    run_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a compatible failed full run from its latest reconstructed time.",
+    )
+    run_parser.add_argument(
         "--timeout-seconds",
         type=int,
         default=3600,
@@ -623,6 +646,65 @@ def main(argv: list[str] | None = None) -> int:
         "--json",
         action="store_true",
         help="Print run result as JSON.",
+    )
+
+    study_run_parser = subparsers.add_parser(
+        "run-study",
+        help="Run every member of an accuracy or sensitivity study within one resource budget.",
+    )
+    study_run_parser.add_argument(
+        "case",
+        type=Path,
+        help="Path to any member of the study.",
+    )
+    study_run_parser.add_argument(
+        "--backend",
+        choices=["auto", "native", "wsl", "docker"],
+        default="auto",
+        help="OpenFOAM backend shared by all study members.",
+    )
+    study_run_parser.add_argument(
+        "--processes",
+        type=normalize_process_request,
+        default="auto",
+        metavar="auto|N",
+        help="MPI processes per active case; auto balances ranks against concurrency.",
+    )
+    study_run_parser.add_argument(
+        "--process-budget",
+        type=normalize_study_process_budget,
+        default="auto",
+        metavar="auto|N",
+        help="Maximum aggregate processes across concurrently running study cases.",
+    )
+    study_run_parser.add_argument(
+        "--file-handler",
+        type=normalize_file_handler,
+        default="auto",
+        metavar="auto|uncollated|collated|masterUncollated",
+        help="OpenFOAM parallel file handler for every member.",
+    )
+    study_run_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=3600,
+        help="Maximum runtime for each study member.",
+    )
+    study_run_parser.add_argument(
+        "--mode",
+        choices=["full", "mesh"],
+        default="full",
+        help="Validate each mesh or run each complete solver workflow.",
+    )
+    study_run_parser.add_argument(
+        "--no-reuse-mesh",
+        action="store_true",
+        help="Rebuild meshes instead of reusing compatible validated meshes.",
+    )
+    study_run_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the aggregate study result as JSON.",
     )
 
     report_parser = subparsers.add_parser(
@@ -916,13 +998,21 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             run_mode=args.mode,
             reuse_mesh=not args.no_reuse_mesh,
+            processes=args.processes,
+            file_handler=args.file_handler,
+            resume=args.resume,
         )
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:
             print(f"Backend: {result.backend}")
+            print(f"Processes: {result.processes} (requested {result.requested_processes})")
+            print(f"File handler: {result.file_handler}")
             print(f"Mode: {result.run_mode}")
             print(f"Reused mesh: {'yes' if result.reused_mesh else 'no'}")
+            print(
+                f"Resumed: {'yes, from time ' + _text_number(result.resume_from_time) if result.resumed else 'no'}"
+            )
             print(f"Return code: {result.returncode}")
             print(f"Numerically qualified: {'yes' if result.trusted else 'no'}")
             print(f"Log: {result.log_path}")
@@ -933,6 +1023,41 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print("No force coefficient output found yet.")
         return 0 if result.ok else 1
+
+    if args.command == "run-study":
+        result = run_study(
+            args.case,
+            backend=args.backend,
+            timeout_seconds=args.timeout_seconds,
+            run_mode=args.mode,
+            reuse_mesh=not args.no_reuse_mesh,
+            processes=args.processes,
+            process_budget=args.process_budget,
+            file_handler=args.file_handler,
+        )
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            plan = result.get("plan") if isinstance(result.get("plan"), dict) else {}
+            print(f"Study: {result.get('studyId')}")
+            print(f"Status: {result.get('status')}")
+            print(f"Backend: {plan.get('backend')}")
+            print(
+                f"Allocation: {plan.get('maxConcurrentCases')} concurrent cases x "
+                f"{plan.get('processesPerCase')} processes "
+                f"(budget {plan.get('processBudget')})"
+            )
+            if plan.get("memoryWarning"):
+                print(f"Memory warning: {plan.get('memoryWarning')}")
+            for member in result.get("results", []):
+                if isinstance(member, dict):
+                    status = "ok" if member.get("ok") else "failed"
+                    detail = member.get("error")
+                    print(
+                        f"- {member.get('casePath')}: {status}"
+                        + (f" ({detail})" if detail else "")
+                    )
+        return 0 if result.get("ok") else 1
 
     if args.command == "report-case":
         report = case_report(args.case)

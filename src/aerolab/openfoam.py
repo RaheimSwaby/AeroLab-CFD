@@ -2056,18 +2056,33 @@ cache
 """
 
 
-def _decompose_par_dict() -> str:
-    return """FoamFile
-{
+def _decompose_par_dict(processes: int = 1) -> str:
+    if isinstance(processes, bool) or processes < 1:
+        raise ValueError("OpenFOAM processes must be a positive integer.")
+    return f"""FoamFile
+{{
     version 2.0;
     format ascii;
     class dictionary;
     object decomposeParDict;
-}
+}}
 
-numberOfSubdomains 4;
+numberOfSubdomains {processes};
 method scotch;
 """
+
+
+def configure_decomposition(case_path: Path, processes: int) -> Path:
+    """Atomically set the process count used by decomposePar for one case."""
+    if isinstance(processes, bool) or not isinstance(processes, int) or processes < 1:
+        raise ValueError("OpenFOAM processes must be a positive integer.")
+    path = case_path.resolve() / "system" / "decomposeParDict"
+    if not path.parent.is_dir():
+        raise FileNotFoundError(path.parent)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(_decompose_par_dict(processes), encoding="utf-8", newline="\n")
+    temporary.replace(path)
+    return path
 
 
 def _physical_properties(kinematic_viscosity_m2_s: float = 1.5e-5) -> str:
@@ -3287,13 +3302,112 @@ def _fv_models(
 """
 
 
+def _parallel_script_prelude() -> str:
+    return """AEROLAB_PROCESSES=${AEROLAB_PROCESSES:-1}
+AEROLAB_FILE_HANDLER=${AEROLAB_FILE_HANDLER:-auto}
+AEROLAB_RESUME=${AEROLAB_RESUME:-0}
+AEROLAB_FEATURE_CACHE_KEY=${AEROLAB_FEATURE_CACHE_KEY:-disabled}
+AEROLAB_BLOCK_CACHE_KEY=${AEROLAB_BLOCK_CACHE_KEY:-disabled}
+case "$AEROLAB_PROCESSES" in
+    ''|*[!0-9]*)
+        echo "AeroLab stopped: AEROLAB_PROCESSES must be a positive integer." >&2
+        exit 64
+        ;;
+esac
+if [ "$AEROLAB_PROCESSES" -lt 1 ]; then
+    echo "AeroLab stopped: AEROLAB_PROCESSES must be at least 1." >&2
+    exit 64
+fi
+case "$AEROLAB_FILE_HANDLER" in
+    auto) ;;
+    uncollated|collated|masterUncollated)
+        export FOAM_FILEHANDLER="$AEROLAB_FILE_HANDLER"
+        ;;
+    *)
+        echo "AeroLab stopped: unsupported OpenFOAM file handler '$AEROLAB_FILE_HANDLER'." >&2
+        exit 64
+        ;;
+esac
+case "$AEROLAB_RESUME" in
+    0|1) ;;
+    *)
+        echo "AeroLab stopped: AEROLAB_RESUME must be 0 or 1." >&2
+        exit 64
+        ;;
+esac
+for cache_key in "$AEROLAB_FEATURE_CACHE_KEY" "$AEROLAB_BLOCK_CACHE_KEY"; do
+    case "$cache_key" in
+        disabled) ;;
+        ''|*[!0-9a-f]*)
+            echo "AeroLab stopped: invalid stage-cache key." >&2
+            exit 64
+            ;;
+    esac
+done
+
+cleanup_processor_dirs() {
+    for processor_dir in processor[0-9]*; do
+        case "$processor_dir" in
+            processor*[!0-9]*) continue ;;
+        esac
+        if [ -d "$processor_dir" ]; then
+            rm -rf -- "$processor_dir"
+        fi
+    done
+}
+
+"""
+
+
 def _mesh_steps() -> str:
-    return """echo "=== AEROLAB STEP: surfaceFeatures ==="
-surfaceFeatures
+    return """mkdir -p .aerolab-cache/surfaceFeatures .aerolab-cache/blockMesh
+echo "=== AEROLAB STEP: surfaceFeatures ==="
+FEATURE_CACHE=".aerolab-cache/surfaceFeatures/$AEROLAB_FEATURE_CACHE_KEY"
+if [ "$AEROLAB_FEATURE_CACHE_KEY" != disabled ] && [ -f "$FEATURE_CACHE/.ready" ]; then
+    echo "AeroLab stage cache hit: surfaceFeatures"
+    find constant/geometry -maxdepth 1 -type f -name '*.eMesh' -delete
+    cp -a -- "$FEATURE_CACHE/files/." constant/geometry/
+else
+    find constant/geometry -maxdepth 1 -type f -name '*.eMesh' -delete
+    surfaceFeatures
+    if [ "$AEROLAB_FEATURE_CACHE_KEY" != disabled ]; then
+        FEATURE_CACHE_TMP="$FEATURE_CACHE.tmp-$$"
+        rm -rf -- "$FEATURE_CACHE_TMP" "$FEATURE_CACHE"
+        mkdir -p "$FEATURE_CACHE_TMP/files"
+        find constant/geometry -maxdepth 1 -type f -name '*.eMesh' -exec cp -a -- {} "$FEATURE_CACHE_TMP/files/" \\;
+        : > "$FEATURE_CACHE_TMP/.ready"
+        mv -- "$FEATURE_CACHE_TMP" "$FEATURE_CACHE"
+    fi
+fi
 echo "=== AEROLAB STEP: blockMesh ==="
-blockMesh
-echo "=== AEROLAB STEP: snappyHexMesh ==="
-snappyHexMesh -overwrite
+BLOCK_CACHE=".aerolab-cache/blockMesh/$AEROLAB_BLOCK_CACHE_KEY"
+if [ "$AEROLAB_BLOCK_CACHE_KEY" != disabled ] && [ -f "$BLOCK_CACHE/.ready" ] && [ -f "$BLOCK_CACHE/polyMesh/points" ]; then
+    echo "AeroLab stage cache hit: blockMesh"
+    rm -rf constant/polyMesh
+    cp -a -- "$BLOCK_CACHE/polyMesh" constant/polyMesh
+else
+    blockMesh
+    if [ "$AEROLAB_BLOCK_CACHE_KEY" != disabled ]; then
+        BLOCK_CACHE_TMP="$BLOCK_CACHE.tmp-$$"
+        rm -rf -- "$BLOCK_CACHE_TMP" "$BLOCK_CACHE"
+        mkdir -p "$BLOCK_CACHE_TMP"
+        cp -a -- constant/polyMesh "$BLOCK_CACHE_TMP/polyMesh"
+        : > "$BLOCK_CACHE_TMP/.ready"
+        mv -- "$BLOCK_CACHE_TMP" "$BLOCK_CACHE"
+    fi
+fi
+if [ "$AEROLAB_PROCESSES" -gt 1 ]; then
+    echo "=== AEROLAB STEP: decomposeMesh ==="
+    decomposePar -force
+    echo "=== AEROLAB STEP: snappyHexMesh ==="
+    mpirun -np "$AEROLAB_PROCESSES" snappyHexMesh -parallel -overwrite
+    echo "=== AEROLAB STEP: reconstructMesh ==="
+    reconstructParMesh -constant
+    cleanup_processor_dirs
+else
+    echo "=== AEROLAB STEP: snappyHexMesh ==="
+    snappyHexMesh -overwrite
+fi
 echo "=== AEROLAB STEP: checkMesh ==="
 checkMesh | tee log.checkMesh
 if ! grep -q "Mesh OK." log.checkMesh; then
@@ -3329,15 +3443,45 @@ fi
 echo "=== AEROLAB STEP: checkMeshDiagnostics ==="
 checkMesh -allGeometry -allTopology
 """ if validate_mesh else ""
-    initialization = (
-        """echo "=== AEROLAB STEP: potentialFoam ==="
-potentialFoam
+    serial_initialization = (
+        """        echo "=== AEROLAB STEP: potentialFoam ==="
+        potentialFoam
 """
         if solver_module == "incompressibleFluid"
         else ""
     )
-    return f"""{mesh_check}{initialization}echo "=== AEROLAB STEP: foamRun ==="
-foamRun
+    parallel_initialization = (
+        """        echo "=== AEROLAB STEP: potentialFoam ==="
+        mpirun -np "$AEROLAB_PROCESSES" potentialFoam -parallel
+"""
+        if solver_module == "incompressibleFluid"
+        else ""
+    )
+    return f"""{mesh_check}if [ "$AEROLAB_PROCESSES" -gt 1 ]; then
+    echo "=== AEROLAB STEP: decomposeSolve ==="
+    if [ "$AEROLAB_RESUME" -eq 1 ]; then
+        decomposePar -force -latestTime
+    else
+        decomposePar -force
+{parallel_initialization}    fi
+    echo "=== AEROLAB STEP: foamRun ==="
+    if [ "$AEROLAB_RESUME" -eq 1 ]; then
+        mpirun -np "$AEROLAB_PROCESSES" foamRun -parallel -latestTime
+    else
+        mpirun -np "$AEROLAB_PROCESSES" foamRun -parallel
+    fi
+    echo "=== AEROLAB STEP: reconstructSolve ==="
+    reconstructPar -latestTime
+    cleanup_processor_dirs
+else
+    if [ "$AEROLAB_RESUME" -eq 1 ]; then
+        echo "=== AEROLAB STEP: foamRun ==="
+        foamRun -latestTime
+    else
+{serial_initialization}        echo "=== AEROLAB STEP: foamRun ==="
+        foamRun
+    fi
+fi
 echo "=== AEROLAB STEP: streamlines ==="
 foamPostProcess -func streamlines -latestTime
 echo "=== AEROLAB STEP: wallShearStress ==="
@@ -3352,7 +3496,7 @@ def _allmesh() -> str:
     return f"""#!/bin/sh
 set -eu
 
-{_mesh_steps()}"""
+{_parallel_script_prelude()}{_mesh_steps()}"""
 
 
 def _allsolve(
@@ -3362,7 +3506,7 @@ def _allsolve(
     return f"""#!/bin/sh
 set -eu
 
-{_solve_steps(include_y_plus, validate_mesh=True, solver_module=solver_module)}"""
+{_parallel_script_prelude()}{_solve_steps(include_y_plus, validate_mesh=True, solver_module=solver_module)}"""
 
 
 def _allrun(
@@ -3372,7 +3516,7 @@ def _allrun(
     return f"""#!/bin/sh
 set -eu
 
-{_mesh_steps()}{_solve_steps(include_y_plus, validate_mesh=False, solver_module=solver_module)}"""
+{_parallel_script_prelude()}{_mesh_steps()}{_solve_steps(include_y_plus, validate_mesh=False, solver_module=solver_module)}"""
 
 
 def _run_wsl_ps1() -> str:

@@ -20,8 +20,13 @@ from .solver import (
     case_run_progress,
     compare_cases,
     create_sensitivity_study,
+    normalize_file_handler,
+    normalize_process_request,
+    normalize_study_process_budget,
     run_case,
+    run_study,
     solver_status,
+    study_members,
 )
 from .stl import detect_aero_features, inspect_stl, mesh_preview
 
@@ -41,14 +46,27 @@ class AeroLabServer(ThreadingHTTPServer):
         timeout_seconds: int,
         run_mode: str,
         reuse_mesh: bool,
+        processes: str | int,
+        file_handler: str,
+        resume: bool,
     ) -> None:
+        case_path = case_path.resolve()
         with self.active_runs_lock:
             existing = self.active_runs.get(case_path)
             if existing is not None and existing.is_alive():
                 raise ValueError("This case already has an active OpenFOAM run.")
             worker = threading.Thread(
                 target=self._run_case_worker,
-                args=(case_path, backend, timeout_seconds, run_mode, reuse_mesh),
+                args=(
+                    case_path,
+                    backend,
+                    timeout_seconds,
+                    run_mode,
+                    reuse_mesh,
+                    processes,
+                    file_handler,
+                    resume,
+                ),
                 name=f"aerolab-{run_mode}-{case_path.name}",
                 daemon=True,
             )
@@ -62,6 +80,9 @@ class AeroLabServer(ThreadingHTTPServer):
         timeout_seconds: int,
         run_mode: str,
         reuse_mesh: bool,
+        processes: str | int,
+        file_handler: str,
+        resume: bool,
     ) -> None:
         try:
             run_case(
@@ -70,12 +91,92 @@ class AeroLabServer(ThreadingHTTPServer):
                 timeout_seconds=timeout_seconds,
                 run_mode=run_mode,
                 reuse_mesh=reuse_mesh,
+                processes=processes,
+                file_handler=file_handler,
+                resume=resume,
             )
         except Exception as exc:
             _record_background_run_failure(case_path, run_mode, backend, exc)
         finally:
             with self.active_runs_lock:
-                self.active_runs.pop(case_path, None)
+                if self.active_runs.get(case_path) is threading.current_thread():
+                    self.active_runs.pop(case_path, None)
+
+    def start_study_run(
+        self,
+        case_path: Path,
+        backend: str,
+        timeout_seconds: int,
+        run_mode: str,
+        reuse_mesh: bool,
+        processes: str | int,
+        process_budget: str | int,
+        file_handler: str,
+    ) -> dict[str, object]:
+        descriptor = study_members(case_path)
+        member_paths = [Path(str(value)).resolve() for value in descriptor["casePaths"]]
+        with self.active_runs_lock:
+            conflicts = [
+                path.name
+                for path in member_paths
+                if (worker := self.active_runs.get(path)) is not None and worker.is_alive()
+            ]
+            if conflicts:
+                raise ValueError(
+                    "Study members already running: " + ", ".join(conflicts)
+                )
+            worker = threading.Thread(
+                target=self._run_study_worker,
+                args=(
+                    case_path.resolve(),
+                    member_paths,
+                    backend,
+                    timeout_seconds,
+                    run_mode,
+                    reuse_mesh,
+                    processes,
+                    process_budget,
+                    file_handler,
+                ),
+                name=f"aerolab-study-{descriptor['studyId']}",
+                daemon=True,
+            )
+            for path in member_paths:
+                self.active_runs[path] = worker
+            worker.start()
+        return descriptor
+
+    def _run_study_worker(
+        self,
+        case_path: Path,
+        member_paths: list[Path],
+        backend: str,
+        timeout_seconds: int,
+        run_mode: str,
+        reuse_mesh: bool,
+        processes: str | int,
+        process_budget: str | int,
+        file_handler: str,
+    ) -> None:
+        try:
+            run_study(
+                case_path,
+                backend=backend,
+                timeout_seconds=timeout_seconds,
+                run_mode=run_mode,
+                reuse_mesh=reuse_mesh,
+                processes=processes,
+                process_budget=process_budget,
+                file_handler=file_handler,
+            )
+        except Exception as exc:
+            _record_background_study_failure(member_paths, backend, exc)
+        finally:
+            with self.active_runs_lock:
+                current = threading.current_thread()
+                for path in member_paths:
+                    if self.active_runs.get(path) is current:
+                        self.active_runs.pop(path, None)
 
 
 class AeroLabHandler(BaseHTTPRequestHandler):
@@ -105,6 +206,12 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/case-progress":
             try:
                 self._handle_case_progress(parsed.query)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if parsed.path == "/api/study-progress":
+            try:
+                self._handle_study_progress(parsed.query)
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
             return
@@ -142,6 +249,9 @@ class AeroLabHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/run-case":
                 self._handle_run_case()
+                return
+            if parsed.path == "/api/run-study":
+                self._handle_run_study()
                 return
             if parsed.path == "/api/compare-cases":
                 self._handle_compare_cases()
@@ -310,6 +420,23 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         if not (case_path / "case.json").is_file():
             raise ValueError("The selected folder is not an AeroLab case.")
         self._send_json({"ok": True, "progress": case_run_progress(case_path)})
+
+    def _handle_study_progress(self, query: str) -> None:
+        params = parse_qs(query)
+        value = params.get("casePath", [None])[0]
+        if not value:
+            raise ValueError("A study member path is required.")
+        case_path = self._resolve_project_path(unquote(value))
+        if not (case_path / "case.json").is_file():
+            raise ValueError("The selected folder is not an AeroLab case.")
+        record_path = case_path / "aerolab-study-run.json"
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            record = None
+        except json.JSONDecodeError as exc:
+            raise ValueError("The study run record is not valid JSON.") from exc
+        self._send_json({"ok": True, "exists": record is not None, "studyRun": record})
 
     def _handle_repair_model(self) -> None:
         payload = self._json_body()
@@ -582,12 +709,20 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         default_timeout = 14400 if run_mode == "mesh" else 21600
         timeout_seconds = int(payload.get("timeoutSeconds") or default_timeout)
         reuse_mesh = payload.get("reuseMesh") is not False
+        processes = normalize_process_request(payload.get("processes", "auto"))
+        file_handler = normalize_file_handler(payload.get("fileHandler", "auto"))
+        resume_value = payload.get("resume", False)
+        if not isinstance(resume_value, bool):
+            raise ValueError("Resume must be true or false.")
         self.server.start_case_run(
             case_path,
             backend,
             timeout_seconds,
             run_mode,
             reuse_mesh,
+            processes,
+            file_handler,
+            resume_value,
         )
         self._send_json(
             {
@@ -596,6 +731,47 @@ class AeroLabHandler(BaseHTTPRequestHandler):
                 "casePath": str(case_path),
                 "mode": run_mode,
                 "timeoutSeconds": timeout_seconds,
+                "processes": processes,
+                "fileHandler": file_handler,
+                "resume": resume_value,
+            },
+            status=202,
+        )
+
+    def _handle_run_study(self) -> None:
+        payload = self._json_body()
+        case_path = self._resolve_project_path(str(payload["casePath"]))
+        backend = str(payload.get("backend") or "auto")
+        run_mode = str(payload.get("mode") or "full")
+        default_timeout = 14400 if run_mode == "mesh" else 21600
+        timeout_seconds = int(payload.get("timeoutSeconds") or default_timeout)
+        reuse_mesh = payload.get("reuseMesh") is not False
+        processes = normalize_process_request(payload.get("processes", "auto"))
+        process_budget = normalize_study_process_budget(
+            payload.get("processBudget", "auto")
+        )
+        file_handler = normalize_file_handler(payload.get("fileHandler", "auto"))
+        descriptor = self.server.start_study_run(
+            case_path,
+            backend,
+            timeout_seconds,
+            run_mode,
+            reuse_mesh,
+            processes,
+            process_budget,
+            file_handler,
+        )
+        self._send_json(
+            {
+                "ok": True,
+                "accepted": True,
+                "casePath": str(case_path),
+                "study": descriptor,
+                "mode": run_mode,
+                "timeoutSeconds": timeout_seconds,
+                "processes": processes,
+                "processBudget": process_budget,
+                "fileHandler": file_handler,
             },
             status=202,
         )
@@ -707,6 +883,34 @@ def _record_background_run_failure(
             stream.write(f"\nAeroLab background run failed: {error}\n")
     except OSError:
         pass
+
+
+def _record_background_study_failure(
+    member_paths: list[Path],
+    backend: str,
+    error: Exception,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    for member_path in member_paths:
+        record_path = member_path / "aerolab-study-run.json"
+        existing: dict[str, object] = {}
+        try:
+            existing = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+        record = {
+            **existing,
+            "status": "failed",
+            "ok": False,
+            "backend": backend,
+            "startedAt": existing.get("startedAt") or now,
+            "finishedAt": now,
+            "error": {
+                "type": type(error).__name__,
+                "message": str(error),
+            },
+        }
+        record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
 
 def run_app(host: str, port: int, root: Path) -> None:

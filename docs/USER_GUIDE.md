@@ -145,6 +145,54 @@ Standard and fine request prism layers and calculate absolute layer thickness fr
 
 Use **Steady RANS** for orientation checks, mesh development, and faster estimates of a settled mean flow. Use **Transient + averaged** for bluff bodies, open-wheel vehicles, hatchback or truck wakes, and comparisons where changing separation matters. Transient mode uses adaptive PIMPLE time stepping, develops the wake for several vehicle flow-through lengths, then averages velocity, pressure, turbulence, wall shear, `Cd`, and `Cl` over a physical-time window. It costs more runtime and does not turn a coarse mesh into an accurate one.
 
+## Configure Local Solver Performance
+
+The browser exposes the same optimization controls as the CLI:
+
+- **Compute processes — Auto:** recommended. AeroLab probes CPU, memory/cgroup limits, case cell budget, and MPI commands inside the selected backend.
+- **Compute processes — Serial:** useful as a baseline or for small cases where MPI overhead dominates.
+- **Parallel file handler — Auto:** recommended until another OpenFOAM handler has been verified with the installed MPI build.
+- **Study process budget:** one aggregate rank budget shared by all concurrently running accuracy/sensitivity members.
+- **Resume failed solver:** opt-in recovery from the latest compatible reconstructed time.
+
+Automatic selection reserves one CPU, reserves at least 25% or 1 GiB of memory, budgets 2 GiB per rank, and caps a case at eight ranks. It also reduces ranks for small cell budgets. If MPI tools are incomplete, Auto uses serial execution. A manually requested count is rejected when it exceeds backend CPU or conservative memory limits; AeroLab does not silently reduce it.
+
+Parallel mesh and solve stages decompose the case, execute the MPI-capable OpenFOAM command, reconstruct durable serial results, and remove `processorN` directories. The optimization status reports the requested and resolved rank counts. Do not assume eight ranks are eight times faster: MPI communication, decomposition, reconstruction, and filesystem work impose overhead, and small cases may run faster serially. This repository has not yet completed a real serial-versus-auto timing run, so no speedup percentage is claimed.
+
+### Cache and mesh reuse
+
+AeroLab fingerprints the inputs to `surfaceFeatures` and `blockMesh` and stores successful outputs under the case-local `.aerolab-cache`. A hit skips only that exact unchanged stage. The final snappy mesh is governed by the stricter reusable-mesh record and body-fidelity audit; it is never accepted merely because an earlier cache directory exists.
+
+The recommended sequence is:
+
+1. create the case;
+2. run **Validate Mesh** once;
+3. resolve any red mesh or fidelity result;
+4. run **Run Solver**, which reuses the matching validated mesh; and
+5. rebuild whenever geometry or mesh inputs change.
+
+### Safe resume
+
+Resume is available only when all of these are true:
+
+1. the prior attempt is recorded as a failed **full** run;
+2. physical and numerical solver inputs have the same fingerprint;
+3. the mesh is still reusable;
+4. a reconstructed positive time directory contains both `U` and `p`; and
+5. mesh reuse remains enabled.
+
+AeroLab then skips `potentialFoam`, decomposes the latest time when needed, and runs `foamRun -latestTime`. Successful runs, mesh-only runs, stale inputs, incomplete processor-only output, or missing fields must start cleanly. Resume does not weaken convergence or verification gates.
+
+### Study scheduling
+
+**Run Study** discovers and validates every sibling member before starting. It reserves all members against duplicate single-case runs, probes backend resources once, estimates each member's conservative memory need, and schedules bounded waves. When MPI is available it balances ranks per case against concurrency; otherwise it can run independent serial members concurrently. `aerolab-study-run.json` is copied to every member and records partial and final progress.
+
+### File and backend behavior
+
+On Windows, WSL2 is the preferred backend. AeroLab stages each case on the WSL Linux filesystem, then copies results back to the project. Docker remains an optional alternative only when the user has installed it and explicitly set a vetted Foundation v13 image; AeroLab never downloads one. On Docker, execution similarly stages to an anonymous Linux volume before copying results back. Native Foundation v13 is supported on Linux.
+
+There is no GPU execution path for this Foundation v13 workflow. The supported performance tools are CPU MPI, Linux-filesystem staging, stage/mesh reuse, strict resume, and resource-budgeted study concurrency.
+
 ## Create And Run A Case
 
 1. Resolve every red CFD Readiness item.

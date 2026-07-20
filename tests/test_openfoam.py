@@ -14,6 +14,61 @@ from aerolab.stl import inspect_stl, read_stl_triangles, write_binary_stl_triang
 
 
 class OpenFoamCaseTests(unittest.TestCase):
+    def test_generated_scripts_cover_serial_mpi_cache_handler_and_resume_paths(self) -> None:
+        from aerolab.openfoam import configure_decomposition
+
+        project = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            case_path = create_case(
+                model_path=project / "models" / "sample_box.stl",
+                case_name="parallel-contract",
+                speed_mph=70,
+                flow_axis="x",
+                cases_dir=Path(temp_dir),
+                quality="draft",
+            )
+            allrun = (case_path / "Allrun").read_text(encoding="utf-8")
+            allmesh = (case_path / "Allmesh").read_text(encoding="utf-8")
+            allsolve = (case_path / "Allsolve").read_text(encoding="utf-8")
+            decomposition = (case_path / "system" / "decomposeParDict").read_text(
+                encoding="utf-8"
+            )
+
+            self.assertIn("numberOfSubdomains 1;", decomposition)
+            for script in (allrun, allmesh, allsolve):
+                self.assertIn("AEROLAB_PROCESSES=${AEROLAB_PROCESSES:-1}", script)
+                self.assertIn("AEROLAB_FILE_HANDLER=${AEROLAB_FILE_HANDLER:-auto}", script)
+                self.assertIn("AEROLAB_RESUME=${AEROLAB_RESUME:-0}", script)
+                self.assertIn("uncollated|collated|masterUncollated)", script)
+                self.assertIn("export FOAM_FILEHANDLER=\"$AEROLAB_FILE_HANDLER\"", script)
+                self.assertIn("AEROLAB_RESUME must be 0 or 1", script)
+                self.assertIn("cleanup_processor_dirs()", script)
+
+            self.assertIn("AeroLab stage cache hit: surfaceFeatures", allmesh)
+            self.assertIn("AeroLab stage cache hit: blockMesh", allmesh)
+            self.assertIn("decomposePar -force", allmesh)
+            self.assertIn(
+                'mpirun -np "$AEROLAB_PROCESSES" snappyHexMesh -parallel -overwrite',
+                allmesh,
+            )
+            self.assertIn("snappyHexMesh -overwrite", allmesh)
+            self.assertIn("reconstructParMesh -constant", allmesh)
+            self.assertIn("decomposePar -force -latestTime", allsolve)
+            self.assertIn(
+                'mpirun -np "$AEROLAB_PROCESSES" foamRun -parallel -latestTime',
+                allsolve,
+            )
+            self.assertIn("foamRun -latestTime", allsolve)
+            self.assertIn("reconstructPar -latestTime", allsolve)
+
+            configure_decomposition(case_path, 4)
+            self.assertIn(
+                "numberOfSubdomains 4;",
+                (case_path / "system" / "decomposeParDict").read_text(encoding="utf-8"),
+            )
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                configure_decomposition(case_path, True)
+
     def test_generates_transient_time_averaged_vehicle_case(self) -> None:
         project = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temp_dir:

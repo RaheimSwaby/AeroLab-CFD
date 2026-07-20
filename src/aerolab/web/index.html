@@ -432,10 +432,52 @@
                 <span>Solver actions</span>
                 <small>Mesh before committing to a full run</small>
               </div>
+              <label>
+                <span>Compute processes</span>
+                <select id="solverProcesses">
+                  <option value="auto" selected>Auto — hardware and case aware</option>
+                  <option value="1">Serial — 1 process</option>
+                  <option value="2">2 processes</option>
+                  <option value="4">4 processes</option>
+                  <option value="6">6 processes</option>
+                  <option value="8">8 processes</option>
+                  <option value="12">12 processes</option>
+                  <option value="16">16 processes</option>
+                </select>
+                <small>Auto respects the CPU and memory available inside Docker or WSL.</small>
+              </label>
+              <div class="form-grid two-up engineering-only">
+                <label>
+                  <span>Parallel file handler</span>
+                  <select id="solverFileHandler">
+                    <option value="auto" selected>Auto — backend default</option>
+                    <option value="uncollated">Uncollated</option>
+                    <option value="collated">Collated</option>
+                    <option value="masterUncollated">Primary uncollated</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Study process budget</span>
+                  <select id="studyProcessBudget">
+                    <option value="auto" selected>Auto — shared hardware budget</option>
+                    <option value="2">2 total processes</option>
+                    <option value="4">4 total processes</option>
+                    <option value="6">6 total processes</option>
+                    <option value="8">8 total processes</option>
+                    <option value="12">12 total processes</option>
+                    <option value="16">16 total processes</option>
+                  </select>
+                </label>
+              </div>
+              <label class="toggle engineering-only">
+                <span><strong>Resume failed solver</strong><small>Requires unchanged inputs, reusable mesh, and reconstructed time state</small></span>
+                <input id="resumeSolver" type="checkbox" />
+              </label>
               <div class="case-tools">
                 <button id="checkSolverButton" type="button">Check Solver</button>
                 <button id="meshCaseButton" type="button" disabled>Validate Mesh</button>
                 <button id="runCaseButton" type="button" disabled>Run Solver</button>
+                <button id="runStudyButton" class="engineering-only" type="button" disabled>Run Study</button>
               </div>
             </div>
             <div id="runProgress" class="run-progress" hidden aria-live="polite">
@@ -457,6 +499,7 @@
             </details>
             <div class="status-stack">
               <p id="solverStatus" class="inline-status"></p>
+              <p id="optimizationStatus" class="inline-status engineering-only"></p>
               <p id="resultSummary" class="inline-status"></p>
             </div>
           </section>
@@ -578,6 +621,6 @@
       </main>
     </div>
 
-    <script type="module" src="/assets/app.js?v=65"></script>
+    <script type="module" src="/assets/app.js?v=67"></script>
   </body>
 </html>

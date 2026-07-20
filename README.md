@@ -125,6 +125,36 @@ Use the CFD quality preset based on intent: `draft` for quick setup checks, `sta
 
 Enter the width of the smallest aerodynamic feature whose pressure effect matters, such as a diffuser strake or vortex generator. AeroLab targets at least four sharp-feature cells across that width by raising the `surfaceFeatures` and maximum body-surface refinement levels, with quality-dependent local/global cell caps. The broad body surface keeps a lower level so a small feature does not force the entire tunnel to the same cell size. Draft and Standard cases currently stop at refinement level 8; Fine stops at level 9 with a larger cell budget. A smaller unsupported target is rejected before meshing instead of silently generating an under-resolved case or exhausting a local machine. The post-run body-patch fidelity audit remains the final proof that OpenFOAM actually retained the feature.
 
+## Local OpenFOAM Acceleration
+
+AeroLab can run new cases serially or with backend-aware MPI. The CLI and browser default to `auto`; manually executing a generated `./Allrun` remains serial unless `AEROLAB_PROCESSES` is set.
+
+```powershell
+# Let AeroLab choose a safe rank count inside WSL2, native Linux, or Docker.
+aerolab run-case .\cases\sample-ref --processes auto
+
+# Request an exact count. AeroLab rejects it if backend CPU or memory limits are too low.
+aerolab run-case .\cases\sample-ref --processes 4
+
+# Share one aggregate process budget across all members of an accuracy or sensitivity study.
+aerolab run-study .\cases\one-study-member --processes auto --process-budget auto
+```
+
+`auto` measures CPUs, cgroup/container limits, available memory, and MPI tools inside the selected solver backend. It reserves one CPU, keeps at least 25% or 1 GiB of memory free, budgets 2 GiB per rank, considers the case cell limit, and caps one case at eight ranks. If a required MPI tool is unavailable, automatic selection safely uses one process; an explicit unsupported count fails instead of being silently reduced.
+
+Parallel meshing decomposes the case, runs `snappyHexMesh` with MPI, reconstructs the serial mesh, and removes temporary processor directories. Parallel solving follows the same decompose/run/reconstruct/cleanup lifecycle. More ranks do not imply proportional speedup: small cases can be slower because decomposition, MPI communication, reconstruction, and storage have fixed costs. No real serial-versus-MPI timing has yet been measured for this repository, so treat acceleration as expected behavior to benchmark on the target computer, not a published speedup claim.
+
+Additional local controls:
+
+- **Stage cache:** unchanged `surfaceFeatures` and `blockMesh` inputs can reuse fingerprinted outputs. A validated final mesh has a separate, stricter geometry/mesh fingerprint.
+- **Mesh reuse:** **Validate Mesh** once, then **Run Solver** can reuse only a matching reusable mesh.
+- **Resume:** `--resume` is opt-in and accepted only after a failed full run with unchanged solver inputs, a reusable mesh, and a reconstructed numeric time containing `U` and `p`.
+- **File handling:** leave `--file-handler auto` selected unless the target OpenFOAM/MPI installation has been tested with another handler. Collated output can reduce file counts, but support and performance depend on the installation.
+- **Studies:** independent cases run concurrently within one CPU/memory budget. This improves total study throughput; it does not make each individual case faster.
+- **Resource guidance:** run records and the browser report selected ranks, cache hits, convergence policy, and conservative memory guidance.
+
+There is no GPU path for the generated Foundation v13 workflow. CPU MPI, safe storage staging, cache reuse, mesh reuse, and bounded study concurrency are the supported acceleration mechanisms.
+
 ## Solver Status And Runs
 
 Check whether OpenFOAM is available locally:

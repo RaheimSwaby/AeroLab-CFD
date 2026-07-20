@@ -35,6 +35,7 @@ def case_run_progress(case_path: Path) -> dict[str, object]:
     case_path = case_path.resolve()
     case_payload = _read_json_object(case_path / "case.json")
     run_payload = _read_json_object(case_path / "aerolab-run.json")
+    study_run_payload = _read_json_object(case_path / "aerolab-study-run.json")
     case_status = str(case_payload.get("status") or "unknown")
     run_status = str(run_payload.get("status") or "")
     run_mode = str(run_payload.get("mode") or "full")
@@ -130,6 +131,16 @@ def case_run_progress(case_path: Path) -> dict[str, object]:
         "runMode": run_mode,
         "solverTime": solver_time,
         "solverEndTime": end_time if solver_time is not None else None,
+        "optimization": {
+            "requestedProcesses": run_payload.get("requestedProcesses"),
+            "processes": run_payload.get("processes"),
+            "fileHandler": run_payload.get("fileHandler"),
+            "resumed": run_payload.get("resumed"),
+            "resumeFromTime": run_payload.get("resumeFromTime"),
+            "convergencePolicy": run_payload.get("convergencePolicy"),
+            "processSelection": run_payload.get("processSelection"),
+        },
+        "studyRun": study_run_payload or None,
         "updatedAt": case_payload.get("updated_at") or run_payload.get("finishedAt"),
     }
 
@@ -289,8 +300,10 @@ def case_report(
         try:
             stored_run = json.loads(run_json_path.read_text(encoding="utf-8"))
             run_payload = {key: stored_run.get(key) for key in (
-                "status", "ok", "trusted", "numericallyQualified", "mode", "reusedMesh", "backend", "returncode",
-                "logPath", "startedAt", "finishedAt"
+                "status", "ok", "trusted", "numericallyQualified", "mode", "reusedMesh",
+                "backend", "requestedProcesses", "processes", "fileHandler", "resumed",
+                "resumeFromTime", "solverInputFingerprint", "convergencePolicy",
+                "processSelection", "returncode", "logPath", "startedAt", "finishedAt"
             )}
         except json.JSONDecodeError:
             run_payload = None
@@ -371,6 +384,7 @@ def case_report(
     )
 
     visualization = _case_visualization(case_path, case_payload) if include_visualization else {}
+    study_run = _read_json_object(case_path / "aerolab-study-run.json") or None
     return {
         "schemaVersion": case_payload.get("schema_version", 1),
         "casePath": str(case_path),
@@ -418,6 +432,7 @@ def case_report(
         "gridConvergence": validation,
         "sensitivityStudy": sensitivity,
         "lastRun": run_payload,
+        "studyRun": study_run,
         "runProgress": case_run_progress(case_path),
         **visualization,
     }
