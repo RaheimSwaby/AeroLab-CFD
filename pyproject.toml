@@ -28,6 +28,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 aerolab = ["web/*", "web/vendor/*"]
+"aerolab.benchmarks" = ["cube-symmetry-v1/*.json", "cube-symmetry-v1/*.stl"]
 
 [tool.ruff]
 target-version = "py310"

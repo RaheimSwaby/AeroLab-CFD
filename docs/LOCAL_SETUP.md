@@ -59,3 +59,29 @@ The Python CLI will remain the local controller. The solver can run in WSL2/Dock
 - ParaView: CFD visualization
 - OpenFOAM: CFD solver
 - WSL2 or Docker: local solver environment
+
+## Reproducible OpenFOAM benchmark
+
+AeroLab includes an offline `cube-symmetry-v1` real-solver smoke benchmark. It verifies the packaged STL checksum, generates a fresh deterministic case, requires OpenFOAM Foundation v13, applies the normal numerical-qualification gates, and checks cube symmetry and broad drag sanity limits. It does **not** claim absolute aerodynamic accuracy; a reference-geometry benchmark is still required for that claim.
+
+Prepare and inspect the benchmark without a solver:
+
+```bash
+aerolab benchmark cube-symmetry-v1 --prepare-only --output-dir outputs/benchmarks --json
+```
+
+Run it on a machine with Foundation v13 available through the native, WSL, or configured local Docker backend:
+
+```bash
+aerolab benchmark cube-symmetry-v1 --backend auto --timeout-seconds 3600 --json
+```
+
+Every attempt is stored separately under `outputs/benchmarks/cube-symmetry-v1/<run-id>/` with the raw packaged manifest, generated case, and `benchmark-result.json`. Evidence files are SHA-256 indexed in the result, and `benchmark-result.sha256` records a checksum of the result itself. These adjacent checksums detect accidental or unreconciled changes, but they are not an external signature and do not prevent someone with write access from deliberately recomputing them. Solver execution is pinned to the probed paths and executable hashes for the complete OpenFOAM toolchain used by AeroLab; Docker probes and runs are additionally pinned to the inspected image ID. Set `AEROLAB_BUILD_REVISION` to a release or source revision when you need that identifier recorded with the solver provenance. The command exits `0` for a passed or successfully prepared benchmark, `1` for a scientific or numerical benchmark failure, `2` for a setup, infrastructure, or evaluation error, and `3` when no requested OpenFOAM backend is available. Normal benchmark execution never downloads a solver image.
+
+To enable the environment-gated real-solver integration test on a pre-provisioned Foundation v13 host:
+
+```bash
+AEROLAB_RUN_OPENFOAM_BENCHMARK=1 \
+AEROLAB_BENCHMARK_BACKEND=auto \
+python -m unittest discover -s tests -p 'test_benchmark.py' -v
+```

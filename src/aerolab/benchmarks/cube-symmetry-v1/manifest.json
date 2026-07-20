@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "id": "cube-symmetry-v1",
+  "name": "Cube symmetry real-solver smoke benchmark",
+  "kind": "real_solver_smoke",
+  "validationScope": "Verifies packaged-input integrity, Foundation v13 execution, AeroLab numerical qualification, and symmetry/sanity invariants. It is not an absolute aerodynamic-accuracy reference.",
+  "absoluteAccuracyValidated": false,
+  "fixture": {
+    "path": "body.stl",
+    "sha256": "13b9bef191ac63d1b63deafbbc4d634b71f8875562e048b371e281aeeaa7415f"
+  },
+  "solver": {
+    "family": "OpenFOAM Foundation",
+    "majorVersion": "13",
+    "execution": "serial"
+  },
+  "case": {
+    "name": "cube-symmetry-v1",
+    "speedMph": 44.7387258411,
+    "flowAxis": "x",
+    "includeGround": false,
+    "movingGround": false,
+    "quality": "draft",
+    "simulationMode": "steady",
+    "unitScale": 1.0,
+    "unitLabel": "m",
+    "referenceAreaM2": 1.0,
+    "referenceLengthM": 1.0,
+    "measuredLengthM": 1.0,
+    "measuredWidthM": 1.0,
+    "measuredHeightM": 1.0,
+    "airTemperatureC": 15.0,
+    "airPressurePa": 101325.0,
+    "airDensityKgM3": 1.225,
+    "kinematicViscosityM2S": 0.000015,
+    "turbulenceIntensityPercent": 1.0,
+    "turbulenceLengthScaleM": 0.07,
+    "sourceFlowDirection": "+x",
+    "sourceUpDirection": "+z"
+  },
+  "acceptance": {
+    "requiredQualificationChecks": [
+      "Geometry fidelity",
+      "Meshed body fidelity",
+      "Measured dimensions",
+      "Aero feature resolution",
+      "Solver process",
+      "Mesh quality",
+      "Residual convergence",
+      "Six-axis load stability"
+    ],
+    "metrics": [
+      {
+        "path": "meshQuality.cells",
+        "label": "positive mesh cell count",
+        "minimum": 1
+      },
+      {
+        "path": "forceCoeffs.meanCd",
+        "label": "positive bounded drag sanity envelope",
+        "minimum": 0.1,
+        "maximum": 3.0
+      },
+      {
+        "path": "forceCoeffs.meanCl",
+        "label": "vertical symmetry",
+        "absoluteMaximum": 0.1
+      },
+      {
+        "path": "forceCoeffs.meanCs",
+        "label": "lateral symmetry",
+        "absoluteMaximum": 0.1
+      },
+      {
+        "path": "forceCoeffs.meanCmRoll",
+        "label": "roll-moment symmetry",
+        "absoluteMaximum": 0.1
+      },
+      {
+        "path": "forceCoeffs.meanCmPitch",
+        "label": "pitch-moment symmetry",
+        "absoluteMaximum": 0.1
+      },
+      {
+        "path": "forceCoeffs.meanCmYaw",
+        "label": "yaw-moment symmetry",
+        "absoluteMaximum": 0.1
+      }
+    ]
+  }
+}

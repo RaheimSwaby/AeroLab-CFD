@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import sys
 from pathlib import Path
@@ -731,7 +733,87 @@ def main(argv: list[str] | None = None) -> int:
         help="Write the sensitivity report to this file instead of standard output.",
     )
 
-    args = parser.parse_args(argv)
+    from .benchmarks import DEFAULT_BENCHMARK_ID, available_benchmarks
+
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="Run a packaged real-OpenFOAM regression benchmark.",
+    )
+    benchmark_parser.add_argument(
+        "benchmark_id",
+        nargs="?",
+        choices=available_benchmarks(),
+        default=DEFAULT_BENCHMARK_ID,
+        help="Packaged benchmark identifier.",
+    )
+    benchmark_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs/benchmarks"),
+        help="Directory where separate benchmark attempts are archived.",
+    )
+    benchmark_parser.add_argument(
+        "--backend",
+        choices=["auto", "native", "wsl", "docker"],
+        default="auto",
+        help="OpenFOAM backend to verify and use.",
+    )
+    benchmark_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=3600,
+        help="Maximum real-solver runtime.",
+    )
+    benchmark_parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Verify the packaged input and generate the deterministic case without running OpenFOAM.",
+    )
+    benchmark_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the benchmark result as JSON.",
+    )
+
+    parse_argv = list(argv) if argv is not None else sys.argv[1:]
+    benchmark_json_mode = bool(
+        parse_argv
+        and parse_argv[0] == "benchmark"
+        and "--json" in parse_argv
+    )
+    if benchmark_json_mode:
+        parser_error_output = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(parser_error_output):
+                args = parser.parse_args(parse_argv)
+        except SystemExit as exc:
+            if exc.code == 0:
+                raise
+            error_lines = [
+                line.strip()
+                for line in parser_error_output.getvalue().splitlines()
+                if line.strip()
+            ]
+            message = error_lines[-1] if error_lines else "Invalid benchmark arguments."
+            if ": error: " in message:
+                message = message.split(": error: ", 1)[1]
+            print(
+                json.dumps(
+                    {
+                        "benchmarkId": None,
+                        "status": "error",
+                        "passed": False,
+                        "error": {
+                            "type": "ArgumentError",
+                            "message": message,
+                        },
+                    },
+                    indent=2,
+                )
+            )
+            return 2
+    else:
+        args = parser.parse_args(parse_argv)
 
     if args.command == "check":
         report = inspect_stl(args.model)
@@ -929,6 +1011,55 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(content)
         return 0
+
+    if args.command == "benchmark":
+        from .benchmarks import BENCHMARK_UNAVAILABLE_EXIT_CODE, run_benchmark
+
+        try:
+            result = run_benchmark(
+                args.benchmark_id,
+                output_dir=args.output_dir,
+                backend=args.backend,
+                timeout_seconds=args.timeout_seconds,
+                prepare_only=args.prepare_only,
+            )
+        except Exception as exc:
+            result = {
+                "benchmarkId": args.benchmark_id,
+                "status": "error",
+                "passed": False,
+                "requestedBackend": args.backend,
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+            }
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                print(f"Benchmark: {args.benchmark_id}", file=sys.stderr)
+                print("Status: error", file=sys.stderr)
+                print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Benchmark: {result.get('benchmarkName')}")
+            print(f"Status: {result.get('status')}")
+            print(f"Real solver passed: {'yes' if result.get('passed') else 'no'}")
+            print(
+                "Absolute aerodynamic accuracy reference: "
+                f"{'yes' if result.get('absoluteAccuracyValidated') else 'no'}"
+            )
+            print(f"Case: {result.get('casePath')}")
+            print(f"Result: {result.get('resultPath')}")
+            for check in result.get("checks", []):
+                if isinstance(check, dict):
+                    print(f"- {check.get('status')}: {check.get('label')} - {check.get('detail')}")
+        if result.get("status") == "prepared":
+            return 0
+        if result.get("status") == "unavailable":
+            return BENCHMARK_UNAVAILABLE_EXIT_CODE
+        if result.get("status") == "error":
+            return 2
+        return 0 if result.get("passed") else 1
 
     parser.error(f"Unknown command: {args.command}")
     return 2

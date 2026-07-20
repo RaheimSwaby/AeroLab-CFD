@@ -3,15 +3,26 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shutil
+import signal
 import subprocess
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TextIO
 
 from ..openfoam import ensure_case_postprocessing
 from .analysis import _latest_body_surface_vtk, assess_meshed_surface_fidelity, case_report
-from .backends import _run_command, _select_backend, solver_status
+from .backends import (
+    _backend_cleanup_command,
+    _backend_cleanup_verification_command,
+    _run_command,
+    _select_backend,
+    solver_status,
+)
 from .util import _read_json_object
 
 MESH_INPUT_FILES = (
@@ -88,6 +99,7 @@ def run_case(
     timeout_seconds: int = 3600,
     run_mode: str = "full",
     reuse_mesh: bool = True,
+    solver_identity: dict[str, object] | None = None,
 ) -> SolverRunResult:
     case_path = case_path.resolve()
     run_mode = str(run_mode or "full").lower()
@@ -117,11 +129,14 @@ def run_case(
     run_path = case_path / "aerolab-run.json"
 
     _clear_previous_solver_outputs(case_path, preserve_mesh=reused_mesh)
+    execution_id = uuid.uuid4().hex
     command = _run_command(
         case_path,
         selected,
         timeout_seconds=timeout_seconds,
         script_name=script_name,
+        execution_id=execution_id,
+        solver_identity=solver_identity,
     )
     process_timeout = timeout_seconds + 900 if selected == "wsl" else timeout_seconds
     _update_case_status(case_path, "mesh_running" if run_mode == "mesh" else "solver_running")
@@ -148,29 +163,24 @@ def run_case(
     with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
         log_file.write(f"AeroLab backend: {selected}\n")
         log_file.flush()
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=str(case_path),
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=process_timeout,
-            )
-            returncode = completed.returncode
-            if returncode == 124 and selected == "wsl":
-                log_file.write(
-                    f"\nAeroLab stopped OpenFOAM after {timeout_seconds} seconds; "
-                    "staged partial results were copied back.\n"
-                )
-        except subprocess.TimeoutExpired:
-            returncode = 124
+        returncode, outer_timeout = _run_solver_process(
+            command,
+            case_path=case_path,
+            backend=selected,
+            execution_id=execution_id,
+            process_timeout=process_timeout,
+            log_file=log_file,
+        )
+        if outer_timeout:
             log_file.write(
-                f"\nAeroLab stopped the run after its {process_timeout}-second outer limit.\n"
+                f"\nAeroLab stopped the complete solver process tree after "
+                f"its {process_timeout}-second outer limit.\n"
             )
-        except OSError as exc:
-            returncode = 127
-            log_file.write(f"\nAeroLab could not start the solver process: {exc}\n")
+        elif returncode == 124 and selected == "wsl":
+            log_file.write(
+                f"\nAeroLab stopped OpenFOAM after {timeout_seconds} seconds; "
+                "staged partial results were copied back.\n"
+            )
     finished_at = datetime.now(timezone.utc).isoformat()
     mesh_fidelity_path = case_path / "mesh-surface-fidelity.json"
     mesh_outputs_present = _mesh_outputs_present(case_path)
@@ -242,6 +252,195 @@ def run_case(
         run_mode=run_mode,
         reused_mesh=reused_mesh,
     )
+
+
+def _run_solver_process(
+    command: list[str],
+    *,
+    case_path: Path,
+    backend: str,
+    execution_id: str,
+    process_timeout: int,
+    log_file: TextIO,
+    termination_grace_seconds: float = 30.0,
+) -> tuple[int, bool]:
+    process_options: dict[str, object] = {}
+    if os.name == "posix":
+        process_options["start_new_session"] = True
+    elif os.name == "nt":
+        process_options["creationflags"] = getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0,
+        )
+    process = subprocess.Popen(
+        command,
+        cwd=str(case_path),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
+        **process_options,
+    )
+    try:
+        return process.wait(timeout=process_timeout), False
+    except subprocess.TimeoutExpired:
+        cleanup_errors: list[str] = []
+        try:
+            _terminate_process_tree(
+                process,
+                grace_seconds=termination_grace_seconds,
+            )
+        except Exception as exc:
+            cleanup_errors.append(f"process-tree termination failed: {exc}")
+        try:
+            _confirm_backend_cleanup(case_path, backend, execution_id)
+        except Exception as exc:
+            cleanup_errors.append(f"backend cleanup failed: {exc}")
+        if cleanup_errors:
+            detail = "; ".join(cleanup_errors)
+            log_file.write(f"\nAeroLab could not confirm timeout cleanup: {detail}\n")
+            raise RuntimeError(
+                f"Solver timeout cleanup could not be confirmed: {detail}"
+            )
+        return 124, True
+
+
+def _confirm_backend_cleanup(
+    case_path: Path,
+    backend: str,
+    execution_id: str,
+) -> None:
+    cleanup_command = _backend_cleanup_command(case_path, backend, execution_id)
+    verification_command = _backend_cleanup_verification_command(
+        case_path,
+        backend,
+        execution_id,
+    )
+    if cleanup_command is None and verification_command is None:
+        return
+    if cleanup_command is None or verification_command is None:
+        raise RuntimeError("Backend cleanup commands are incomplete.")
+
+    cleanup_detail = ""
+    try:
+        cleanup = subprocess.run(
+            cleanup_command,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        if cleanup.returncode != 0:
+            cleanup_detail = (cleanup.stderr or cleanup.stdout).strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        cleanup_detail = str(exc)
+
+    try:
+        verification = subprocess.run(
+            verification_command,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"container-absence verification failed: {exc}") from exc
+    if verification.returncode != 0:
+        detail = (verification.stderr or verification.stdout).strip()
+        raise RuntimeError(
+            "container-absence verification failed"
+            + (f": {detail}" if detail else "")
+            + (f"; cleanup reported: {cleanup_detail}" if cleanup_detail else "")
+        )
+    remaining_container_ids = verification.stdout.strip()
+    if remaining_container_ids:
+        raise RuntimeError(
+            f"container still exists after forced removal: {remaining_container_ids}"
+            + (f"; cleanup reported: {cleanup_detail}" if cleanup_detail else "")
+        )
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[str],
+    *,
+    grace_seconds: float = 30.0,
+) -> None:
+    if os.name == "posix":
+        process_group_id = process.pid
+        if process_group_id == os.getpgrp():
+            raise RuntimeError("Refusing to signal AeroLab's own process group.")
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            process.poll()
+            return
+        if _wait_for_process_group_exit(process, process_group_id, grace_seconds):
+            return
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            process.poll()
+            return
+        if not _wait_for_process_group_exit(process, process_group_id, 5.0):
+            raise RuntimeError(
+                f"process group {process_group_id} still exists after SIGKILL"
+            )
+        return
+
+    if os.name == "nt":
+        try:
+            terminated = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=max(5.0, grace_seconds),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Windows process-tree termination failed: {exc}") from exc
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.wait(timeout=5)
+            raise RuntimeError("Windows process tree did not exit after taskkill.") from exc
+        if terminated.returncode != 0:
+            detail = (terminated.stderr or terminated.stdout).strip()
+            raise RuntimeError(
+                "Windows taskkill could not confirm recursive termination"
+                + (f": {detail}" if detail else "")
+            )
+        return
+
+    process.terminate()
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _wait_for_process_group_exit(
+    process: subprocess.Popen[str],
+    process_group_id: int,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        process.poll()
+        if not _process_group_exists(process_group_id):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _clear_previous_solver_outputs(case_path: Path, preserve_mesh: bool = False) -> None:
