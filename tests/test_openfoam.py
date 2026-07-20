@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from aerolab.case import create_case
+from aerolab.cli import main as cli_main
 from aerolab.openfoam import ensure_case_postprocessing
 from aerolab.solver import case_report
 from aerolab.stl import inspect_stl, read_stl_triangles, write_binary_stl_triangles
@@ -49,6 +50,9 @@ class OpenFoamCaseTests(unittest.TestCase):
             self.assertIn("U UMean;", streamlines)
             self.assertIn("pMean", streamlines)
             self.assertIn("fields (pMean wallShearStressMean);", body_pressure)
+            self.assertNotIn(" TMean", body_pressure)
+            self.assertNotIn("thermal", metadata["physical_model"])
+            self.assertFalse((case_path / "constant" / "fvModels").exists())
 
     def test_incompressible_case_rejects_mach_point_three_and_records_flow_state(self) -> None:
         project = Path(__file__).resolve().parents[1]
@@ -361,6 +365,148 @@ U 3 2 float
             self.assertEqual(browser_report["meshResolution"]["smallest_aero_feature_m"], 0.005)
             self.assertTrue(browser_report["surfacePressureSetup"]["configured"])
             self.assertTrue(browser_report["surfacePressureSetup"]["wallShearConfigured"])
+
+    def test_generates_total_power_heat_sources_and_temperature_export(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        model_path = project / "models" / "sample_box.stl"
+        heat_zones = [
+            {
+                "name": "engineHeat",
+                "shape": "box",
+                "component": "engine",
+                "minimum_m": [0.2, 0.2, 0.2],
+                "maximum_m": [0.6, 0.6, 0.6],
+                "power_kw": 75,
+            },
+            {
+                "name": "exhaustHeat",
+                "shape": "box",
+                "component": "exhaust",
+                "minimum_m": [0.65, 0.2, 0.2],
+                "maximum_m": [0.85, 0.4, 0.4],
+                "power_w": 12_500,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cases_dir = Path(temp_dir)
+            case_path = create_case(
+                model_path=model_path,
+                case_name="thermal-zones",
+                speed_mph=70,
+                flow_axis="x",
+                cases_dir=cases_dir,
+                quality="draft",
+                simulation_mode="transient",
+                fluid_profile="compressible_thermal",
+                heat_zones=heat_zones,
+            )
+
+            metadata = json.loads((case_path / "case.json").read_text(encoding="utf-8"))
+            normalized = metadata["physical_model"]["volume_zones"]["heat_zones"]
+            fv_models = (case_path / "constant" / "fvModels").read_text(encoding="utf-8")
+            snappy = (case_path / "system" / "snappyHexMeshDict").read_text(encoding="utf-8")
+            body_pressure = (case_path / "system" / "bodyPressure").read_text(encoding="utf-8")
+            control = (case_path / "system" / "controlDict").read_text(encoding="utf-8")
+            allrun = (case_path / "Allrun").read_text(encoding="utf-8")
+
+            self.assertEqual(metadata["solver_module"], "fluid")
+            self.assertEqual([zone["shape"] for zone in normalized], ["box", "box"])
+            self.assertEqual([zone["power_w"] for zone in normalized], [75_000.0, 12_500.0])
+            self.assertEqual(metadata["physical_model"]["thermal"]["total_power_w"], 87_500.0)
+            self.assertEqual(metadata["physical_model"]["thermal"]["model"], "direct_air_volumetric_heat_source")
+            self.assertIn("engineHeat\n{\n    type heatSource;", fv_models)
+            self.assertIn("cellZone engineHeat;\n    Q 75000;", fv_models)
+            self.assertIn("cellZone exhaustHeat;\n    Q 12500;", fv_models)
+            self.assertNotIn("q 75000;", fv_models)
+            self.assertIn("faceZone engineHeatFaces;", snappy)
+            self.assertIn("cellZone engineHeat;", snappy)
+            self.assertIn("fields (pMean wallShearStressMean TMean);", body_pressure)
+            self.assertIn("fields (U p T k wallShearStress);", control)
+            self.assertIn("solver fluid;", control)
+            self.assertIn("foamPostProcess -solver fluid -func wallShearStress", allrun)
+            self.assertTrue((case_path / "0" / "T").is_file())
+
+            with self.assertRaisesRegex(ValueError, "compressible_thermal"):
+                create_case(
+                    model_path=model_path,
+                    case_name="incompressible-heat",
+                    speed_mph=70,
+                    flow_axis="x",
+                    cases_dir=cases_dir,
+                    generate_openfoam=False,
+                    heat_zones=heat_zones[:1],
+                )
+            with self.assertRaisesRegex(ValueError, "unsupported shape"):
+                create_case(
+                    model_path=model_path,
+                    case_name="unsupported-heat-shape",
+                    speed_mph=70,
+                    flow_axis="x",
+                    cases_dir=cases_dir,
+                    generate_openfoam=False,
+                    fluid_profile="compressible_thermal",
+                    heat_zones=[{**heat_zones[0], "shape": "cylinder"}],
+                )
+            with self.assertRaisesRegex(ValueError, "exactly one of power_w or power_kw"):
+                create_case(
+                    model_path=model_path,
+                    case_name="ambiguous-heat-power",
+                    speed_mph=70,
+                    flow_axis="x",
+                    cases_dir=cases_dir,
+                    generate_openfoam=False,
+                    fluid_profile="compressible_thermal",
+                    heat_zones=[{**heat_zones[0], "power_w": 75_000}],
+                )
+
+    def test_cli_reads_heat_zone_configuration(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cases_dir = root / "cases"
+            heat_config = root / "heat-zones.json"
+            heat_config.write_text(
+                json.dumps(
+                    [
+                        {
+                            "name": "brakeHeat",
+                            "component": "front brakes",
+                            "minimum_m": [0.1, 0.1, 0.1],
+                            "maximum_m": [0.3, 0.3, 0.3],
+                            "power_w": 2_500,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = cli_main(
+                [
+                    "init-case",
+                    str(project / "models" / "sample_box.stl"),
+                    "--name",
+                    "cli-thermal-case",
+                    "--cases-dir",
+                    str(cases_dir),
+                    "--quality",
+                    "draft",
+                    "--fluid-profile",
+                    "compressible_thermal",
+                    "--heat-zones-config",
+                    str(heat_config),
+                ]
+            )
+
+            case_path = cases_dir / "cli-thermal-case"
+            metadata = json.loads((case_path / "case.json").read_text(encoding="utf-8"))
+            fv_models = (case_path / "constant" / "fvModels").read_text(encoding="utf-8")
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                metadata["physical_model"]["volume_zones"]["heat_zones"][0]["power_w"],
+                2_500.0,
+            )
+            self.assertIn("cellZone brakeHeat;", fv_models)
+            self.assertIn("Q 2500;", fv_models)
 
     def test_legacy_case_postprocessing_upgrade_is_idempotent(self) -> None:
         project = Path(__file__).resolve().parents[1]

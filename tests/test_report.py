@@ -29,6 +29,29 @@ def _sample_report() -> dict[str, object]:
             "area_source": "manual",
             "length_source": "manual",
         },
+        "physicalModel": {
+            "fluid": {
+                "profile": "compressible_thermal",
+                "temperature_c": 15.0,
+                "pressure_pa": 101325.0,
+                "density_kg_m3": 1.225,
+                "kinematic_viscosity_m2_s": 1.5e-5,
+            },
+            "volume_zones": {
+                "porous_zones": [],
+                "fan_zones": [],
+                "heat_zones": [
+                    {"name": "engineHeat", "component": "engine", "power_w": 75_000.0}
+                ],
+            },
+        },
+        "temperatureResults": {
+            "field": "TMean",
+            "minimumC": 15.0,
+            "meanC": 26.25,
+            "maximumC": 40.0,
+            "maximumRiseK": 25.0,
+        },
         "forceCoeffs": {"meanCd": 0.394, "meanCl": -0.12, "file": "/x/forceCoeffs.dat"},
         "aerodynamicForces": {
             "dragN": 938.7,
@@ -73,6 +96,14 @@ class RenderMarkdownTests(unittest.TestCase):
         self.assertIn("211 lbf", md)  # drag in pounds-force
         self.assertIn("Downforce", md)  # vertical force labelled by type
 
+    def test_contains_thermal_loads_and_solved_air_temperature(self):
+        md = render_markdown(_sample_report())
+        self.assertIn("Internal-air temperature (min / mean / max)", md)
+        self.assertIn("15 / 26.25 / 40 °C", md)
+        self.assertIn("Maximum air-temperature rise", md)
+        self.assertIn("25 K", md)
+        self.assertIn("direct-to-air heat loads: engineHeat (75000 W, engine)", md)
+
     def test_surfaces_grid_convergence_when_validated(self):
         md = render_markdown(_sample_report())
         self.assertIn("Grid-converged Cd", md)
@@ -102,6 +133,12 @@ class RenderHtmlTests(unittest.TestCase):
         self.assertIn("<title>", html_out)
         self.assertIn("demo-70mph", html_out)
         self.assertIn("938.7", html_out)
+
+    def test_contains_solved_thermal_results(self):
+        html_out = render_html(_sample_report())
+        self.assertIn("Internal-air temperature", html_out)
+        self.assertIn("26.25", html_out)
+        self.assertIn("engineHeat", html_out)
 
     def test_escapes_untrusted_case_name(self):
         report = _sample_report()

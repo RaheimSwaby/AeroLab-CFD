@@ -29,6 +29,7 @@ from .parsing import (  # noqa: F401
     parse_force_coeffs,
     parse_layer_coverage,
     parse_residuals,
+    parse_temperature_results,
     parse_transient_state,
     parse_y_plus,
 )

@@ -25,6 +25,7 @@ from aerolab.solver import (
     parse_residuals,
     parse_streamlines,
     parse_surface_pressure,
+    parse_temperature_results,
     parse_transient_state,
     parse_y_plus,
 )
@@ -665,6 +666,63 @@ p 1 4 float
             self.assertEqual(parsed["speedRange"], [8.0, 12.0])
             self.assertEqual(parsed["pressureRange"], [1.0, 4.0])
 
+    def test_temperature_results_parse_latest_internal_tmean_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            case_path = Path(temp_dir)
+            case_path.joinpath("case.json").write_text(
+                json.dumps(
+                    {
+                        "name": "thermal-results",
+                        "solver_module": "fluid",
+                        "flow": {"air_temperature_k": 288.15},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            initial = case_path / "0"
+            initial.mkdir()
+            initial.joinpath("T").write_text(
+                "FoamFile { format ascii; }\ninternalField uniform 288.15;\n",
+                encoding="utf-8",
+            )
+            final = case_path / "100"
+            final.mkdir()
+            final.joinpath("T").write_text(
+                "FoamFile { format ascii; }\ninternalField uniform 999;\n",
+                encoding="utf-8",
+            )
+            final.joinpath("TMean").write_text(
+                """FoamFile
+{
+    format ascii;
+}
+internalField nonuniform List<scalar>
+4
+(
+288.15
+293.15
+303.15
+313.15
+)
+;
+boundaryField {}
+""",
+                encoding="utf-8",
+            )
+
+            parsed = parse_temperature_results(case_path)
+            report = case_report(case_path)
+
+            self.assertIsNotNone(parsed)
+            self.assertEqual(parsed["field"], "TMean")
+            self.assertTrue(parsed["timeAveraged"])
+            self.assertEqual(parsed["sampleCount"], 4)
+            self.assertAlmostEqual(parsed["minimumC"], 15.0)
+            self.assertAlmostEqual(parsed["meanC"], 26.25)
+            self.assertAlmostEqual(parsed["maximumC"], 40.0)
+            self.assertAlmostEqual(parsed["maximumRiseK"], 25.0)
+            self.assertEqual(report["temperatureResults"]["field"], "TMean")
+
     def test_body_pressure_vtk_is_converted_to_cp_for_browser(self) -> None:
         project = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -699,9 +757,11 @@ POLYGONS 2 8
 3 0 1 2
 3 0 2 3
 POINT_DATA 4
-FIELD attributes 1
+FIELD attributes 2
 p 1 4 float
 50 0 -50 25
+T 1 4 float
+288.15 293.15 303.15 313.15
 """,
                 encoding="utf-8",
             )
@@ -723,6 +783,11 @@ p 1 4 float
             self.assertEqual(parsed["pressurePaRange"], [-61.25, 61.25])
             self.assertTrue(parsed["hasPressureDrag"])
             self.assertEqual([point[4] for point in parsed["points"]], [0.0, 0.0, 0.0, 0.0])
+            self.assertTrue(parsed["hasTemperature"])
+            self.assertEqual(parsed["temperatureKRange"], [288.15, 313.15])
+            self.assertEqual(parsed["temperatureCRange"], [15.0, 40.0])
+            self.assertEqual(parsed["temperatureKValues"], [288.15, 293.15, 303.15, 313.15])
+            self.assertIn("not a solid-component", parsed["temperatureDefinition"])
 
             report = case_report(case_path, include_visualization=True)
             self.assertEqual(report["surfacePressure"]["triangleCount"], 2)

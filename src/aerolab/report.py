@@ -61,6 +61,7 @@ def _summary_pairs(report: dict[str, object]) -> list[tuple[str, str]]:
     forces = report.get("aerodynamicForces")
     force_coeffs = report.get("forceCoeffs")
     convergence = report.get("gridConvergence")
+    temperature = report.get("temperatureResults")
     balance = _get(forces, "aeroBalance")
     vertical_type = _get(forces, "verticalForceType") or "downforce/lift"
     pairs: list[tuple[str, str]] = [
@@ -87,6 +88,19 @@ def _summary_pairs(report: dict[str, object]) -> list[tuple[str, str]]:
         ("Pitch moment", f"{_num(_get(forces, 'pitchMomentNm'), 4)} N·m"),
         ("Yaw moment", f"{_num(_get(forces, 'yawMomentNm'), 4)} N·m"),
     ]
+    if isinstance(temperature, dict) and temperature.get("meanC") is not None:
+        pairs[1:1] = [
+            (
+                "Internal-air temperature (min / mean / max)",
+                f"{_num(temperature.get('minimumC'), 5)} / "
+                f"{_num(temperature.get('meanC'), 5)} / "
+                f"{_num(temperature.get('maximumC'), 5)} °C",
+            ),
+            (
+                "Maximum air-temperature rise",
+                f"{_num(temperature.get('maximumRiseK'), 5)} K",
+            ),
+        ]
     if isinstance(balance, dict) and balance.get("qualified"):
         pairs.extend(
             (
@@ -149,6 +163,7 @@ def _setup_pairs(report: dict[str, object]) -> list[tuple[str, str]]:
     if isinstance(volume_zones, dict):
         porous = volume_zones.get("porous_zones")
         fans = volume_zones.get("fan_zones")
+        heat = volume_zones.get("heat_zones")
         porous_names = (
             [str(zone.get("name")) for zone in porous if isinstance(zone, dict)]
             if isinstance(porous, list)
@@ -159,11 +174,22 @@ def _setup_pairs(report: dict[str, object]) -> list[tuple[str, str]]:
             if isinstance(fans, list)
             else []
         )
+        heat_descriptions = (
+            [
+                f"{zone.get('name')} ({_num(zone.get('power_w'), 6)} W, {zone.get('component')})"
+                for zone in heat
+                if isinstance(zone, dict)
+            ]
+            if isinstance(heat, list)
+            else []
+        )
         parts = []
         if porous_names:
             parts.append(f"porous: {', '.join(porous_names)}")
         if fan_names:
             parts.append(f"fans: {', '.join(fan_names)}")
+        if heat_descriptions:
+            parts.append(f"direct-to-air heat loads: {', '.join(heat_descriptions)}")
         zone_text = "; ".join(parts) if parts else "none"
     datums = report.get("vehicleDatums")
     datum_text = DASH

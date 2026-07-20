@@ -293,6 +293,30 @@ def parse_surface_pressure(
         pressure = [sums[index] / counts[index] if counts[index] else 0.0 for index in range(point_count)]
         pressure_location = "cell-averaged-to-point"
 
+    point_temperature_mean = _vtk_field(lines, "TMean", 1, point_count)
+    cell_temperature_mean = _vtk_field(lines, "TMean", 1, polygon_count)
+    point_temperature = point_temperature_mean or _vtk_field(lines, "T", 1, point_count)
+    cell_temperature = cell_temperature_mean or _vtk_field(lines, "T", 1, polygon_count)
+    temperature_time_averaged = point_temperature_mean is not None or cell_temperature_mean is not None
+    temperature_k: list[float] | None = None
+    temperature_location: str | None = None
+    if point_temperature is not None:
+        temperature_k = [float(value) for value in point_temperature]
+        temperature_location = "point"
+    elif cell_temperature is not None:
+        sums = [0.0] * point_count
+        counts = [0] * point_count
+        for polygon_index, indices in enumerate(polygons):
+            value = float(cell_temperature[polygon_source_indices[polygon_index]])
+            for index in indices:
+                sums[index] += value
+                counts[index] += 1
+        temperature_k = [
+            sums[index] / counts[index] if counts[index] else 0.0
+            for index in range(point_count)
+        ]
+        temperature_location = "cell-averaged-to-point"
+
     point_shear = _vtk_field(lines, "wallShearStressMean", 3, point_count) or _vtk_field(
         lines, "wallShearStress", 3, point_count
     )
@@ -382,8 +406,14 @@ def parse_surface_pressure(
     decimated = False
     if len(triangles) > max_triangles:
         value_fields = [cp_values]
+        skin_drag_index: int | None = None
+        temperature_index: int | None = None
         if skin_drag_values is not None:
+            skin_drag_index = len(value_fields)
             value_fields.append(skin_drag_values)
+        if temperature_k is not None:
+            temperature_index = len(value_fields)
+            value_fields.append(temperature_k)
         points, value_fields, triangles = _cluster_pressure_surface(
             points,
             value_fields,
@@ -391,7 +421,10 @@ def parse_surface_pressure(
             max_triangles,
         )
         cp_values = value_fields[0]
-        skin_drag_values = value_fields[1] if skin_drag_values is not None else None
+        if skin_drag_index is not None:
+            skin_drag_values = value_fields[skin_drag_index]
+        if temperature_index is not None:
+            temperature_k = value_fields[temperature_index]
         decimated = True
     if not triangles:
         return {"file": str(path), "error": "Body-pressure visualization decimation removed every triangle."}
@@ -445,6 +478,31 @@ def parse_surface_pressure(
         if absolute_pressure
         else [value * density_kg_m3 for value in coefficient_pressure]
     )
+    temperature_payload: dict[str, object] = {}
+    if temperature_k:
+        temperature_min = min(temperature_k)
+        temperature_max = max(temperature_k)
+        display_min = _percentile(temperature_k, 0.02)
+        display_max = _percentile(temperature_k, 0.98)
+        if display_max - display_min < 1e-9:
+            display_min -= 0.5
+            display_max += 0.5
+        temperature_payload = {
+            "hasTemperature": True,
+            "temperatureLocation": temperature_location,
+            "temperatureTimeAveraged": temperature_time_averaged,
+            "temperatureKRange": [round(temperature_min, 6), round(temperature_max, 6)],
+            "temperatureCRange": [
+                round(temperature_min - 273.15, 6),
+                round(temperature_max - 273.15, 6),
+            ],
+            "temperatureDisplayRangeK": [round(display_min, 6), round(display_max, 6)],
+            "temperatureKValues": [round(value, 6) for value in temperature_k],
+            "temperatureDefinition": (
+                "Adjacent-air temperature sampled on solved body and wheel patches; "
+                "not a solid-component temperature."
+            ),
+        }
     return {
         "file": str(path),
         "hasPressure": True,
@@ -474,6 +532,7 @@ def parse_surface_pressure(
             round(total_drag_coefficient, 6) if total_drag_coefficient is not None else None
         ),
         "wallShearDefinition": "Flow-direction wallShearStress divided by dynamic pressure; positive adds viscous drag.",
+        **temperature_payload,
         **drag_summary,
         "points": [
             [

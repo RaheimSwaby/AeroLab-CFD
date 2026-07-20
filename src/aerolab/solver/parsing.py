@@ -539,7 +539,113 @@ def _latest_transient_mean_fields(case_path: Path) -> set[str]:
     if not time_directories:
         return set()
     latest = max(time_directories, key=lambda item: item[0])[1]
-    return {name for name in ("UMean", "pMean", "kMean", "wallShearStressMean") if (latest / name).is_file()}
+    return {
+        name
+        for name in ("UMean", "pMean", "TMean", "kMean", "wallShearStressMean")
+        if (latest / name).is_file()
+    }
+
+
+def parse_temperature_results(case_path: Path) -> dict[str, object] | None:
+    """Summarize the latest solved internal-air T or TMean field."""
+    candidates: list[tuple[float, int, Path]] = []
+    for field_name in ("T", "TMean"):
+        for field_path in case_path.glob(f"*/{field_name}"):
+            try:
+                time_value = float(field_path.parent.name)
+            except ValueError:
+                continue
+            if time_value > 0 and field_path.is_file():
+                candidates.append((time_value, 1 if field_name == "TMean" else 0, field_path))
+    if not candidates:
+        return None
+
+    time_value, _, field_path = max(candidates, key=lambda item: (item[0], item[1]))
+    if field_path.stat().st_size > 256 * 1024 * 1024:
+        return {
+            "file": str(field_path),
+            "field": field_path.name,
+            "time": time_value,
+            "error": "Temperature field exceeds the 256 MB parser limit.",
+        }
+    text = field_path.read_text(encoding="utf-8", errors="ignore")
+    if re.search(r"\bformat\s+binary\s*;", text):
+        return {
+            "file": str(field_path),
+            "field": field_path.name,
+            "time": time_value,
+            "error": "Only ASCII OpenFOAM temperature fields are supported.",
+        }
+    values = _openfoam_internal_scalar_values(text)
+    if not values:
+        return {
+            "file": str(field_path),
+            "field": field_path.name,
+            "time": time_value,
+            "error": "The internal temperature field is missing or incomplete.",
+        }
+
+    minimum_k = min(values)
+    maximum_k = max(values)
+    mean_k = statistics.fmean(values)
+    p05_k = _percentile(values, 0.05)
+    p95_k = _percentile(values, 0.95)
+    result: dict[str, object] = {
+        "file": str(field_path),
+        "field": field_path.name,
+        "time": time_value,
+        "timeAveraged": field_path.name == "TMean",
+        "scope": "internal cells",
+        "meanMethod": "unweighted cell-value mean",
+        "sampleCount": len(values),
+        "uniform": len(values) == 1,
+        "minimumK": minimum_k,
+        "meanK": mean_k,
+        "maximumK": maximum_k,
+        "p05K": p05_k,
+        "p95K": p95_k,
+        "minimumC": minimum_k - 273.15,
+        "meanC": mean_k - 273.15,
+        "maximumC": maximum_k - 273.15,
+        "p05C": p05_k - 273.15,
+        "p95C": p95_k - 273.15,
+    }
+    case_payload = _read_json_object(case_path / "case.json")
+    flow = case_payload.get("flow") if isinstance(case_payload.get("flow"), dict) else {}
+    inlet_k = _finite_number(flow.get("air_temperature_k"))
+    if inlet_k is not None:
+        result.update(
+            {
+                "freestreamK": inlet_k,
+                "freestreamC": inlet_k - 273.15,
+                "meanRiseK": mean_k - inlet_k,
+                "maximumRiseK": maximum_k - inlet_k,
+            }
+        )
+    return result
+
+
+def _openfoam_internal_scalar_values(text: str) -> list[float] | None:
+    number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    uniform_match = re.search(rf"\binternalField\s+uniform\s+({number})\s*;", text)
+    if uniform_match:
+        value = float(uniform_match.group(1))
+        return [value] if math.isfinite(value) else None
+    values_match = re.search(
+        r"\binternalField\s+nonuniform\s+List<scalar>\s+(\d+)\s*\((.*?)\)\s*;",
+        text,
+        re.DOTALL,
+    )
+    if not values_match:
+        return None
+    expected_count = int(values_match.group(1))
+    try:
+        values = [float(value) for value in values_match.group(2).split()]
+    except ValueError:
+        return None
+    if len(values) != expected_count or not all(math.isfinite(value) for value in values):
+        return None
+    return values
 
 
 def parse_y_plus(case_path: Path, wall_resolution: object = None) -> dict[str, object] | None:

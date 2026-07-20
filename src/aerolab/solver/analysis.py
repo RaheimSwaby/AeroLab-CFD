@@ -22,6 +22,7 @@ from .parsing import (
     parse_force_coeffs,
     parse_layer_coverage,
     parse_residuals,
+    parse_temperature_results,
     parse_transient_state,
     parse_y_plus,
 )
@@ -312,6 +313,7 @@ def case_report(
     layer_coverage = parse_layer_coverage(case_path, case_payload.get("wall_resolution"))
     residuals = parse_residuals(case_path, case_payload.get("cfd_quality"))
     transient_state = parse_transient_state(case_path, case_payload.get("cfd_quality"))
+    temperature_results = parse_temperature_results(case_path)
     y_plus = parse_y_plus(case_path, case_payload.get("wall_resolution"))
     geometry_fidelity = case_payload.get("geometry_fidelity")
     source_model = case_payload.get("model")
@@ -406,6 +408,7 @@ def case_report(
         "layerCoverage": layer_coverage,
         "residuals": residuals,
         "transientState": transient_state,
+        "temperatureResults": temperature_results,
         "yPlus": y_plus,
         "numericallyQualified": bool(assessment.get("numericallyQualified")),
         "qualificationStatus": assessment.get("qualificationStatus"),
@@ -637,10 +640,17 @@ def _surface_pressure_setup(case_path: Path) -> dict[str, object]:
         )
         allrun_hook = "foamPostProcess -func bodyPressure" in allrun_text
         wall_shear_hook = (
-            "foamPostProcess -solver incompressibleFluid -func wallShearStress" in allrun_text
+            "foamPostProcess -solver " in allrun_text
+            and " -func wallShearStress" in allrun_text
         )
     post_dir = case_path / "postProcessing" / "bodyPressure"
     output_available = post_dir.is_dir() and any(post_dir.rglob("*.vtk"))
+    config_text = (
+        config_path.read_text(encoding="utf-8", errors="ignore")
+        if config_path.is_file()
+        else ""
+    )
+    temperature_configured = bool(re.search(r"\bT(?:Mean)?\b", config_text))
     return {
         "configured": config_path.is_file() and allrun_hook and wall_shear_path.is_file() and wall_shear_hook,
         "configFile": str(config_path),
@@ -648,6 +658,7 @@ def _surface_pressure_setup(case_path: Path) -> dict[str, object]:
         "allrunHook": allrun_hook,
         "wallShearConfigFile": str(wall_shear_path),
         "wallShearConfigured": wall_shear_path.is_file() and wall_shear_hook,
+        "temperatureConfigured": temperature_configured,
         "outputAvailable": output_available,
     }
 

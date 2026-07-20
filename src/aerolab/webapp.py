@@ -442,6 +442,10 @@ class AeroLabHandler(BaseHTTPRequestHandler):
                 payload.get("fanZones"),
                 "Fan zones",
             ),
+            "heat_zones": self._volume_zone_options(
+                payload.get("heatZones"),
+                "Heat-load zones",
+            ),
             "flow_axis": str(payload.get("flowAxis") or "x"),
             "include_ground": bool(payload.get("includeGround")),
             "moving_ground": bool(payload.get("movingGround")),

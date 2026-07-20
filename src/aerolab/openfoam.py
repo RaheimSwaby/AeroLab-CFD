@@ -359,9 +359,17 @@ def generate_openfoam_case(
         if isinstance(fan_value, list)
         else []
     )
-    volume_zones = [*porous_zones, *fan_zones]
+    heat_value = volume_zone_settings.get("heat_zones")
+    heat_zones = (
+        [zone for zone in heat_value if isinstance(zone, dict)]
+        if isinstance(heat_value, list)
+        else []
+    )
+    volume_zones = [*porous_zones, *fan_zones, *heat_zones]
     fluid_profile = str(fluid_settings.get("profile") or "incompressible")
     solver_module = "fluid" if fluid_profile == "compressible_thermal" else "incompressibleFluid"
+    if heat_zones and solver_module != "fluid":
+        raise ValueError("Heat-load zones require the compressible_thermal fluid profile.")
     turbulence_model = str(turbulence_settings.get("model") or "kOmegaSST")
 
     dirs = [
@@ -492,6 +500,7 @@ def generate_openfoam_case(
         ),
         "porous_zones": porous_zones,
         "fan_zones": fan_zones,
+        "heat_zones": heat_zones,
         "volume_zones": volume_zones,
         "nu_tilda": 3.0 * kinematic_viscosity_m2_s,
     }
@@ -521,7 +530,11 @@ def generate_openfoam_case(
             "nuTilda" if turbulence_model != "kOmegaSST" else "k",
         ),
         "system/wallShearStress": _wall_shear_stress_dict(patch_names),
-        "system/bodyPressure": _body_pressure_dict(simulation_mode, patch_names),
+        "system/bodyPressure": _body_pressure_dict(
+            simulation_mode,
+            patch_names,
+            include_temperature=solver_module == "fluid",
+        ),
         "system/yPlus": _y_plus_dict(),
         "system/surfaceFeaturesDict": _surface_features_dict(wheels),
         "system/controlDict": _control_dict(values),
@@ -583,7 +596,7 @@ def generate_openfoam_case(
         files["0/T"] = _field_temperature(include_ground, values)
         files["0/alphat"] = _field_alphat(include_ground, values)
     if volume_zones:
-        files["constant/fvModels"] = _fv_models(porous_zones, fan_zones)
+        files["constant/fvModels"] = _fv_models(porous_zones, fan_zones, heat_zones)
 
     written: list[Path] = [body_stl, *wheel_stls]
     for relative_path, content in files.items():
@@ -603,6 +616,23 @@ def ensure_case_postprocessing(case_path: Path) -> dict[str, bool]:
     if not allrun_path.is_file():
         raise FileNotFoundError(allrun_path)
 
+    solver_module = "incompressibleFluid"
+    simulation_mode = "steady"
+    case_json_path = case_path / "case.json"
+    if case_json_path.is_file():
+        try:
+            case_payload = json.loads(case_json_path.read_text(encoding="utf-8"))
+            solver_module = str(case_payload.get("solver_module") or solver_module)
+            quality = case_payload.get("cfd_quality")
+            if isinstance(quality, dict):
+                simulation_mode = str(quality.get("simulation_mode") or simulation_mode)
+            elif str(case_payload.get("simulation_type") or "").startswith("transient"):
+                simulation_mode = "transient"
+        except (OSError, ValueError, TypeError):
+            pass
+    include_temperature = solver_module == "fluid"
+    temperature_field = "TMean" if simulation_mode == "transient" else "T"
+
     body_pressure_path = case_path / "system" / "bodyPressure"
     body_pressure_created = not body_pressure_path.exists()
     body_pressure_updated = body_pressure_created
@@ -611,11 +641,17 @@ def ensure_case_postprocessing(case_path: Path) -> dict[str, bool]:
         body_pressure_updated = (
             "wallShearStress" not in body_pressure_text
             or "interpolate no;" not in body_pressure_text
+            or (include_temperature and f" {temperature_field})" not in body_pressure_text)
         )
     if body_pressure_updated:
         body_pressure_path.parent.mkdir(parents=True, exist_ok=True)
         with body_pressure_path.open("w", encoding="utf-8", newline="\n") as stream:
-            stream.write(_body_pressure_dict())
+            stream.write(
+                _body_pressure_dict(
+                    simulation_mode,
+                    include_temperature=include_temperature,
+                )
+            )
 
     wall_shear_path = case_path / "system" / "wallShearStress"
     wall_shear_created = not wall_shear_path.exists()
@@ -624,14 +660,6 @@ def ensure_case_postprocessing(case_path: Path) -> dict[str, bool]:
             stream.write(_wall_shear_stress_dict())
 
     allrun = allrun_path.read_text(encoding="utf-8").replace("\r\n", "\n")
-    solver_module = "incompressibleFluid"
-    case_json_path = case_path / "case.json"
-    if case_json_path.is_file():
-        try:
-            case_payload = json.loads(case_json_path.read_text(encoding="utf-8"))
-            solver_module = str(case_payload.get("solver_module") or solver_module)
-        except (OSError, ValueError, TypeError):
-            pass
     body_command = "foamPostProcess -func bodyPressure -latestTime\n"
     wall_command = (
         f"foamPostProcess -solver {solver_module} -func wallShearStress -latestTime\n"
@@ -1349,17 +1377,19 @@ log yes;
 def _body_pressure_dict(
     simulation_mode: str = "steady",
     patch_names: list[str] | None = None,
+    include_temperature: bool = False,
 ) -> str:
-    fields = (
-        "pMean wallShearStressMean"
-        if simulation_mode == "transient"
-        else "p wallShearStress"
-    )
+    fields = [
+        "pMean" if simulation_mode == "transient" else "p",
+        "wallShearStressMean" if simulation_mode == "transient" else "wallShearStress",
+    ]
+    if include_temperature:
+        fields.append("TMean" if simulation_mode == "transient" else "T")
     patches = " ".join(patch_names or ["body"])
     return f"""type surfaces;
 libs ("libsampling.so");
 writeControl writeTime;
-fields ({fields});
+fields ({" ".join(fields)});
 surfaceFormat vtk;
 interpolationScheme cellPoint;
 writeFormat ascii;
@@ -3193,6 +3223,7 @@ boundaryField
 def _fv_models(
     porous_zones: list[dict[str, object]],
     fan_zones: list[dict[str, object]],
+    heat_zones: list[dict[str, object]],
 ) -> str:
     entries: list[str] = []
     for zone in porous_zones:
@@ -3232,6 +3263,15 @@ def _fv_models(
     Ct {float(zone["thrust_coefficient"]):.9g};
     diskArea {float(zone["disk_area_m2"]):.9g};
     upstreamPoint {_foam_vec(_vector_value(zone["upstream_point_m"]))};
+}}"""
+        )
+    for zone in heat_zones:
+        entries.append(
+            f"""{zone["name"]}
+{{
+    type heatSource;
+    cellZone {zone["cell_zone"]};
+    Q {float(zone["power_w"]):.9g};
 }}"""
         )
     body = "\n\n".join(entries)

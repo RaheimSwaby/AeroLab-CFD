@@ -59,6 +59,19 @@ def _report_text(report: dict[str, object]) -> str:
     else:
         lines.append("No force or moment coefficient output found.")
 
+    temperature = report.get("temperatureResults")
+    if isinstance(temperature, dict) and temperature.get("meanC") is not None:
+        lines.extend(
+            (
+                "Internal-air temperature:",
+                f"- minimum / mean / maximum: {_text_number(temperature.get('minimumC'))} / "
+                f"{_text_number(temperature.get('meanC'))} / "
+                f"{_text_number(temperature.get('maximumC'))} C",
+                f"- maximum rise above inlet: {_text_number(temperature.get('maximumRiseK'))} K",
+                f"- field: {temperature.get('field')} at time {temperature.get('time')}",
+            )
+        )
+
     statistics = report.get("transientStatistics")
     if isinstance(statistics, dict):
         overall = statistics.get("overall_evidence")
@@ -384,6 +397,14 @@ def main(argv: list[str] | None = None) -> int:
         "--fan-zones-config",
         type=Path,
         help="JSON list of explicit solver-coordinate actuation-disk box zones.",
+    )
+    case_parser.add_argument(
+        "--heat-zones-config",
+        type=Path,
+        help=(
+            "JSON list of solver-coordinate box heat loads; each entry uses "
+            "component and exactly one of power_w or power_kw."
+        ),
     )
     case_parser.add_argument(
         "--tunnel-width-m",
@@ -776,6 +797,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.fan_zones_config,
                 "fan_zones",
                 "Fan-zone",
+            ),
+            heat_zones=_volume_zones_from_file(
+                args.heat_zones_config,
+                "heat_zones",
+                "Heat-load-zone",
             ),
         )
         print(f"Created case: {case_path}")

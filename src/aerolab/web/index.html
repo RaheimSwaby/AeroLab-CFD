@@ -294,7 +294,7 @@
             <details class="advanced-disclosure engineering-only advanced-flow-fields">
               <summary>
                 <span>Components and regions</span>
-                <small>Rotating wheels, porous media, and fans</small>
+                <small>Rotating wheels, porous media, fans, and heat loads</small>
               </summary>
               <div class="disclosure-body">
                 <label>
@@ -310,7 +310,11 @@
                   <span>Fan box zones JSON</span>
                   <textarea id="fanZonesJson" rows="7" spellcheck="false" placeholder='[{"name":"coolingFan","minimum_m":[1.35,-0.3,0.2],"maximum_m":[1.45,0.3,0.8],"disk_direction":[1,0,0],"power_coefficient":0.3,"thrust_coefficient":0.6,"disk_area_m2":0.25,"upstream_point_m":[1.3,0,0.5]}]'></textarea>
                 </label>
-                <p class="field-help">Region boxes and fan sample points are explicit transformed solver coordinates in meters.</p>
+                <label>
+                  <span>Heat-load box zones JSON</span>
+                  <textarea id="heatZonesJson" rows="7" spellcheck="false" placeholder='[{"name":"engineHeat","shape":"box","component":"engine","minimum_m":[0.4,-0.3,0.2],"maximum_m":[0.9,0.3,0.8],"power_kw":75}]'></textarea>
+                </label>
+                <p class="field-help">Region boxes and fan sample points are explicit transformed solver coordinates in meters. Heat loads are total power delivered directly to the air and require Compressible + thermal.</p>
               </div>
             </details>
           </section>
@@ -473,6 +477,7 @@
                   <div class="viewer-segmented" role="group" aria-label="Surface coloring">
                     <button id="surfaceModeButton" class="active" type="button" aria-pressed="true">Surface</button>
                     <button id="pressureModeButton" type="button" aria-pressed="false" disabled>Cp</button>
+                    <button id="temperatureModeButton" type="button" aria-pressed="false" disabled>Air temp</button>
                     <button id="dragModeButton" type="button" aria-pressed="false" disabled>Drag areas</button>
                   </div>
                   <label class="viewer-toggle">

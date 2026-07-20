@@ -94,10 +94,16 @@ class AccuracyStudyApiTests(unittest.TestCase):
 
         self.assertIn('id="invertOrbit"', index)
         self.assertIn('id="dragModeButton"', index)
+        self.assertIn('id="temperatureModeButton"', index)
+        self.assertIn('id="heatZonesJson"', index)
         self.assertIn('id="groundClearanceMm"', index)
         self.assertIn("els.invertOrbit.checked ? -1 : 1", app)
         self.assertIn('"aerolab-invert-orbit"', app)
         self.assertIn('setSurfaceMode("drag")', app)
+        self.assertIn('setSurfaceMode("temperature")', app)
+        self.assertIn("heatZones: engineering", app)
+        self.assertIn("temperatureKValues", app)
+        self.assertIn("hasSurfaceTemperature", app)
         self.assertIn("pressureDragDisplayRange", app)
         self.assertIn("totalDragDisplayRange", app)
         self.assertIn("triangleTotalDragValues", app)
@@ -127,6 +133,65 @@ class AccuracyStudyApiTests(unittest.TestCase):
         self.assertIn("verticalForceLbf", app)
         self.assertIn("STL coordinates calculate", app)
         self.assertIn("Measured length m", index)
+
+    def test_creates_thermal_case_with_heat_zone_through_api(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            models = root / "models"
+            models.mkdir()
+            model_path = models / "sample_box.stl"
+            shutil.copyfile(project / "models" / "sample_box.stl", model_path)
+            server = AeroLabServer(("127.0.0.1", 0), root)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                request = Request(
+                    f"http://127.0.0.1:{server.server_port}/api/cases",
+                    data=json.dumps(
+                        {
+                            "modelPath": str(model_path),
+                            "name": "api-thermal-case",
+                            "speedMph": 70,
+                            "flowAxis": "x",
+                            "fluidProfile": "compressible_thermal",
+                            "heatZones": [
+                                {
+                                    "name": "radiatorReject",
+                                    "shape": "box",
+                                    "component": "radiator coolant",
+                                    "minimum_m": [0.2, 0.2, 0.2],
+                                    "maximum_m": [0.6, 0.6, 0.6],
+                                    "power_kw": 5,
+                                }
+                            ],
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=30) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            case_path = Path(result["casePath"])
+            heat_zones = result["case"]["physical_model"]["volume_zones"]["heat_zones"]
+            thermal = result["case"]["physical_model"]["thermal"]
+            fv_models = (case_path / "constant" / "fvModels").read_text(encoding="utf-8")
+            body_pressure = (case_path / "system" / "bodyPressure").read_text(encoding="utf-8")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(heat_zones[0]["power_w"], 5_000.0)
+            self.assertEqual(thermal["total_power_w"], 5_000.0)
+            self.assertEqual(thermal["model"], "direct_air_volumetric_heat_source")
+            self.assertIn("constant/fvModels", result["files"])
+            self.assertIn("type heatSource;", fv_models)
+            self.assertIn("cellZone radiatorReject;", fv_models)
+            self.assertIn("Q 5000;", fv_models)
+            self.assertIn("fields (p wallShearStress T);", body_pressure)
 
     def test_case_runs_start_in_background_and_reject_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

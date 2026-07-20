@@ -93,6 +93,7 @@ def create_case(
     turbulence_model: str = "kOmegaSST",
     porous_zones: list[dict[str, object]] | None = None,
     fan_zones: list[dict[str, object]] | None = None,
+    heat_zones: list[dict[str, object]] | None = None,
 ) -> Path:
     speed_mph = float(speed_mph)
     if not math.isfinite(speed_mph) or speed_mph <= 0:
@@ -231,6 +232,7 @@ def create_case(
         turbulence_model=turbulence_model,
         porous_zones=porous_zones,
         fan_zones=fan_zones,
+        heat_zones=heat_zones,
         model_path=model_path,
         model_scale=unit_scale,
         source_flow_direction=source_flow_direction,
@@ -516,6 +518,7 @@ def _physical_model_metadata(
     turbulence_model: str,
     porous_zones: list[dict[str, object]] | None,
     fan_zones: list[dict[str, object]] | None,
+    heat_zones: list[dict[str, object]] | None,
     model_path: Path,
     model_scale: float,
     source_flow_direction: str,
@@ -583,6 +586,7 @@ def _physical_model_metadata(
     volume_zones = _normalize_volume_zones(
         porous_zones=porous_zones,
         fan_zones=fan_zones,
+        heat_zones=heat_zones,
         reserved_names={
             "body",
             "bodyRefinement",
@@ -596,6 +600,16 @@ def _physical_model_metadata(
             *(str(name) for name in wheels["patch_names"]),
         },
     )
+    heat_zone_values = volume_zones.get("heat_zones")
+    normalized_heat_zones = (
+        [zone for zone in heat_zone_values if isinstance(zone, dict)]
+        if isinstance(heat_zone_values, list)
+        else []
+    )
+    if normalized_heat_zones and fluid_profile != "compressible_thermal":
+        raise ValueError(
+            "Heat-load zones require the compressible_thermal fluid profile so OpenFOAM solves the energy equation."
+        )
 
     fluid_metadata = {**air, "applied_to_solver": True}
     if fluid_profile == "compressible_thermal":
@@ -679,6 +693,16 @@ def _physical_model_metadata(
         }
     if volume_zones["enabled"]:
         result["volume_zones"] = volume_zones
+    if normalized_heat_zones:
+        result["thermal"] = {
+            "model": "direct_air_volumetric_heat_source",
+            "source_type": "heatSource",
+            "power_mode": "total",
+            "total_power_w": sum(float(zone["power_w"]) for zone in normalized_heat_zones),
+            "temperature_field": "T",
+            "component_temperatures_solved": False,
+            "applied_to_solver": True,
+        }
     return result
 
 
@@ -716,10 +740,12 @@ def _normalize_volume_zones(
     *,
     porous_zones: list[dict[str, object]] | None,
     fan_zones: list[dict[str, object]] | None,
+    heat_zones: list[dict[str, object]] | None,
     reserved_names: set[str],
 ) -> dict[str, object]:
     normalized_porous: list[dict[str, object]] = []
     normalized_fans: list[dict[str, object]] = []
+    normalized_heat: list[dict[str, object]] = []
     names = set(reserved_names)
 
     for index, value in enumerate(_zone_list(porous_zones, "Porous zones"), start=1):
@@ -794,11 +820,51 @@ def _normalize_volume_zones(
             }
         )
 
+    for index, value in enumerate(_zone_list(heat_zones, "Heat-load zones"), start=1):
+        name = _zone_name(value.get("name"), f"heatZone{index}", names, "Heat-load zone")
+        shape = str(value.get("shape") or "box").strip().lower().replace("-", "_")
+        if shape != "box":
+            raise ValueError(
+                f"Heat-load zone {name!r} uses unsupported shape {shape!r}; currently only 'box' is supported."
+            )
+        minimum, maximum = _zone_box(value, f"Heat-load zone {name!r}")
+        component_value = value.get("component")
+        if not isinstance(component_value, str) or not component_value.strip():
+            raise ValueError(f"Heat-load zone {name!r} requires a non-empty component label.")
+        has_watts = value.get("power_w") is not None
+        has_kilowatts = value.get("power_kw") is not None
+        if has_watts == has_kilowatts:
+            raise ValueError(
+                f"Heat-load zone {name!r} requires exactly one of power_w or power_kw."
+            )
+        power_w = (
+            _positive_number(value.get("power_w"), f"Heat-load zone {name!r} power")
+            if has_watts
+            else 1000.0
+            * _positive_number(value.get("power_kw"), f"Heat-load zone {name!r} power")
+        )
+        normalized_heat.append(
+            {
+                "name": name,
+                "shape": "box",
+                "component": component_value.strip(),
+                "cell_zone": name,
+                "face_zone": f"{name}Faces",
+                "minimum_m": _vector_mapping(minimum),
+                "maximum_m": _vector_mapping(maximum),
+                "power_w": power_w,
+                "source_model": "heatSource",
+                "power_mode": "total",
+                "coordinate_system": "solver_cartesian",
+            }
+        )
+
     zone_names = [
         *(str(zone["name"]) for zone in normalized_porous),
         *(str(zone["name"]) for zone in normalized_fans),
+        *(str(zone["name"]) for zone in normalized_heat),
     ]
-    return {
+    result: dict[str, object] = {
         "enabled": bool(zone_names),
         "coordinate_frame": "explicit_solver_coordinates_m",
         "porous_zones": normalized_porous,
@@ -806,6 +872,9 @@ def _normalize_volume_zones(
         "zone_names": zone_names,
         "applied_to_solver": True,
     }
+    if normalized_heat:
+        result["heat_zones"] = normalized_heat
+    return result
 
 
 def _zone_list(

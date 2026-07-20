@@ -117,6 +117,7 @@ const els = {
   wheelSetupJson: document.querySelector("#wheelSetupJson"),
   porousZonesJson: document.querySelector("#porousZonesJson"),
   fanZonesJson: document.querySelector("#fanZonesJson"),
+  heatZonesJson: document.querySelector("#heatZonesJson"),
   caseName: document.querySelector("#caseName"),
   referenceArea: document.querySelector("#referenceArea"),
   referenceLength: document.querySelector("#referenceLength"),
@@ -163,6 +164,7 @@ const els = {
   showEdges: document.querySelector("#showEdges"),
   surfaceModeButton: document.querySelector("#surfaceModeButton"),
   pressureModeButton: document.querySelector("#pressureModeButton"),
+  temperatureModeButton: document.querySelector("#temperatureModeButton"),
   dragModeButton: document.querySelector("#dragModeButton"),
 };
 
@@ -485,6 +487,9 @@ function currentCasePayload() {
     fanZones: engineering
       ? volumeZonesPayload(els.fanZonesJson, "Fan zones")
       : null,
+    heatZones: engineering
+      ? volumeZonesPayload(els.heatZonesJson, "Heat-load zones")
+      : null,
     flowAxis: els.flowAxis.value,
     includeGround,
     movingGround: includeGround && els.movingGround.checked,
@@ -677,6 +682,7 @@ for (const input of [
   els.turbulenceModel,
   els.porousZonesJson,
   els.fanZonesJson,
+  els.heatZonesJson,
   els.closedTunnel,
   els.tunnelWidthM,
   els.tunnelHeightM,
@@ -848,11 +854,21 @@ els.invertOrbit.addEventListener("change", saveViewerPreferences);
 els.showEdges.addEventListener("change", drawFlow);
 els.surfaceModeButton.addEventListener("click", () => setSurfaceMode("material"));
 els.pressureModeButton.addEventListener("click", () => setSurfaceMode("cp"));
+els.temperatureModeButton.addEventListener("click", () => setSurfaceMode("temperature"));
 els.dragModeButton.addEventListener("click", () => setSurfaceMode("drag"));
 
 function hasSurfacePressure() {
   const pressure = state.caseReport?.surfacePressure;
   return Boolean(pressure?.hasPressure && pressure.points?.length && pressure.triangles?.length);
+}
+
+function hasSurfaceTemperature() {
+  const surface = state.caseReport?.surfacePressure;
+  return Boolean(
+    hasSurfacePressure()
+    && surface?.hasTemperature
+    && surface.temperatureKValues?.length === surface.points?.length,
+  );
 }
 
 function hasSurfaceDrag() {
@@ -867,6 +883,7 @@ function hasSurfaceWallShear() {
 
 function setSurfaceMode(mode) {
   if (mode === "cp" && hasSurfacePressure()) state.viewer.surfaceMode = "cp";
+  else if (mode === "temperature" && hasSurfaceTemperature()) state.viewer.surfaceMode = "temperature";
   else if (mode === "drag" && hasSurfaceDrag()) state.viewer.surfaceMode = "drag";
   else state.viewer.surfaceMode = "material";
   syncSurfaceModeControls();
@@ -877,19 +894,25 @@ function setSurfaceMode(mode) {
 
 function syncSurfaceModeControls() {
   const hasPressure = hasSurfacePressure();
+  const hasTemperature = hasSurfaceTemperature();
   const hasDrag = hasSurfaceDrag();
   if (!hasPressure && state.viewer.surfaceMode === "cp") state.viewer.surfaceMode = "material";
+  if (!hasTemperature && state.viewer.surfaceMode === "temperature") state.viewer.surfaceMode = "material";
   if (!hasDrag && state.viewer.surfaceMode === "drag") state.viewer.surfaceMode = "material";
   const showPressure = state.viewer.surfaceMode === "cp";
+  const showTemperature = state.viewer.surfaceMode === "temperature";
   const showDrag = state.viewer.surfaceMode === "drag";
-  const showMaterial = !showPressure && !showDrag;
+  const showMaterial = !showPressure && !showTemperature && !showDrag;
   els.surfaceModeButton.classList.toggle("active", showMaterial);
   els.pressureModeButton.classList.toggle("active", showPressure);
+  els.temperatureModeButton.classList.toggle("active", showTemperature);
   els.dragModeButton.classList.toggle("active", showDrag);
   els.surfaceModeButton.setAttribute("aria-pressed", String(showMaterial));
   els.pressureModeButton.setAttribute("aria-pressed", String(showPressure));
+  els.temperatureModeButton.setAttribute("aria-pressed", String(showTemperature));
   els.dragModeButton.setAttribute("aria-pressed", String(showDrag));
   els.pressureModeButton.disabled = !hasPressure;
+  els.temperatureModeButton.disabled = !hasTemperature;
   els.dragModeButton.disabled = !hasDrag;
   const pressureSetup = state.caseReport?.surfacePressureSetup;
   const pressureLabel = hasPressure
@@ -899,6 +922,13 @@ function syncSurfaceModeControls() {
       : "Pressure coefficient Cp will be configured when this case is run";
   els.pressureModeButton.setAttribute("aria-label", pressureLabel);
   els.pressureModeButton.title = pressureLabel;
+  const temperatureLabel = hasTemperature
+    ? "Show solved adjacent-air temperature on the body surface"
+    : pressureSetup?.temperatureConfigured
+      ? "Adjacent-air temperature is pending a completed solver run"
+      : "Air temperature requires a compressible + thermal case";
+  els.temperatureModeButton.setAttribute("aria-label", temperatureLabel);
+  els.temperatureModeButton.title = temperatureLabel;
   const dragLabel = hasDrag
     ? hasSurfaceWallShear()
       ? "Show solved local total drag from pressure and wall shear"
@@ -914,10 +944,25 @@ function syncSurfaceModeControls() {
 function renderDragSummary() {
   const surface = state.caseReport?.surfacePressure;
   const regions = Array.isArray(surface?.dragRegions) ? surface.dragRegions : [];
-  const visible = state.viewer.surfaceMode === "drag" && hasSurfaceDrag();
-  els.dragSummary.hidden = !visible;
-  if (!visible) {
+  const showTemperature = state.viewer.surfaceMode === "temperature" && hasSurfaceTemperature();
+  const showDrag = state.viewer.surfaceMode === "drag" && hasSurfaceDrag();
+  els.dragSummary.hidden = !showTemperature && !showDrag;
+  if (!showTemperature && !showDrag) {
     els.dragSummary.innerHTML = "";
+    return;
+  }
+  if (showTemperature) {
+    const range = surface.temperatureCRange || [];
+    const summary = state.caseReport?.temperatureResults;
+    els.dragSummary.innerHTML = `
+      <div class="drag-summary-heading">
+        <strong>Adjacent-air temperature</strong>
+        <span>${surface.temperatureTimeAveraged ? "Mean field" : "Final field"}</span>
+      </div>
+      <p>${fmt(range[0])} to ${fmt(range[1])} °C on the solved surface</p>
+      ${summary?.maximumRiseK != null ? `<small>Internal-air maximum rise: ${fmt(summary.maximumRiseK)} K above inlet</small>` : ""}
+      <small>${escapeHtml(surface.temperatureDefinition || "This is air temperature next to the surface, not solid-component temperature.")}</small>
+    `;
     return;
   }
 
@@ -1409,13 +1454,17 @@ function setupReadinessItems(report) {
     try {
       const porousZones = volumeZonesPayload(els.porousZonesJson, "Porous zones") || [];
       const fanZones = volumeZonesPayload(els.fanZonesJson, "Fan zones") || [];
-      const zoneCount = porousZones.length + fanZones.length;
+      const heatZones = volumeZonesPayload(els.heatZonesJson, "Heat-load zones") || [];
+      const zoneCount = porousZones.length + fanZones.length + heatZones.length;
+      const heatProfileMismatch = heatZones.length > 0 && fluidProfile !== "compressible_thermal";
       items.push({
         label: "Volume zones",
-        status: "pass",
-        detail: zoneCount
-          ? `${porousZones.length} porous and ${fanZones.length} fan zone${zoneCount === 1 ? "" : "s"} will be generated from explicit solver-coordinate boxes.`
-          : "No porous or fan volume zones are configured.",
+        status: heatProfileMismatch ? "fail" : "pass",
+        detail: heatProfileMismatch
+          ? "Heat-load zones require the Compressible + thermal fluid profile."
+          : zoneCount
+            ? `${porousZones.length} porous, ${fanZones.length} fan, and ${heatZones.length} heat-load zone${zoneCount === 1 ? "" : "s"} will be generated from explicit solver-coordinate boxes.`
+            : "No porous, fan, or heat-load volume zones are configured.",
       });
     } catch (error) {
       items.push({
@@ -2614,8 +2663,19 @@ function restoreCaseContext(report) {
         upstream_point_m: zone.upstream_point_m,
       }))
     : [];
+  const heatZones = Array.isArray(volumeZones.heat_zones)
+    ? volumeZones.heat_zones.map((zone) => ({
+        name: zone.name,
+        shape: zone.shape || "box",
+        component: zone.component,
+        minimum_m: zone.minimum_m,
+        maximum_m: zone.maximum_m,
+        power_w: zone.power_w,
+      }))
+    : [];
   els.porousZonesJson.value = porousZones.length ? JSON.stringify(porousZones, null, 2) : "";
   els.fanZonesJson.value = fanZones.length ? JSON.stringify(fanZones, null, 2) : "";
+  els.heatZonesJson.value = heatZones.length ? JSON.stringify(heatZones, null, 2) : "";
   els.includeGround.checked = Boolean(ground.enabled);
   els.movingGround.checked = Boolean(ground.moving);
   els.groundClearanceMm.value = String(Math.max(0, Number(ground.clearance_m || 0)) * 1000);
@@ -2843,6 +2903,10 @@ function renderResultSummary() {
   const coeffs = state.caseReport?.forceCoeffs;
   const forces = state.caseReport?.aerodynamicForces;
   const assessment = state.caseReport?.qualityAssessment;
+  const temperature = state.caseReport?.temperatureResults;
+  const temperatureSummary = temperature?.meanC != null
+    ? ` | air T ${fmt(temperature.meanC)} °C mean, ${fmt(temperature.maximumC)} °C max${temperature.maximumRiseK == null ? "" : `, +${fmt(temperature.maximumRiseK)} K max`}`
+    : "";
   if (!coeffs) {
     const progress = state.activeRunProgress || state.caseReport?.runProgress;
     const label = progress?.isRunning
@@ -2854,7 +2918,7 @@ function renderResultSummary() {
         : progress?.isComplete
           ? "solver finished - coefficients missing"
           : "not run - preview only";
-    els.resultSummary.textContent = state.activeCasePath ? `Results: ${label}` : "";
+    els.resultSummary.textContent = state.activeCasePath ? `Results: ${label}${temperatureSummary}` : "";
     return;
   }
   const cd = coeffs.meanCd ?? coeffs.Cd ?? "n/a";
@@ -2891,6 +2955,9 @@ function renderResultSummary() {
     forces?.signedSideForceN != null ? `side ${fmt(forces.signedSideForceN)} N` : null,
     forces?.pitchMomentNm != null ? `pitch ${fmt(forces.pitchMomentNm)} N m` : null,
     balance?.qualified ? `front balance ${fmt(balance.frontAeroBalancePercent)}%` : "balance datum incomplete",
+    temperature?.meanC != null
+      ? `air T ${fmt(temperature.minimumC)} / ${fmt(temperature.meanC)} / ${fmt(temperature.maximumC)} °C min/mean/max${temperature.maximumRiseK == null ? "" : `; max rise ${fmt(temperature.maximumRiseK)} K`}`
+      : null,
     `${samples} samples`,
     cdStatistics?.confidence_interval?.lower != null
       ? `Cd 95% CI [${fmt(cdStatistics.confidence_interval.lower)}, ${fmt(cdStatistics.confidence_interval.upper)}]`
@@ -3249,6 +3316,23 @@ function pressureColor(value, minimum, maximum, alpha = 1) {
   return `rgba(${color[0]},${color[1]},${color[2]},${alpha})`;
 }
 
+function temperatureColorChannels(value, minimum, maximum) {
+  const span = Math.max(maximum - minimum, 1e-9);
+  const amount = clamp((value - minimum) / span, 0, 1);
+  const stops = [
+    [43, 76, 181],
+    [43, 190, 196],
+    [242, 204, 66],
+    [220, 58, 47],
+  ];
+  const scaled = amount * (stops.length - 1);
+  const index = Math.min(stops.length - 2, Math.floor(scaled));
+  const blend = scaled - index;
+  return stops[index].map(
+    (channel, channelIndex) => Math.round(lerp(channel, stops[index + 1][channelIndex], blend)),
+  );
+}
+
 function dragColorChannels(value, minimum, maximum) {
   const negativeLimit = Math.max(Math.abs(Math.min(minimum, 0)), 1e-6);
   const positiveLimit = Math.max(Math.max(maximum, 0), 1e-6);
@@ -3265,20 +3349,25 @@ function dragColorChannels(value, minimum, maximum) {
 
 function drawPressureLegend(ctx, width, height) {
   const basic = state.viewMode === "basic";
+  const showTemperature = state.viewer.surfaceMode === "temperature" && hasSurfaceTemperature();
   const showDrag = state.viewer.surfaceMode === "drag" && hasSurfaceDrag();
-  const surfacePressure = (state.viewer.surfaceMode === "cp" || showDrag) && hasSurfacePressure()
+  const surfacePressure = (
+    state.viewer.surfaceMode === "cp" || showTemperature || showDrag
+  ) && hasSurfacePressure()
     ? state.caseReport.surfacePressure
     : null;
   const flow = state.caseReport?.solverStreamlines;
   if (!surfacePressure && (!flow?.lines?.length || !flow.hasPressure || !flow.pressureRange)) return;
-  const range = showDrag
-    ? hasSurfaceWallShear()
-      ? surfacePressure?.totalDragDisplayRange || surfacePressure?.totalDragDensityRange
-      : surfacePressure?.pressureDragDisplayRange || surfacePressure?.pressureDragDensityRange
-    : surfacePressure?.cpDisplayRange || surfacePressure?.cpRange || flow.pressureRange;
-  const pressureMin = Number(range[0] || 0);
-  const pressureMax = Number(range[1] || 0);
-  const limit = Math.max(Math.abs(pressureMin), Math.abs(pressureMax), 1e-6);
+  const range = showTemperature
+    ? surfacePressure?.temperatureDisplayRangeK || surfacePressure?.temperatureKRange
+    : showDrag
+      ? hasSurfaceWallShear()
+        ? surfacePressure?.totalDragDisplayRange || surfacePressure?.totalDragDensityRange
+        : surfacePressure?.pressureDragDisplayRange || surfacePressure?.pressureDragDensityRange
+      : surfacePressure?.cpDisplayRange || surfacePressure?.cpRange || flow.pressureRange;
+  const rangeMin = Number(range?.[0] ?? 0);
+  const rangeMax = Number(range?.[1] ?? 0);
+  const limit = Math.max(Math.abs(rangeMin), Math.abs(rangeMax), 1e-6);
   const panelWidth = Math.min(250, width - 28);
   const x = 14;
   const y = Math.max(104, height - 72);
@@ -3291,10 +3380,15 @@ function drawPressureLegend(ctx, width, height) {
   roundRectPath(ctx, x, y, panelWidth, 58, 8);
   ctx.fill();
   for (let pixel = 0; pixel < barWidth; pixel += 1) {
-    const value = -limit + (pixel / Math.max(1, barWidth - 1)) * limit * 2;
-    const color = showDrag
-      ? dragColorChannels(value, -limit, limit)
-      : pressureColorChannels(value, -limit, limit);
+    const amount = pixel / Math.max(1, barWidth - 1);
+    const value = showTemperature
+      ? rangeMin + amount * (rangeMax - rangeMin)
+      : -limit + amount * limit * 2;
+    const color = showTemperature
+      ? temperatureColorChannels(value, rangeMin, rangeMax)
+      : showDrag
+        ? dragColorChannels(value, -limit, limit)
+        : pressureColorChannels(value, -limit, limit);
     ctx.fillStyle = `rgb(${color[0]},${color[1]},${color[2]})`;
     ctx.fillRect(barX + pixel, barY, 1.2, 8);
   }
@@ -3302,21 +3396,35 @@ function drawPressureLegend(ctx, width, height) {
   ctx.font = "600 11px Inter, system-ui, sans-serif";
   ctx.textAlign = "center";
   ctx.fillText(
-    basic
-      ? showDrag ? "Relative drag areas" : "Relative pressure"
-      : showDrag
-        ? hasSurfaceWallShear() ? "Local total drag areas" : "Local pressure-drag areas"
-        : surfacePressure ? "Pressure coefficient Cp" : "Relative pressure",
+    showTemperature
+      ? "Adjacent-air temperature"
+      : basic
+        ? showDrag ? "Relative drag areas" : "Relative pressure"
+        : showDrag
+          ? hasSurfaceWallShear() ? "Local total drag areas" : "Local pressure-drag areas"
+          : surfacePressure ? "Pressure coefficient Cp" : "Relative pressure",
     x + panelWidth / 2,
     y + 16,
   );
   ctx.font = "600 10px Inter, system-ui, sans-serif";
   ctx.textAlign = "left";
-  ctx.fillText(basic ? "Low" : showDrag ? "Offset" : surfacePressure ? fmt(-limit) : "Low", barX, y + 47);
+  ctx.fillText(
+    showTemperature ? `${fmt(rangeMin - 273.15)} °C` : basic ? "Low" : showDrag ? "Offset" : surfacePressure ? fmt(-limit) : "Low",
+    barX,
+    y + 47,
+  );
   ctx.textAlign = "center";
-  ctx.fillText(basic ? "Neutral" : showDrag ? "Neutral" : "0", x + panelWidth / 2, y + 47);
+  ctx.fillText(
+    showTemperature ? `${fmt((rangeMin + rangeMax) / 2 - 273.15)} °C` : basic ? "Neutral" : showDrag ? "Neutral" : "0",
+    x + panelWidth / 2,
+    y + 47,
+  );
   ctx.textAlign = "right";
-  ctx.fillText(basic ? "High" : showDrag ? "High drag" : surfacePressure ? fmt(limit) : "High", x + panelWidth - 14, y + 47);
+  ctx.fillText(
+    showTemperature ? `${fmt(rangeMax - 273.15)} °C` : basic ? "High" : showDrag ? "High drag" : surfacePressure ? fmt(limit) : "High",
+    x + panelWidth - 14,
+    y + 47,
+  );
   ctx.restore();
 }
 
@@ -3596,7 +3704,7 @@ function ensureThreeViewer() {
 
 function rebuildThreeGeometry(view, geometryKey) {
   disposeThreeGeometry(view);
-  const solvedSurfaceMode = state.viewer.surfaceMode === "cp" || state.viewer.surfaceMode === "drag";
+  const solvedSurfaceMode = ["cp", "temperature", "drag"].includes(state.viewer.surfaceMode);
   const surfacePressure = solvedSurfaceMode && hasSurfacePressure()
     ? state.caseReport.surfacePressure
     : null;
@@ -3675,14 +3783,17 @@ function rebuildThreeSolvedSurfaceGeometry(view, geometryKey, surfacePressure) {
   const positions = [];
   const colors = [];
   const indices = [];
+  const showTemperature = state.viewer.surfaceMode === "temperature";
   const showDrag = state.viewer.surfaceMode === "drag";
-  const range = showDrag
-    ? hasSurfaceWallShear()
-      ? surfacePressure.totalDragDisplayRange || surfacePressure.totalDragDensityRange || [-1, 1]
-      : surfacePressure.pressureDragDisplayRange || surfacePressure.pressureDragDensityRange || [-1, 1]
-    : surfacePressure.cpDisplayRange || surfacePressure.cpRange || [-1, 1];
-  const minimum = Number(range[0] || -1);
-  const maximum = Number(range[1] || 1);
+  const range = showTemperature
+    ? surfacePressure.temperatureDisplayRangeK || surfacePressure.temperatureKRange || [273.15, 373.15]
+    : showDrag
+      ? hasSurfaceWallShear()
+        ? surfacePressure.totalDragDisplayRange || surfacePressure.totalDragDensityRange || [-1, 1]
+        : surfacePressure.pressureDragDisplayRange || surfacePressure.pressureDragDensityRange || [-1, 1]
+      : surfacePressure.cpDisplayRange || surfacePressure.cpRange || [-1, 1];
+  const minimum = Number(range[0] ?? -1);
+  const maximum = Number(range[1] ?? 1);
 
   const triangleDragValues = hasSurfaceWallShear()
     ? surfacePressure.triangleTotalDragValues
@@ -3699,15 +3810,19 @@ function rebuildThreeSolvedSurfaceGeometry(view, geometryKey, surfacePressure) {
       }
     });
   } else {
-    for (const point of surfacePressure.points) {
+    surfacePressure.points.forEach((point, pointIndex) => {
       positions.push(Number(point[0]), Number(point[1]), Number(point[2]) + zOffset);
       const dragValueIndex = hasSurfaceWallShear() ? 6 : 4;
-      const value = Number(point[showDrag ? dragValueIndex : 3] || 0);
-      const color = showDrag
-        ? dragColorChannels(value, minimum, maximum)
-        : pressureColorChannels(value, minimum, maximum);
+      const value = showTemperature
+        ? Number(surfacePressure.temperatureKValues?.[pointIndex] ?? minimum)
+        : Number(point[showDrag ? dragValueIndex : 3] || 0);
+      const color = showTemperature
+        ? temperatureColorChannels(value, minimum, maximum)
+        : showDrag
+          ? dragColorChannels(value, minimum, maximum)
+          : pressureColorChannels(value, minimum, maximum);
       colors.push(color[0] / 255, color[1] / 255, color[2] / 255);
-    }
+    });
     for (const triangle of surfacePressure.triangles) {
       indices.push(Number(triangle[0]), Number(triangle[1]), Number(triangle[2]));
     }

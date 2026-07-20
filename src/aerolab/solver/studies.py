@@ -620,6 +620,7 @@ def _case_options_from_payload(
         "turbulence_model": str(turbulence.get("model") or "kOmegaSST"),
         "porous_zones": _stored_zone_options(volume_zones.get("porous_zones")),
         "fan_zones": _stored_zone_options(volume_zones.get("fan_zones")),
+        "heat_zones": _stored_zone_options(volume_zones.get("heat_zones")),
     }
 
 
