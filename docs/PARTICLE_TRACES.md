@@ -256,3 +256,74 @@ The repository currently has no JavaScript test runner. Validate the feature by:
 4. orbiting and zooming to verify particle/model alignment and depth testing;
 5. switching cases to verify stale particles disappear; and
 6. confirming speed and surface-field legends remain distinct in `Both` mode.
+
+## Post–Version 1 game plan
+
+Version 1 (commit `70ae6ce`) landed the advection, rendering, the
+`Lines | Particles | Both` control, dual legends, mean/final-field labeling, and
+WebGL fallback — i.e. it absorbed what an earlier draft split across two stages.
+What remains is lock-in, polish, and one strategic decision.
+
+Everything tunable is currently a hardcoded constant
+(`SOLVER_PARTICLE_TARGET_PER_LINE = 24`, `SOLVER_PARTICLE_MAX_COUNT = 5_200`,
+`SOLVER_PARTICLE_ANIMATION_RATE = 0.9`; material `size: 0.052`,
+`opacity: 0.92`). The polish work is therefore a repeatable pattern: expose a
+constant as a control and persist it to `localStorage`, following the existing
+`"aerolab-invert-orbit"` convention.
+
+Recommended order: **A → C (decide) → B → D**. Lock the foundation, make the
+strategic call so polish is not spent on an architecture that might be replaced,
+then polish, then decide on JS tooling.
+
+### Stage A — Lock in what exists (do first)
+
+Not new features; makes Version 1 durable before more is built on it.
+
+- **Wiring tests** in `tests/test_webapp.py`, following the
+  `test_inverted_orbit_control_is_wired_and_persistent` pattern: assert the
+  `solverLinesButton` / `solverBothButton` controls exist in `index.html`; that
+  `prepareSolverParticles`, `updateSolverParticles`, `resetSolverParticles`, and
+  `setSolverFlowMode` are referenced in `app.js`; and that both `Mean-flow speed`
+  and `Final-field speed` label strings are present.
+- **Manual visual pass** — the Validation checklist above, run in a browser on a
+  machine that can reach the local app.
+- Effort: small. Risk: none. Rationale: ~800 lines shipped with no automated
+  guard, so a later refactor could silently unwire the controls or labels.
+
+### Stage B — Interaction polish
+
+The "Future polish" items, ordered cheapest to dearest by how deeply they touch
+the render path:
+
+1. **Pause + animation-rate control** — scale `dt` by a rate factor; pause is
+   rate 0. Per-frame only, no buffer rebuild. Trivial.
+2. **Particle size / opacity controls** — write `material.size` /
+   `material.opacity` and trigger a `dt = 0` redraw. No buffer rebuild. Easy.
+3. **Particle density control** — changing particles-per-line reallocates the
+   typed arrays, so it must re-run `prepareSolverParticles` rather than tweak a
+   uniform. Debounce the input so a drag does not rebuild every frame. Moderate.
+
+Effort: small–moderate. Risk: low. Each item is expose-constant → control →
+persist.
+
+### Stage C — Strategic decision (not code)
+
+The open question from this document: **are seeded-streamline particles
+sufficient, or is particle seeding anywhere in the domain a real requirement?**
+
+- Version 1 visualizes seeded flow topology. Free-space particles require
+  volumetric velocity output (new OpenFOAM sampling), a payload well beyond the
+  current 128 MB streamline guard, and browser-side field interpolation — the
+  volumetric approach this document explicitly rejected. It is a different
+  feature, not an increment.
+- Decide this before investing in Stage B, because a free-space requirement would
+  replace the architecture some polish work targets.
+
+### Stage D — JavaScript test tooling (optional, infrastructure)
+
+Stage A asserts control *presence*, not *behavior*. Unit-testing the advection
+and arc-length math would mean adopting a JS runner (for example Vitest or Node's
+built-in test runner); the pure functions (`prepareSolverParticles`,
+`writeSolverParticleColor`) are already extractable. This is a project-level
+decision about adding a Node toolchain to a Python-first repository and is worth
+treating on its own.
