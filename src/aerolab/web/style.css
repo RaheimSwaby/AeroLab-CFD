@@ -1898,6 +1898,38 @@ button:active:not(:disabled) {
   padding: 12px;
 }
 
+.run-log-disclosure {
+  margin-top: 10px;
+}
+
+.run-log-body {
+  background: #10212a;
+  border-top: 1px solid #29414d;
+  padding: 0;
+}
+
+.run-log-output {
+  background: transparent;
+  border: 0;
+  color: #d9e8ed;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 0;
+  max-height: 300px;
+  min-height: 120px;
+  overflow: auto;
+  padding: 12px;
+  tab-size: 2;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.run-log-output:focus {
+  outline: 2px solid #7bc6cf;
+  outline-offset: -2px;
+}
+
 .advanced-flow-fields textarea {
   background: #f8fafb;
   border-color: var(--line-strong);

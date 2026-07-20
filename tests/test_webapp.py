@@ -111,12 +111,19 @@ class AccuracyStudyApiTests(unittest.TestCase):
         self.assertIn("adaptiveMaxGlobalCells", app)
         self.assertIn('els.sidebar.inert = true', app)
         self.assertIn('id="runProgressBar"', index)
+        self.assertIn('id="runLogDetails" class="advanced-disclosure run-log-disclosure"', index)
+        self.assertIn('id="runLogOutput"', index)
         self.assertIn('id="meshCaseButton"', index)
         self.assertIn('runActiveCase("mesh")', app)
         self.assertIn("reuseMesh: true", app)
         self.assertIn("meshOnly ? 14400 : 21600", app)
         self.assertIn("startRunProgressPolling", app)
         self.assertIn("/api/case-progress?casePath=", app)
+        self.assertIn("startRunLogPolling", app)
+        self.assertIn("stopRunLogPolling", app)
+        self.assertIn("/api/case-log?casePath=", app)
+        self.assertIn("els.runLogDetails.open", app)
+        self.assertIn("els.runLogOutput.textContent", app)
         self.assertIn("current 3D view is preview", app)
         self.assertIn("smallestFeatureM:", app)
         self.assertIn("unitScale: effectiveUnitScale()", app)
@@ -304,6 +311,87 @@ class AccuracyStudyApiTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["progress"]["phase"], "Solving airflow")
             self.assertEqual(payload["progress"]["percent"], 75)
+
+    def test_case_log_endpoint_returns_only_a_bounded_case_local_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cases_dir = root / "cases"
+            case_path = cases_dir / "running-case"
+            case_path.mkdir(parents=True)
+            case_path.joinpath("case.json").write_text(
+                json.dumps({"name": "running-case", "status": "mesh_running"}),
+                encoding="utf-8",
+            )
+            log_text = "".join(
+                f"old-line-{index:05d} {'x' * 24}\n"
+                for index in range(3_000)
+            ) + "Shell refinement iteration 9\nAfter refinement cells: 1234567\n"
+            log_path = case_path / "aerolab-run.log"
+            log_path.write_text(log_text, encoding="utf-8")
+
+            missing_case = cases_dir / "not-run"
+            missing_case.mkdir()
+            missing_case.joinpath("case.json").write_text(
+                json.dumps({"name": "not-run", "status": "created"}),
+                encoding="utf-8",
+            )
+            non_case_root = root / "other" / "fake-case"
+            non_case_root.mkdir(parents=True)
+            non_case_root.joinpath("case.json").write_text("{}", encoding="utf-8")
+            non_case_root.joinpath("aerolab-run.log").write_text(
+                "must-not-be-readable",
+                encoding="utf-8",
+            )
+
+            server = AeroLabServer(("127.0.0.1", 0), root)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.server_port}/api/case-log?casePath="
+                with urlopen(base_url + quote(str(case_path), safe=""), timeout=10) as response:
+                    self.assertEqual(response.headers["Cache-Control"], "no-store")
+                    payload = json.loads(response.read().decode("utf-8"))
+
+                with urlopen(base_url + quote(str(missing_case), safe=""), timeout=10) as response:
+                    missing_payload = json.loads(response.read().decode("utf-8"))
+
+                with self.assertRaises(HTTPError) as context:
+                    urlopen(base_url + quote(str(non_case_root), safe=""), timeout=10)
+                self.assertEqual(context.exception.code, 400)
+                self.assertNotIn("must-not-be-readable", context.exception.read().decode("utf-8"))
+
+                secret_path = root / "private.log"
+                secret_path.write_text("top-secret-log-content", encoding="utf-8")
+                log_path.unlink()
+                try:
+                    log_path.symlink_to(secret_path)
+                except OSError:
+                    pass
+                else:
+                    with self.assertRaises(HTTPError) as symlink_context:
+                        urlopen(base_url + quote(str(case_path), safe=""), timeout=10)
+                    self.assertEqual(symlink_context.exception.code, 400)
+                    self.assertNotIn(
+                        "top-secret-log-content",
+                        symlink_context.exception.read().decode("utf-8"),
+                    )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["exists"])
+            self.assertTrue(payload["truncated"])
+            self.assertLessEqual(payload["shownBytes"], 64 * 1024)
+            self.assertEqual(payload["sizeBytes"], len(log_text.encode("utf-8")))
+            self.assertNotIn("old-line-00000", payload["text"])
+            self.assertIn("Shell refinement iteration 9", payload["text"])
+            self.assertIn("After refinement cells: 1234567", payload["text"])
+            self.assertIsNotNone(payload["modifiedAt"])
+            self.assertTrue(missing_payload["ok"])
+            self.assertFalse(missing_payload["exists"])
+            self.assertEqual(missing_payload["text"], "")
 
     def test_serves_only_stl_files_inside_the_project(self) -> None:
         project = Path(__file__).resolve().parents[1]

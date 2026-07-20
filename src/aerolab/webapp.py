@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import math
 import mimetypes
+import os
 import re
+import stat
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -93,6 +95,12 @@ class AeroLabHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/solver":
             self._send_json(solver_status())
+            return
+        if parsed.path == "/api/case-log":
+            try:
+                self._handle_case_log(parsed.query)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
             return
         if parsed.path == "/api/case-progress":
             try:
@@ -203,6 +211,95 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _handle_case_log(self, query: str) -> None:
+        params = parse_qs(query)
+        value = params.get("casePath", [None])[0]
+        if not value:
+            raise ValueError("A case path is required.")
+        case_path = self._resolve_project_path(unquote(value))
+        cases_root = (self.server.root / "cases").resolve()
+        if not case_path.is_dir() or not case_path.is_relative_to(cases_root):
+            raise ValueError("The selected folder must be an AeroLab case inside the cases directory.")
+        if not (case_path / "case.json").is_file():
+            raise ValueError("The selected folder is not an AeroLab case.")
+
+        log_path = case_path / "aerolab-run.log"
+        maximum_bytes = 64 * 1024
+        open_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(log_path, open_flags)
+        except FileNotFoundError:
+            self._send_json(
+                {
+                    "ok": True,
+                    "exists": False,
+                    "text": "",
+                    "sizeBytes": 0,
+                    "shownBytes": 0,
+                    "truncated": False,
+                    "modifiedAt": None,
+                }
+            )
+            return
+        except OSError as exc:
+            raise ValueError("The case run log must be a regular case-local file.") from exc
+
+        try:
+            log_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(log_stat.st_mode):
+                raise ValueError("The case run log must be a regular case-local file.")
+            try:
+                path_stat = log_path.lstat()
+                resolved_log = log_path.resolve(strict=True)
+                resolved_stat = resolved_log.stat()
+            except OSError as exc:
+                raise ValueError("The case run log changed while it was being opened.") from exc
+            opened_identity = (log_stat.st_dev, log_stat.st_ino)
+            path_identity = (resolved_stat.st_dev, resolved_stat.st_ino)
+            if (
+                stat.S_ISLNK(path_stat.st_mode)
+                or resolved_log.parent != case_path
+                or opened_identity != path_identity
+            ):
+                raise ValueError("The case run log must be a regular case-local file.")
+
+            start = max(0, log_stat.st_size - maximum_bytes)
+            os.lseek(descriptor, start, os.SEEK_SET)
+            chunks: list[bytes] = []
+            remaining = maximum_bytes
+            while remaining > 0:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+        if start > 0:
+            newline = data.find(b"\n")
+            if newline >= 0:
+                data = data[newline + 1 :]
+        self._send_json(
+            {
+                "ok": True,
+                "exists": True,
+                "text": data.decode("utf-8", errors="replace"),
+                "sizeBytes": log_stat.st_size,
+                "shownBytes": len(data),
+                "truncated": start > 0,
+                "modifiedAt": datetime.fromtimestamp(
+                    log_stat.st_mtime,
+                    tz=timezone.utc,
+                ).isoformat(),
+            }
+        )
 
     def _handle_case_progress(self, query: str) -> None:
         params = parse_qs(query)

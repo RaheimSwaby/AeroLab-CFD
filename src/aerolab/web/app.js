@@ -21,6 +21,8 @@ const state = {
   activeRunProgress: null,
   runProgressTimer: null,
   runProgressToken: 0,
+  runLogTimer: null,
+  runLogToken: 0,
   repair: null,
   aeroFeatures: null,
   aeroFeatureScanStatus: "idle",
@@ -144,6 +146,9 @@ const els = {
   runProgressPercent: document.querySelector("#runProgressPercent"),
   runProgressBar: document.querySelector("#runProgressBar"),
   runProgressDetail: document.querySelector("#runProgressDetail"),
+  runLogDetails: document.querySelector("#runLogDetails"),
+  runLogStatus: document.querySelector("#runLogStatus"),
+  runLogOutput: document.querySelector("#runLogOutput"),
   solverStatus: document.querySelector("#solverStatus"),
   resultSummary: document.querySelector("#resultSummary"),
   modelName: document.querySelector("#modelName"),
@@ -178,6 +183,7 @@ async function boot() {
   state.sensitivityParameters = payload.sensitivityParameters || {};
   state.activeCasePath = state.cases[0]?.path || null;
   state.activeRunProgress = state.cases[0]?.progress || null;
+  syncRunLogForActiveCase();
   els.rootPath.textContent = state.root;
   renderCases();
   await refreshSolverStatus();
@@ -325,6 +331,7 @@ els.createCaseButton.addEventListener("click", async () => {
     state.cases = payload.state.cases || [];
     state.comparison = null;
     state.activeCasePath = payload.casePath;
+    syncRunLogForActiveCase();
     els.caseStatus.textContent = `Created ${payload.case.name}`;
     renderCases();
     await refreshCaseReport(payload.casePath);
@@ -352,6 +359,7 @@ els.createStudyButton.addEventListener("click", async () => {
     state.cases = payload.state.cases || [];
     state.comparison = null;
     state.activeCasePath = payload.selectedCasePath;
+    syncRunLogForActiveCase();
     state.caseReport = payload.report;
     els.caseStatus.textContent = "Created draft, standard, and fine accuracy cases";
     renderCases();
@@ -390,6 +398,7 @@ els.createSensitivityButton.addEventListener("click", async () => {
     state.cases = payload.state.cases || [];
     state.comparison = null;
     state.activeCasePath = payload.selectedCasePath;
+    syncRunLogForActiveCase();
     state.caseReport = payload.report;
     const study = payload.study || {};
     els.sensitivityStatus.textContent = `Created ${study.casePaths?.length || values.length} ${study.parameterLabel || study.parameter} cases; baseline index ${study.baselineIndex}.`;
@@ -534,6 +543,99 @@ els.checkSolverButton.addEventListener("click", async () => {
 
 els.meshCaseButton.addEventListener("click", () => runActiveCase("mesh"));
 els.runCaseButton.addEventListener("click", () => runActiveCase("full"));
+els.runLogDetails.addEventListener("toggle", () => {
+  if (els.runLogDetails.open) startRunLogPolling();
+  else stopRunLogPolling();
+});
+
+function syncRunLogForActiveCase() {
+  stopRunLogPolling();
+  if (!state.activeCasePath) {
+    els.runLogStatus.textContent = "Select a case to view its OpenFOAM output";
+    els.runLogOutput.textContent = "No active case selected.";
+    return;
+  }
+  els.runLogStatus.textContent = "Open to view the latest OpenFOAM output";
+  els.runLogOutput.textContent = "Open this panel to load the run log.";
+  if (els.runLogDetails.open) startRunLogPolling();
+}
+
+function startRunLogPolling() {
+  stopRunLogPolling();
+  const casePath = state.activeCasePath;
+  if (!els.runLogDetails.open || !casePath) {
+    syncRunLogForActiveCase();
+    return;
+  }
+  const token = state.runLogToken + 1;
+  state.runLogToken = token;
+  els.runLogStatus.textContent = "Loading latest OpenFOAM output...";
+
+  const poll = async () => {
+    if (
+      state.runLogToken !== token
+      || !els.runLogDetails.open
+      || state.activeCasePath !== casePath
+    ) return;
+    try {
+      const payload = await apiGet(`/api/case-log?casePath=${encodeURIComponent(casePath)}`);
+      if (
+        state.runLogToken !== token
+        || !els.runLogDetails.open
+        || state.activeCasePath !== casePath
+      ) return;
+      renderRunLogPayload(payload);
+    } catch (error) {
+      if (
+        state.runLogToken !== token
+        || !els.runLogDetails.open
+        || state.activeCasePath !== casePath
+      ) return;
+      els.runLogStatus.textContent = "Run log unavailable";
+      els.runLogOutput.textContent = `Could not read the run log: ${error.message}`;
+    }
+    if (
+      state.runLogToken === token
+      && els.runLogDetails.open
+      && state.activeCasePath === casePath
+    ) {
+      state.runLogTimer = window.setTimeout(poll, 1200);
+    }
+  };
+  void poll();
+}
+
+function renderRunLogPayload(payload) {
+  const stickToBottom = (
+    els.runLogOutput.scrollHeight
+    - els.runLogOutput.scrollTop
+    - els.runLogOutput.clientHeight
+  ) < 40;
+  if (!payload.exists) {
+    els.runLogStatus.textContent = "Waiting for OpenFOAM output";
+    els.runLogOutput.textContent = "No run log yet. Start mesh validation or a solver run.";
+  } else {
+    const totalBytes = formatInt(payload.sizeBytes || 0);
+    const shownBytes = formatInt(payload.shownBytes || 0);
+    els.runLogStatus.textContent = payload.truncated
+      ? `Showing latest ${shownBytes} of ${totalBytes} bytes`
+      : `${totalBytes} bytes · live`;
+    els.runLogOutput.textContent = payload.text || "The run log is currently empty.";
+  }
+  if (stickToBottom) {
+    window.requestAnimationFrame(() => {
+      els.runLogOutput.scrollTop = els.runLogOutput.scrollHeight;
+    });
+  }
+}
+
+function stopRunLogPolling() {
+  state.runLogToken += 1;
+  if (state.runLogTimer != null) {
+    window.clearTimeout(state.runLogTimer);
+    state.runLogTimer = null;
+  }
+}
 
 async function runActiveCase(mode) {
   if (!state.activeCasePath) return;
@@ -597,6 +699,7 @@ els.caseList.addEventListener("click", async (event) => {
   state.activeCasePath = requestedCasePath;
   state.caseReport = null;
   state.activeRunProgress = state.cases.find((item) => item.path === requestedCasePath)?.progress || null;
+  syncRunLogForActiveCase();
   state.report = null;
   state.mesh = null;
   els.modelName.textContent = "Loading case";
@@ -1067,6 +1170,7 @@ function loadReport(modelPath, report, preview = null, exactData = null) {
   state.caseReport = null;
   state.activeCasePath = null;
   state.activeRunProgress = null;
+  syncRunLogForActiveCase();
   state.viewer.meshSource = "raw";
   state.viewer.surfaceMode = "material";
   syncSurfaceModeControls();
@@ -1225,6 +1329,7 @@ async function beginSourceAlignment() {
     state.caseReport = null;
     state.activeCasePath = null;
     state.activeRunProgress = null;
+    syncRunLogForActiveCase();
     state.viewer.meshSource = "raw";
     state.viewer.surfaceMode = "material";
     syncSurfaceModeControls();

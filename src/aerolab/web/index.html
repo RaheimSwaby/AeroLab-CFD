@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#102433" />
     <title>AeroLab CFD — Local Aerodynamics</title>
-    <link rel="stylesheet" href="/assets/style.css?v=30" />
+    <link rel="stylesheet" href="/assets/style.css?v=31" />
   </head>
   <body data-view-mode="basic">
     <a class="skip-link" href="#mainContent">Skip to analysis</a>
@@ -446,6 +446,15 @@
               <progress id="runProgressBar" max="100" value="0">0%</progress>
               <small id="runProgressDetail"></small>
             </div>
+            <details id="runLogDetails" class="advanced-disclosure run-log-disclosure">
+              <summary>
+                <span>Run log</span>
+                <small id="runLogStatus" aria-live="polite">Select a case to view its OpenFOAM output</small>
+              </summary>
+              <div class="run-log-body">
+                <pre id="runLogOutput" class="run-log-output" tabindex="0" aria-label="Latest OpenFOAM run log">No active case selected.</pre>
+              </div>
+            </details>
             <div class="status-stack">
               <p id="solverStatus" class="inline-status"></p>
               <p id="resultSummary" class="inline-status"></p>
@@ -559,6 +568,6 @@
       </main>
     </div>
 
-    <script type="module" src="/assets/app.js?v=63"></script>
+    <script type="module" src="/assets/app.js?v=64"></script>
   </body>
 </html>
