@@ -407,7 +407,9 @@ def create_case(
             body_rotation_center_source=body_rotation_center_source,
         )
         case["status"] = "openfoam_case_generated"
-        case["openfoam_files"] = [str(path.relative_to(case_path)) for path in files]
+        # POSIX separators keep case.json portable: cases are staged into WSL/Linux,
+        # and a Windows-generated manifest must not carry backslash paths.
+        case["openfoam_files"] = [path.relative_to(case_path).as_posix() for path in files]
 
     with (case_path / "case.json").open("w", encoding="utf-8") as f:
         json.dump(case, f, indent=2)

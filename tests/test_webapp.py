@@ -327,7 +327,9 @@ class AccuracyStudyApiTests(unittest.TestCase):
                 for index in range(3_000)
             ) + "Shell refinement iteration 9\nAfter refinement cells: 1234567\n"
             log_path = case_path / "aerolab-run.log"
-            log_path.write_text(log_text, encoding="utf-8")
+            # newline="" disables text-mode newline translation so the on-disk byte
+            # count matches log_text on Windows as well as POSIX.
+            log_path.write_text(log_text, encoding="utf-8", newline="")
 
             missing_case = cases_dir / "not-run"
             missing_case.mkdir()

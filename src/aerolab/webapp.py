@@ -883,8 +883,9 @@ def _list_cases(cases_dir: Path) -> list[dict[str, object]]:
 
 
 def _case_files(case_path: Path) -> list[str]:
+    # POSIX separators keep the JSON API response consistent across platforms.
     return [
-        str(path.relative_to(case_path))
+        path.relative_to(case_path).as_posix()
         for path in sorted(case_path.rglob("*"))
         if path.is_file()
     ]
