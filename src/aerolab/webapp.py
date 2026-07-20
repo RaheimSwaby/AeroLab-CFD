@@ -12,7 +12,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .case import create_case
 from .repair import repair_fidelity_for_model, repair_stl
-from .solver import case_report, case_run_progress, run_case, solver_status
+from .solver import (
+    SENSITIVITY_PARAMETERS,
+    case_report,
+    case_run_progress,
+    compare_cases,
+    create_sensitivity_study,
+    run_case,
+    solver_status,
+)
 from .stl import detect_aero_features, inspect_stl, mesh_preview
 
 
@@ -121,8 +129,14 @@ class AeroLabHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/accuracy-study":
                 self._handle_create_accuracy_study()
                 return
+            if parsed.path == "/api/sensitivity-study":
+                self._handle_create_sensitivity_study()
+                return
             if parsed.path == "/api/run-case":
                 self._handle_run_case()
+                return
+            if parsed.path == "/api/compare-cases":
+                self._handle_compare_cases()
                 return
             if parsed.path == "/api/case-report":
                 self._handle_case_report()
@@ -305,10 +319,129 @@ class AeroLabHandler(BaseHTTPRequestHandler):
             }
         )
 
+    def _handle_create_sensitivity_study(self) -> None:
+        payload = self._json_body()
+        options = self._case_options(payload)
+        model_path = options["model_path"]
+        base_name = _safe_case_name(str(payload.get("name") or model_path.stem))
+        parameter = str(payload.get("sensitivityParameter") or "")
+        if parameter not in SENSITIVITY_PARAMETERS:
+            supported = ", ".join(sorted(SENSITIVITY_PARAMETERS))
+            raise ValueError(f"Choose one supported sensitivity parameter: {supported}.")
+        raw_values = payload.get("sensitivityValues")
+        if not isinstance(raw_values, list):
+            raise ValueError("Sensitivity values must be a JSON list of two to twelve numbers.")
+        values = [float(value) for value in raw_values]
+        raw_baseline = payload.get("sensitivityBaselineIndex")
+        baseline_index = None if raw_baseline in (None, "") else int(raw_baseline)
+        study = create_sensitivity_study(
+            base_options=options,
+            base_name=base_name,
+            cases_dir=self.server.root / "cases",
+            parameter=parameter,
+            values=values,
+            generate_openfoam=True,
+            baseline_index=baseline_index,
+        )
+        selected = Path(str(study["selectedCasePath"]))
+        self._send_json(
+            {
+                "ok": True,
+                "study": study,
+                "selectedCasePath": str(selected),
+                "report": case_report(selected, include_visualization=True),
+                "state": self._state(),
+            }
+        )
+
+    def _wheel_setup_options(self, value: object) -> list[dict[str, object]] | None:
+        if value in (None, "", []):
+            return None
+        if not isinstance(value, list):
+            raise ValueError("Wheel setup must be a JSON list.")
+        wheels: list[dict[str, object]] = []
+        for index, item in enumerate(value, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Wheel setup entry {index} must be an object.")
+            wheel = dict(item)
+            model_value = wheel.get("model_path") or wheel.get("modelPath") or wheel.get("geometry")
+            if not model_value:
+                raise ValueError(f"Wheel setup entry {index} requires model_path.")
+            wheel["model_path"] = str(self._resolve_project_path(str(model_value)))
+            wheels.append(wheel)
+        return wheels
+
+    def _volume_zone_options(
+        self,
+        value: object,
+        label: str,
+    ) -> list[dict[str, object]] | None:
+        if value in (None, "", []):
+            return None
+        if not isinstance(value, list):
+            raise ValueError(f"{label} must be a JSON list.")
+        zones: list[dict[str, object]] = []
+        for index, item in enumerate(value, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"{label} entry {index} must be an object.")
+            zones.append(dict(item))
+        return zones
+
     def _case_options(self, payload: dict[str, object]) -> dict[str, object]:
         return {
             "model_path": self._resolve_project_path(str(payload["modelPath"])),
             "speed_mph": float(payload.get("speedMph") or 70),
+            "air_temperature_c": _optional_finite_float(
+                payload.get("airTemperatureC"),
+                "Air temperature",
+            ),
+            "air_pressure_pa": _optional_positive_float(
+                payload.get("airPressurePa"),
+                "Air pressure",
+            ),
+            "air_density_kg_m3": _optional_positive_float(
+                payload.get("airDensityKgM3"),
+                "Air density",
+            ),
+            "kinematic_viscosity_m2_s": _optional_positive_float(
+                payload.get("kinematicViscosityM2S"),
+                "Kinematic viscosity",
+            ),
+            "turbulence_intensity_percent": _optional_positive_float(
+                payload.get("turbulenceIntensityPercent"),
+                "Turbulence intensity",
+            ),
+            "turbulence_length_scale_m": _optional_positive_float(
+                payload.get("turbulenceLengthScaleM"),
+                "Turbulence length scale",
+            ),
+            "yaw_degrees": _optional_finite_float(payload.get("yawDegrees"), "Yaw angle"),
+            "crosswind_mps": _optional_finite_float(
+                payload.get("crosswindMps"),
+                "Crosswind speed",
+            ),
+            "roughness_height_m": _nonnegative_float(
+                payload.get("roughnessHeightM"),
+                "Surface roughness height",
+            ),
+            "roughness_constant": (
+                _optional_finite_float(payload.get("roughnessConstant"), "Roughness constant")
+                or 0.5
+            ),
+            "closed_tunnel": payload.get("closedTunnel"),
+            "backflow_safe_outlet": bool(payload.get("backflowSafeOutlet")),
+            "wheel_setup": self._wheel_setup_options(payload.get("wheelSetup")),
+            "second_order_transient": bool(payload.get("secondOrderTransient")),
+            "fluid_profile": str(payload.get("fluidProfile") or "incompressible"),
+            "turbulence_model": str(payload.get("turbulenceModel") or "kOmegaSST"),
+            "porous_zones": self._volume_zone_options(
+                payload.get("porousZones"),
+                "Porous zones",
+            ),
+            "fan_zones": self._volume_zone_options(
+                payload.get("fanZones"),
+                "Fan zones",
+            ),
             "flow_axis": str(payload.get("flowAxis") or "x"),
             "include_ground": bool(payload.get("includeGround")),
             "moving_ground": bool(payload.get("movingGround")),
@@ -320,6 +453,15 @@ class AeroLabHandler(BaseHTTPRequestHandler):
             "unit_label": str(payload.get("unitLabel") or "m"),
             "reference_area_m2": _optional_float(payload.get("referenceAreaM2")),
             "reference_length_m": _optional_float(payload.get("referenceLengthM")),
+            "center_of_gravity_m": _optional_vector(payload.get("centerOfGravityM"), "Vehicle CG"),
+            "front_axle_station_m": _optional_finite_float(
+                payload.get("frontAxleStationM"),
+                "Front axle station",
+            ),
+            "rear_axle_station_m": _optional_finite_float(
+                payload.get("rearAxleStationM"),
+                "Rear axle station",
+            ),
             "measured_length_m": _optional_float(payload.get("measuredLengthM")),
             "measured_width_m": _optional_float(payload.get("measuredWidthM")),
             "measured_height_m": _optional_float(payload.get("measuredHeightM")),
@@ -357,6 +499,17 @@ class AeroLabHandler(BaseHTTPRequestHandler):
             status=202,
         )
 
+    def _handle_compare_cases(self) -> None:
+        payload = self._json_body()
+        baseline_path = self._resolve_project_path(str(payload["baselineCasePath"]))
+        variant_path = self._resolve_project_path(str(payload["variantCasePath"]))
+        self._send_json(
+            {
+                "ok": True,
+                "comparison": compare_cases(baseline_path, variant_path),
+            }
+        )
+
     def _handle_case_report(self) -> None:
         payload = self._json_body()
         case_path = self._resolve_project_path(str(payload["casePath"]))
@@ -369,6 +522,7 @@ class AeroLabHandler(BaseHTTPRequestHandler):
             "root": str(self.server.root),
             "sampleModel": str(sample) if sample.exists() else None,
             "cases": _list_cases(self.server.root / "cases"),
+            "sensitivityParameters": SENSITIVITY_PARAMETERS,
         }
 
     def _json_body(self) -> dict[str, object]:
@@ -431,6 +585,7 @@ def _record_background_run_failure(
         "status": "failed",
         "ok": False,
         "trusted": False,
+        "numericallyQualified": False,
         "mode": run_mode,
         "backend": backend,
         "returncode": 127,
@@ -490,6 +645,39 @@ def _optional_float(value: object) -> float | None:
     if number <= 0:
         raise ValueError("Reference values must be positive.")
     return number
+
+
+def _optional_positive_float(value: object, label: str) -> float | None:
+    number = _optional_finite_float(value, label)
+    if number is not None and number <= 0:
+        raise ValueError(f"{label} must be a positive number.")
+    return number
+
+
+def _optional_finite_float(value: object, label: str) -> float | None:
+    if value in (None, ""):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{label} must be a finite number.")
+    return number
+
+
+def _optional_vector(value: object, label: str) -> tuple[float, float, float] | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} requires X, Y, and Z coordinates.")
+    raw = [value.get(axis) for axis in ("x", "y", "z")]
+    provided = sum(component not in (None, "") for component in raw)
+    if provided == 0:
+        return None
+    if provided != 3:
+        raise ValueError(f"{label} requires X, Y, and Z coordinates together.")
+    return tuple(
+        float(_optional_finite_float(component, f"{label} {axis.upper()}"))
+        for axis, component in zip(("x", "y", "z"), raw)
+    )  # type: ignore[return-value]
 
 
 def _nonnegative_float(value: object, label: str) -> float:
@@ -573,7 +761,17 @@ def _list_cases(cases_dir: Path) -> list[dict[str, object]]:
                     "quality": payload.get("cfd_quality", {}).get("name"),
                     "studyId": payload.get("validation_study", {}).get("id"),
                     "studyLevel": payload.get("validation_study", {}).get("level"),
+                    "sensitivityStudyId": payload.get("sensitivity_study", {}).get("id"),
+                    "sensitivityParameter": payload.get("sensitivity_study", {}).get("parameter"),
+                    "sensitivityParameterLabel": payload.get("sensitivity_study", {}).get("parameter_label"),
+                    "sensitivityUnit": payload.get("sensitivity_study", {}).get("unit"),
+                    "sensitivityValue": payload.get("sensitivity_study", {}).get("value"),
+                    "sensitivityIndex": payload.get("sensitivity_study", {}).get("index"),
+                    "sensitivityCount": payload.get("sensitivity_study", {}).get("count"),
+                    "sensitivityBaseline": payload.get("sensitivity_study", {}).get("is_baseline"),
                     "reference": payload.get("aerodynamic_reference"),
+                    "comparisonLockHash": payload.get("comparison_lock", {}).get("hash"),
+                    "balanceDatumQualified": payload.get("vehicle_datums", {}).get("balance_qualified"),
                     "createdAt": payload.get("created_at"),
                     "progress": case_run_progress(case_json.parent),
                 }

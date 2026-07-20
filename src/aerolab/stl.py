@@ -560,6 +560,7 @@ def transformed_report(
     target_flow_axis: str = "x",
     rotation_degrees: Vector = (0.0, 0.0, 0.0),
     translation: Vector = (0.0, 0.0, 0.0),
+    rotation_center: Vector | None = None,
 ) -> StlReport:
     triangles, stl_format = read_stl_triangles(source_path)
     transformed = transform_triangles(
@@ -570,6 +571,7 @@ def transformed_report(
         target_flow_axis=target_flow_axis,
         rotation_degrees=rotation_degrees,
         translation=translation,
+        rotation_center=rotation_center,
     )
     return report_for_triangles(source_path, transformed, stl_format)
 
@@ -587,6 +589,7 @@ def write_transformed_binary_stl(
     target_flow_axis: str = "x",
     rotation_degrees: Vector = (0.0, 0.0, 0.0),
     translation: Vector = (0.0, 0.0, 0.0),
+    rotation_center: Vector | None = None,
 ) -> None:
     triangles, _ = read_stl_triangles(source_path)
     transformed = transform_triangles(
@@ -597,6 +600,7 @@ def write_transformed_binary_stl(
         target_flow_axis=target_flow_axis,
         rotation_degrees=rotation_degrees,
         translation=translation,
+        rotation_center=rotation_center,
     )
     write_binary_stl_triangles(target_path, transformed, header="AeroLab transformed body in solver meters")
 
@@ -627,6 +631,7 @@ def write_transformed_ascii_stl(
     target_flow_axis: str = "x",
     rotation_degrees: Vector = (0.0, 0.0, 0.0),
     translation: Vector = (0.0, 0.0, 0.0),
+    rotation_center: Vector | None = None,
 ) -> None:
     triangles, _ = read_stl_triangles(source_path)
     transformed = transform_triangles(
@@ -637,6 +642,7 @@ def write_transformed_ascii_stl(
         target_flow_axis=target_flow_axis,
         rotation_degrees=rotation_degrees,
         translation=translation,
+        rotation_center=rotation_center,
     )
     target_path.parent.mkdir(parents=True, exist_ok=True)
     with target_path.open("w", encoding="utf-8") as f:
@@ -663,22 +669,90 @@ def transform_triangles(
     target_flow_axis: str = "x",
     rotation_degrees: Vector = (0.0, 0.0, 0.0),
     translation: Vector = (0.0, 0.0, 0.0),
+    rotation_center: Vector | None = None,
 ) -> list[Triangle]:
-    basis = _orientation_basis(source_flow_direction, source_up_direction, target_flow_axis)
-    center = _triangle_center(triangles)
-    rotation_radians = tuple(math.radians(float(value)) for value in rotation_degrees)
+    center = _triangle_center(triangles) if rotation_center is None else _finite_vector(
+        rotation_center,
+        "Rotation center",
+    )
     return [
         tuple(
-            tuple(
-                value + float(translation[axis])
-                for axis, value in enumerate(
-                    _transform_vertex(_rotate_vertex(vertex, center, rotation_radians), basis, scale)
-                )
+            transform_point(
+                vertex,
+                scale=scale,
+                source_flow_direction=source_flow_direction,
+                source_up_direction=source_up_direction,
+                target_flow_axis=target_flow_axis,
+                rotation_degrees=rotation_degrees,
+                translation=translation,
+                rotation_center=center,
             )
             for vertex in triangle
         )  # type: ignore[misc]
         for triangle in triangles
     ]
+
+
+def transform_point(
+    point: Vector,
+    *,
+    scale: float = 1.0,
+    source_flow_direction: str = "+x",
+    source_up_direction: str = "+z",
+    target_flow_axis: str = "x",
+    rotation_degrees: Vector = (0.0, 0.0, 0.0),
+    translation: Vector = (0.0, 0.0, 0.0),
+    rotation_center: Vector = (0.0, 0.0, 0.0),
+) -> Vector:
+    """Transform a source-frame point with the same contract used for solver STL geometry."""
+    source_point = _finite_vector(point, "Point")
+    center = _finite_vector(rotation_center, "Rotation center")
+    offset = _finite_vector(translation, "Translation")
+    factor = float(scale)
+    if not math.isfinite(factor) or factor <= 0:
+        raise ValueError("Geometry scale must be a finite positive value.")
+    rotation_radians = tuple(math.radians(value) for value in _finite_vector(rotation_degrees, "Rotation"))
+    basis = _orientation_basis(source_flow_direction, source_up_direction, target_flow_axis)
+    transformed = _transform_vertex(
+        _rotate_vertex(source_point, center, rotation_radians),
+        basis,
+        factor,
+    )
+    return tuple(transformed[index] + offset[index] for index in range(3))  # type: ignore[return-value]
+
+
+def transform_direction(
+    direction: Vector,
+    *,
+    source_flow_direction: str = "+x",
+    source_up_direction: str = "+z",
+    target_flow_axis: str = "x",
+    rotation_degrees: Vector = (0.0, 0.0, 0.0),
+) -> Vector:
+    """Rotate and orient a source-frame direction without translating or scaling it."""
+    source_direction = _normalize(_finite_vector(direction, "Direction"))
+    rotation_radians = tuple(math.radians(value) for value in _finite_vector(rotation_degrees, "Rotation"))
+    rotated = _rotate_vertex(source_direction, (0.0, 0.0, 0.0), rotation_radians)
+    basis = _orientation_basis(source_flow_direction, source_up_direction, target_flow_axis)
+    return _normalize(_transform_vertex(rotated, basis, 1.0))
+
+
+def _finite_vector(value: object, label: str) -> Vector:
+    if isinstance(value, dict):
+        try:
+            values = (float(value["x"]), float(value["y"]), float(value["z"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{label} requires finite X, Y, and Z values.") from exc
+    else:
+        try:
+            values = tuple(float(component) for component in value)  # type: ignore[union-attr]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} requires finite X, Y, and Z values.") from exc
+        if len(values) != 3:
+            raise ValueError(f"{label} requires finite X, Y, and Z values.")
+    if not all(math.isfinite(component) for component in values):
+        raise ValueError(f"{label} requires finite X, Y, and Z values.")
+    return values  # type: ignore[return-value]
 
 
 def translated_report(report: StlReport, translation: Vector) -> StlReport:

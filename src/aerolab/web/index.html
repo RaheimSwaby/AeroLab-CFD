@@ -3,79 +3,120 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AeroLab CFD</title>
-    <link rel="stylesheet" href="/assets/style.css?v=18" />
+    <meta name="theme-color" content="#102433" />
+    <title>AeroLab CFD — Local Aerodynamics</title>
+    <link rel="stylesheet" href="/assets/style.css?v=30" />
   </head>
-  <body>
+  <body data-view-mode="basic">
+    <a class="skip-link" href="#mainContent">Skip to analysis</a>
     <div class="app-shell">
       <header class="topbar">
-        <div>
-          <h1>AeroLab CFD</h1>
-          <p id="rootPath"></p>
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true"><span>A</span></div>
+          <div class="project-heading">
+            <p class="eyebrow">Local aerodynamic workspace</p>
+            <h1>AeroLab <span>CFD</span></h1>
+            <p id="rootPath"></p>
+          </div>
         </div>
-        <div class="status-strip">
-          <span class="status-dot"></span>
-          <span>Local</span>
+        <div class="topbar-actions">
+          <div class="mode-control">
+            <span class="mode-label">Workspace</span>
+            <div class="view-mode-switch" role="group" aria-label="Interface detail level">
+              <button id="basicModeButton" class="active" type="button" aria-pressed="true">Basic</button>
+              <button id="engineeringModeButton" type="button" aria-pressed="false">Engineering</button>
+            </div>
+          </div>
+          <p id="viewModeDescription" class="view-mode-description">Overall airflow with simplified controls</p>
+          <div class="status-strip" title="AeroLab runs against files and solvers on this machine">
+            <span class="status-dot"></span>
+            <span class="status-copy"><strong>Local</strong><small>Private workspace</small></span>
+          </div>
         </div>
       </header>
 
-      <main class="workspace">
-        <aside class="sidebar">
-          <section class="panel">
-            <h2>Model</h2>
+      <main id="mainContent" class="workspace">
+        <aside class="sidebar" aria-label="Simulation setup">
+          <div class="sidebar-heading">
+            <p class="eyebrow">Setup workflow</p>
+            <h2>Configure the run</h2>
+            <p>Move from geometry to airflow, then create and run the case.</p>
+          </div>
+
+          <section class="panel panel-model">
+            <div class="panel-heading">
+              <span class="step-index">01</span>
+              <div>
+                <p class="panel-kicker">Input</p>
+                <h2>Geometry</h2>
+                <p>Load, orient, and scale the vehicle surface.</p>
+              </div>
+            </div>
+
             <label class="file-drop">
               <input id="modelFile" type="file" accept=".stl" />
-              <span id="fileLabel">Select STL</span>
+              <span class="file-drop-icon" aria-hidden="true">STL</span>
+              <span id="fileLabel">Select an STL model</span>
+              <small>Binary or ASCII surface mesh</small>
             </label>
-            <button id="sampleButton" type="button">Load Sample</button>
-            <button id="prepareScanButton" type="button" disabled>Prepare Scan</button>
-            <p id="repairStatus" class="inline-status"></p>
-            <label>
-              <span>STL units</span>
-              <select id="unitScale">
-                <option value="1" data-label="m">Meters</option>
-                <option value="0.001" data-label="mm">Millimeters</option>
-                <option value="0.01" data-label="cm">Centimeters</option>
-                <option value="0.0254" data-label="in">Inches</option>
-              </select>
-            </label>
-            <label>
-              <span>Measured length m</span>
-              <input id="targetLength" type="number" min="0" step="0.001" placeholder="Tape or CAD value" />
-            </label>
-            <label>
-              <span>Measured width m</span>
-              <input id="targetWidth" type="number" min="0" step="0.001" placeholder="Tape or CAD value" />
-            </label>
-            <label>
-              <span>Measured height m</span>
-              <input id="targetHeight" type="number" min="0" step="0.001" placeholder="Tape or CAD value" />
-            </label>
-            <label>
-              <span>Source flow</span>
-              <select id="sourceFlowDirection">
-                <option value="+x" selected>+X</option>
-                <option value="-x">-X</option>
-                <option value="+y">+Y</option>
-                <option value="-y">-Y</option>
-                <option value="+z">+Z</option>
-                <option value="-z">-Z</option>
-              </select>
-            </label>
-            <label>
-              <span>Source up</span>
-              <select id="sourceUpDirection">
-                <option value="+z" selected>+Z</option>
-                <option value="-z">-Z</option>
-                <option value="+y">+Y</option>
-                <option value="-y">-Y</option>
-                <option value="+x">+X</option>
-                <option value="-x">-X</option>
-              </select>
-            </label>
+            <div class="button-row">
+              <button id="sampleButton" type="button">Load Sample</button>
+              <button id="prepareScanButton" type="button" disabled>Prepare Scan</button>
+            </div>
+            <p id="repairStatus" class="inline-status" aria-live="polite"></p>
+
+            <div class="form-grid two-up">
+              <label>
+                <span>STL units</span>
+                <select id="unitScale">
+                  <option value="1" data-label="m">Meters</option>
+                  <option value="0.001" data-label="mm">Millimeters</option>
+                  <option value="0.01" data-label="cm">Centimeters</option>
+                  <option value="0.0254" data-label="in">Inches</option>
+                </select>
+              </label>
+              <label>
+                <span>Measured length m</span>
+                <input id="targetLength" type="number" min="0" step="0.001" placeholder="Tape or CAD" />
+              </label>
+              <label>
+                <span>Measured width m</span>
+                <input id="targetWidth" type="number" min="0" step="0.001" placeholder="Tape or CAD" />
+              </label>
+              <label>
+                <span>Measured height m</span>
+                <input id="targetHeight" type="number" min="0" step="0.001" placeholder="Tape or CAD" />
+              </label>
+            </div>
+
+            <div class="form-grid two-up orientation-grid">
+              <label>
+                <span>Source flow</span>
+                <select id="sourceFlowDirection">
+                  <option value="+x" selected>+X</option>
+                  <option value="-x">-X</option>
+                  <option value="+y">+Y</option>
+                  <option value="-y">-Y</option>
+                  <option value="+z">+Z</option>
+                  <option value="-z">-Z</option>
+                </select>
+              </label>
+              <label>
+                <span>Source up</span>
+                <select id="sourceUpDirection">
+                  <option value="+z" selected>+Z</option>
+                  <option value="-z">-Z</option>
+                  <option value="+y">+Y</option>
+                  <option value="-y">-Y</option>
+                  <option value="+x">+X</option>
+                  <option value="-x">-X</option>
+                </select>
+              </label>
+            </div>
+
             <div class="alignment-controls">
               <div class="alignment-header">
-                <span>Model rotation</span>
+                <span>Model orientation</span>
                 <div class="alignment-actions">
                   <button id="autoAlignButton" class="compact-button" type="button">Auto-align</button>
                   <button id="resetRotationButton" class="compact-button" type="button">Reset</button>
@@ -106,79 +147,292 @@
                 </label>
               </div>
               <label class="toggle orbit-toggle">
-                <input id="invertOrbit" type="checkbox" />
                 <span>Invert orbit drag</span>
+                <input id="invertOrbit" type="checkbox" />
               </label>
             </div>
           </section>
 
-          <section class="panel">
-            <h2>Flow</h2>
-            <label>
-              <span>Speed</span>
-              <input id="speedMph" type="number" min="1" max="230" step="1" value="70" />
+          <section class="panel panel-flow">
+            <div class="panel-heading">
+              <span class="step-index">02</span>
+              <div>
+                <p class="panel-kicker">Conditions</p>
+                <h2>Airflow</h2>
+                <p>Set the freestream, road, and solver model.</p>
+              </div>
+            </div>
+
+            <label class="featured-input">
+              <span>Freestream speed</span>
+              <span class="input-with-unit">
+                <input id="speedMph" type="number" min="1" max="230" step="1" value="70" />
+                <strong>mph</strong>
+              </span>
             </label>
-            <label>
-              <span>Axis</span>
-              <select id="flowAxis">
-                <option value="x">X</option>
-                <option value="y">Y</option>
-                <option value="z">Z</option>
-              </select>
-            </label>
-            <label class="toggle">
-              <input id="includeGround" type="checkbox" />
-              <span>Ground</span>
-            </label>
-            <label class="toggle">
-              <input id="movingGround" type="checkbox" disabled />
-              <span>Moving ground</span>
-            </label>
+
+            <div class="form-grid two-up atmosphere-grid">
+              <label>
+                <span>Air temperature C</span>
+                <input id="airTemperatureC" type="number" step="0.1" value="15" />
+              </label>
+              <label>
+                <span>Absolute pressure Pa</span>
+                <input id="airPressurePa" type="number" min="1" step="1" value="101325" />
+              </label>
+              <label>
+                <span>Density kg/m3</span>
+                <input id="airDensity" type="number" min="0" step="0.001" placeholder="Auto" />
+              </label>
+              <label>
+                <span>Kinematic viscosity m2/s</span>
+                <input id="kinematicViscosity" type="number" min="0" step="0.000001" placeholder="Auto" />
+              </label>
+              <label>
+                <span>Turbulence intensity %</span>
+                <input id="turbulenceIntensity" type="number" min="0.01" max="50" step="0.1" value="1" />
+              </label>
+              <label>
+                <span>Turbulence length scale m</span>
+                <input id="turbulenceLengthScale" type="number" min="0" step="0.001" placeholder="Auto: 7% ref. length" />
+              </label>
+              <label>
+                <span>Solver flow axis</span>
+                <select id="flowAxis">
+                  <option value="x">X</option>
+                  <option value="y">Y</option>
+                  <option value="z">Z</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="toggle-stack">
+              <label class="toggle">
+                <span><strong>Ground plane</strong><small>Add a road boundary below the model</small></span>
+                <input id="includeGround" type="checkbox" />
+              </label>
+              <label class="toggle">
+                <span><strong>Moving road</strong><small>Match the road to freestream velocity</small></span>
+                <input id="movingGround" type="checkbox" disabled />
+              </label>
+            </div>
             <label>
               <span>Lowest-point road gap mm</span>
               <input id="groundClearanceMm" type="number" min="0" step="1" value="0" disabled />
             </label>
+
+            <details class="advanced-disclosure engineering-only advanced-flow-fields">
+              <summary>
+                <span>Boundary conditions</span>
+                <small>Yaw, crosswind, roughness, and outlet behavior</small>
+              </summary>
+              <div class="disclosure-body">
+                <p class="field-help">Enter yaw or signed crosswind. Speed remains total freestream magnitude.</p>
+                <div class="form-grid two-up">
+                  <label>
+                    <span>Yaw degrees</span>
+                    <input id="yawDegrees" type="number" min="-89" max="89" step="0.1" placeholder="0" />
+                  </label>
+                  <label>
+                    <span>Crosswind m/s</span>
+                    <input id="crosswindMps" type="number" step="0.1" placeholder="Derived from yaw" />
+                  </label>
+                  <label>
+                    <span>Body/wheel roughness Ks mm</span>
+                    <input id="roughnessHeightMm" type="number" min="0" step="0.01" value="0" />
+                  </label>
+                  <label>
+                    <span>Rough-wall constant Cs</span>
+                    <input id="roughnessConstant" type="number" min="0.5" max="1" step="0.05" value="0.5" />
+                  </label>
+                </div>
+                <label class="toggle">
+                  <span><strong>Backflow-safe outlet</strong><small>Use inlet/outlet-safe velocity and turbulence boundaries</small></span>
+                  <input id="backflowSafeOutlet" type="checkbox" />
+                </label>
+              </div>
+            </details>
+
+            <details class="advanced-disclosure engineering-only advanced-flow-fields">
+              <summary>
+                <span>Solver and domain</span>
+                <small>Fluid profile, turbulence model, and tunnel</small>
+              </summary>
+              <div class="disclosure-body">
+                <label class="toggle">
+                  <span><strong>Second-order transient</strong><small>Use the backward temporal scheme</small></span>
+                  <input id="secondOrderTransient" type="checkbox" disabled />
+                </label>
+                <label>
+                  <span>Fluid solver profile</span>
+                  <select id="fluidProfile">
+                    <option value="incompressible" selected>Incompressible (default)</option>
+                    <option value="compressible_thermal">Compressible + thermal (fluid)</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Turbulence model</span>
+                  <select id="turbulenceModel">
+                    <option value="kOmegaSST" selected>k-omega SST (RANS)</option>
+                    <option value="SpalartAllmarasDES">Spalart-Allmaras DES</option>
+                    <option value="SpalartAllmarasIDDES">Spalart-Allmaras IDDES</option>
+                  </select>
+                </label>
+                <label class="toggle">
+                  <span><strong>Closed wind tunnel</strong><small>Use explicit wall and ceiling dimensions</small></span>
+                  <input id="closedTunnel" type="checkbox" />
+                </label>
+                <div class="two-column-inputs tunnel-dimensions">
+                  <label><span>Width m</span><input id="tunnelWidthM" type="number" min="0" step="0.1" disabled /></label>
+                  <label><span>Height m</span><input id="tunnelHeightM" type="number" min="0" step="0.1" disabled /></label>
+                  <label><span>Upstream m</span><input id="tunnelUpstreamM" type="number" min="0" step="0.1" disabled /></label>
+                  <label><span>Downstream m</span><input id="tunnelDownstreamM" type="number" min="0" step="0.1" disabled /></label>
+                </div>
+              </div>
+            </details>
+
+            <details class="advanced-disclosure engineering-only advanced-flow-fields">
+              <summary>
+                <span>Components and regions</span>
+                <small>Rotating wheels, porous media, and fans</small>
+              </summary>
+              <div class="disclosure-body">
+                <label>
+                  <span>Wheel setup JSON</span>
+                  <textarea id="wheelSetupJson" rows="6" spellcheck="false" placeholder='[{"name":"wheel_fl","model_path":"models/wheel_fl.stl","center_source":[0,0,0],"axis_source":[0,1,0],"radius_m":0.33}]'></textarea>
+                </label>
+                <p class="field-help">Wheel geometry, center, and directed axis use the body source frame. Rotating wheels require Ground and Moving road.</p>
+                <label>
+                  <span>Porous box zones JSON</span>
+                  <textarea id="porousZonesJson" rows="6" spellcheck="false" placeholder='[{"name":"radiatorCore","minimum_m":[1.2,-0.3,0.2],"maximum_m":[1.3,0.3,0.8],"darcy_d_per_m2":[1000,1000,1000]}]'></textarea>
+                </label>
+                <label>
+                  <span>Fan box zones JSON</span>
+                  <textarea id="fanZonesJson" rows="7" spellcheck="false" placeholder='[{"name":"coolingFan","minimum_m":[1.35,-0.3,0.2],"maximum_m":[1.45,0.3,0.8],"disk_direction":[1,0,0],"power_coefficient":0.3,"thrust_coefficient":0.6,"disk_area_m2":0.25,"upstream_point_m":[1.3,0,0.5]}]'></textarea>
+                </label>
+                <p class="field-help">Region boxes and fan sample points are explicit transformed solver coordinates in meters.</p>
+              </div>
+            </details>
           </section>
 
-          <section class="panel">
-            <h2>Case</h2>
+          <section class="panel panel-case">
+            <div class="panel-heading">
+              <span class="step-index">03</span>
+              <div>
+                <p class="panel-kicker">Build and run</p>
+                <h2>Case</h2>
+                <p>Choose fidelity, create the files, and launch OpenFOAM.</p>
+              </div>
+            </div>
+
             <label>
-              <span>Name</span>
+              <span>Case name</span>
               <input id="caseName" type="text" value="sample-70mph" />
             </label>
-            <label>
-              <span>Reference area m2</span>
-              <input id="referenceArea" type="number" min="0" step="0.001" placeholder="Auto" />
-            </label>
-            <label>
-              <span>Reference length m</span>
-              <input id="referenceLength" type="number" min="0" step="0.001" placeholder="Auto" />
-            </label>
-            <label>
-              <span>CFD quality</span>
-              <select id="qualityPreset">
-                <option value="draft">Draft</option>
-                <option value="standard" selected>Standard</option>
-                <option value="fine">Fine</option>
-              </select>
-            </label>
-            <label>
-              <span>Simulation</span>
-              <select id="simulationMode">
-                <option value="steady" selected>Steady RANS</option>
-                <option value="transient">Transient + averaged</option>
-              </select>
-            </label>
+            <div class="form-grid two-up">
+              <label>
+                <span>Reference area m2</span>
+                <input id="referenceArea" type="number" min="0" step="0.001" placeholder="Automatic" />
+              </label>
+              <label>
+                <span>Reference length m</span>
+                <input id="referenceLength" type="number" min="0" step="0.001" placeholder="Automatic" />
+              </label>
+            </div>
+
+            <details class="advanced-disclosure datum-fields engineering-only">
+              <summary>
+                <span>Vehicle datums</span>
+                <small>CG and axle stations in solver meters</small>
+              </summary>
+              <div class="disclosure-body">
+                <div class="three-column-inputs">
+                  <label><span>CG X</span><input id="cgX" type="number" step="0.001" placeholder="Optional" /></label>
+                  <label><span>CG Y</span><input id="cgY" type="number" step="0.001" placeholder="Optional" /></label>
+                  <label><span>CG Z</span><input id="cgZ" type="number" step="0.001" placeholder="Optional" /></label>
+                </div>
+                <div class="form-grid two-up">
+                  <label>
+                    <span>Front axle station</span>
+                    <input id="frontAxleStation" type="number" step="0.001" placeholder="Positive flow axis" />
+                  </label>
+                  <label>
+                    <span>Rear axle station</span>
+                    <input id="rearAxleStation" type="number" step="0.001" placeholder="Positive flow axis" />
+                  </label>
+                </div>
+              </div>
+            </details>
+
+            <div class="form-grid two-up case-quality-grid">
+              <label>
+                <span>CFD quality</span>
+                <select id="qualityPreset">
+                  <option value="draft">Draft</option>
+                  <option value="standard" selected>Standard</option>
+                  <option value="fine">Fine</option>
+                </select>
+              </label>
+              <label>
+                <span>Simulation</span>
+                <select id="simulationMode">
+                  <option value="steady" selected>Steady RANS</option>
+                  <option value="transient">Transient + averaged</option>
+                </select>
+              </label>
+            </div>
+
+            <details class="advanced-disclosure engineering-only sensitivity-fields">
+              <summary>
+                <span>One-factor sensitivity</span>
+                <small>Create a setup-locked case family</small>
+              </summary>
+              <div class="disclosure-body">
+                <p class="field-help">Creates 2–12 cases while changing one declared input. Use transient mode for confidence-interval evidence.</p>
+                <label>
+                  <span>Parameter</span>
+                  <select id="sensitivityParameter">
+                    <option value="speed_mph">Freestream speed (mph)</option>
+                    <option value="yaw_degrees" selected>Yaw angle (deg)</option>
+                    <option value="crosswind_mps">Crosswind component (m/s)</option>
+                    <option value="roughness_height_m">Roughness height (m)</option>
+                    <option value="ground_clearance_m">Ground clearance (m)</option>
+                    <option value="turbulence_intensity_percent">Turbulence intensity (%)</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Values (comma-separated)</span>
+                  <input id="sensitivityValues" type="text" value="-5, 0, 5" placeholder="-5, 0, 5" />
+                </label>
+                <label>
+                  <span>Baseline index (optional)</span>
+                  <input id="sensitivityBaselineIndex" type="number" min="0" max="11" step="1" placeholder="Nearest current value" />
+                </label>
+                <button id="createSensitivityButton" type="button" disabled>Create Sensitivity Study</button>
+                <p id="sensitivityStatus" class="inline-status" aria-live="polite"></p>
+              </div>
+            </details>
+
             <label>
               <span>Smallest aero feature mm</span>
-              <input id="smallestFeatureMm" type="number" min="0" step="1" placeholder="Optional" />
+              <input id="smallestFeatureMm" type="number" min="0" step="1" placeholder="Optional mesh target" />
             </label>
-            <button id="createCaseButton" type="button" disabled>Create OpenFOAM Case</button>
-            <button id="createStudyButton" type="button" disabled>Create Accuracy Study</button>
-            <div class="case-tools">
-              <button id="checkSolverButton" type="button">Check Solver</button>
-              <button id="meshCaseButton" type="button" disabled>Validate Mesh</button>
-              <button id="runCaseButton" type="button" disabled>Run Solver</button>
+
+            <div class="primary-actions">
+              <button id="createCaseButton" type="button" disabled>Create OpenFOAM Case</button>
+              <button id="createStudyButton" type="button" disabled>Create Accuracy Study</button>
+            </div>
+
+            <div class="run-section">
+              <div class="run-section-heading">
+                <span>Solver actions</span>
+                <small>Mesh before committing to a full run</small>
+              </div>
+              <div class="case-tools">
+                <button id="checkSolverButton" type="button">Check Solver</button>
+                <button id="meshCaseButton" type="button" disabled>Validate Mesh</button>
+                <button id="runCaseButton" type="button" disabled>Run Solver</button>
+              </div>
             </div>
             <div id="runProgress" class="run-progress" hidden aria-live="polite">
               <div class="run-progress-heading">
@@ -188,26 +442,33 @@
               <progress id="runProgressBar" max="100" value="0">0%</progress>
               <small id="runProgressDetail"></small>
             </div>
-            <p id="solverStatus" class="inline-status"></p>
-            <p id="resultSummary" class="inline-status"></p>
+            <div class="status-stack">
+              <p id="solverStatus" class="inline-status"></p>
+              <p id="resultSummary" class="inline-status"></p>
+            </div>
           </section>
         </aside>
 
         <section class="main-stage">
           <div class="stage-header">
             <div>
+              <p class="eyebrow">Active analysis</p>
               <h2 id="modelName">No model loaded</h2>
-              <p id="modelStatus">Awaiting STL</p>
+              <p id="modelStatus">Choose an STL model to begin</p>
             </div>
             <span id="candidateBadge" class="badge muted">Idle</span>
           </div>
 
           <div class="analysis-grid">
-            <section class="visual-panel">
+            <section class="visual-panel" aria-label="Aerodynamic model viewer">
               <div class="viewer-stack">
                 <canvas id="flowCanvas" width="900" height="420"></canvas>
                 <canvas id="modelCanvas" width="900" height="420" aria-label="Exact STL model view"></canvas>
                 <aside id="dragSummary" class="drag-summary" hidden aria-live="polite"></aside>
+                <div class="viewer-caption" aria-hidden="true">
+                  <span>Interactive flow view</span>
+                  <small>Drag to orbit · scroll to zoom</small>
+                </div>
                 <div class="viewer-controls">
                   <div class="viewer-segmented" role="group" aria-label="Surface coloring">
                     <button id="surfaceModeButton" class="active" type="button" aria-pressed="true">Surface</button>
@@ -223,32 +484,76 @@
             </section>
 
             <section class="metrics-panel">
-              <h3>Geometry</h3>
+              <div class="card-heading">
+                <div>
+                  <p class="panel-kicker">Scan</p>
+                  <h3>Geometry</h3>
+                </div>
+                <span class="card-icon" aria-hidden="true">XYZ</span>
+              </div>
               <dl id="metrics"></dl>
             </section>
           </div>
 
+          <section class="basic-airflow-panel basic-only" aria-labelledby="basicAirflowHeading">
+            <div>
+              <p class="panel-kicker">Result</p>
+              <h3 id="basicAirflowHeading">Airflow overview</h3>
+              <div id="basicAirflowSummary" class="basic-airflow-summary" aria-live="polite"></div>
+            </div>
+            <p class="basic-mode-note">Basic view keeps the workflow focused on overall airflow. Switch to Engineering for numerical checks, loads, moments, and controlled comparisons.</p>
+          </section>
+
           <section class="readiness-panel">
-            <h3>CFD Readiness</h3>
+            <div class="card-heading">
+              <div>
+                <p class="panel-kicker">Preflight</p>
+                <h3>CFD readiness</h3>
+              </div>
+              <p>Geometry and setup checks before a solver run</p>
+            </div>
             <div id="readiness"></div>
           </section>
 
           <section class="warnings-panel">
-            <h3>Mesh Notes</h3>
+            <div class="card-heading">
+              <div>
+                <p class="panel-kicker">Review</p>
+                <h3>Mesh notes</h3>
+              </div>
+            </div>
             <ul id="warnings"></ul>
           </section>
 
           <section class="case-panel">
             <div class="case-header">
-              <h3>Recent Cases</h3>
+              <div>
+                <p class="panel-kicker">Workspace history</p>
+                <h3>Recent cases</h3>
+              </div>
               <span id="caseStatus"></span>
             </div>
             <div id="caseList" class="case-list"></div>
+            <div class="comparison-controls">
+              <div class="comparison-heading">
+                <div>
+                  <p class="panel-kicker">Evidence</p>
+                  <h4>Controlled A/B comparison</h4>
+                </div>
+                <small>Only setup-locked, qualified cases are decision-safe</small>
+              </div>
+              <div class="comparison-selects">
+                <label><span>Baseline</span><select id="comparisonBaseline"></select></label>
+                <label><span>Variant</span><select id="comparisonVariant"></select></label>
+              </div>
+              <button id="compareCasesButton" type="button" disabled>Compare Locked Cases</button>
+              <div id="comparisonSummary" class="comparison-summary" aria-live="polite"></div>
+            </div>
           </section>
         </section>
       </main>
     </div>
 
-    <script type="module" src="/assets/app.js?v=56"></script>
+    <script type="module" src="/assets/app.js?v=63"></script>
   </body>
 </html>

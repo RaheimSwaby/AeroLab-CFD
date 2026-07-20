@@ -41,6 +41,12 @@ def _case_visualization(case_path: Path, case_payload: dict[str, object]) -> dic
             reference_area = float(reference.get("area_m2") or 0.0) or None
         except (TypeError, ValueError):
             reference_area = None
+    pressure_reference_pa = None
+    if case_payload.get("solver_module") == "fluid" and isinstance(flow, dict):
+        try:
+            pressure_reference_pa = float(flow.get("air_pressure_pa") or 0.0)
+        except (TypeError, ValueError):
+            pressure_reference_pa = None
     surface_pressure = parse_surface_pressure(
         case_path,
         preview,
@@ -48,6 +54,7 @@ def _case_visualization(case_path: Path, case_payload: dict[str, object]) -> dic
         speed_mps,
         density,
         reference_area_m2=reference_area,
+        absolute_pressure_reference_pa=pressure_reference_pa,
     )
     return {
         "geometryModelPath": str(body_path),
@@ -142,7 +149,7 @@ def parse_streamlines(
     center_obj = geometry_preview.get("normalizedCenter")
     scale_obj = geometry_preview.get("normalizedScale")
     center = center_obj if isinstance(center_obj, list) and len(center_obj) == 3 else [0.0, 0.0, 0.0]
-    scale = float(scale_obj) if isinstance(scale_obj, (int, float)) else 1.0
+    scale = float(scale_obj) if isinstance(scale_obj, int | float) else 1.0
 
     canonical_points = []
     for point in raw_points:
@@ -212,6 +219,7 @@ def parse_surface_pressure(
     density_kg_m3: float = 1.225,
     max_triangles: int = 180_000,
     reference_area_m2: float | None = None,
+    absolute_pressure_reference_pa: float | None = None,
 ) -> dict[str, object] | None:
     post_dir = case_path / "postProcessing" / "bodyPressure"
     if not post_dir.exists():
@@ -318,14 +326,33 @@ def parse_surface_pressure(
     center_obj = geometry_preview.get("normalizedCenter")
     scale_obj = geometry_preview.get("normalizedScale")
     center = center_obj if isinstance(center_obj, list) and len(center_obj) == 3 else [0.0, 0.0, 0.0]
-    scale = float(scale_obj) if isinstance(scale_obj, (int, float)) else 1.0
+    scale = float(scale_obj) if isinstance(scale_obj, int | float) else 1.0
     canonical_points = [_canonical_solver_point(point, flow_axis) for point in raw_points]
     points = []
     for canonical in canonical_points:
         points.append(tuple((canonical[index] - float(center[index])) * scale for index in range(3)))
 
-    denominator = 0.5 * max(float(speed_mps), 1e-6) ** 2
-    cp_values = [float(value) / denominator for value in pressure]
+    absolute_pressure = absolute_pressure_reference_pa is not None
+    if absolute_pressure:
+        reference_pressure = float(absolute_pressure_reference_pa)
+        coefficient_pressure = [float(value) - reference_pressure for value in pressure]
+        coefficient_point_pressure = (
+            [float(value) - reference_pressure for value in point_pressure]
+            if point_pressure is not None
+            else None
+        )
+        coefficient_cell_pressure = (
+            [float(value) - reference_pressure for value in cell_pressure]
+            if cell_pressure is not None
+            else None
+        )
+        denominator = 0.5 * density_kg_m3 * max(float(speed_mps), 1e-6) ** 2
+    else:
+        coefficient_pressure = [float(value) for value in pressure]
+        coefficient_point_pressure = point_pressure
+        coefficient_cell_pressure = cell_pressure
+        denominator = 0.5 * max(float(speed_mps), 1e-6) ** 2
+    cp_values = [value / denominator for value in coefficient_pressure]
     skin_drag_values = None
     if wall_shear is not None:
         skin_drag_values = [
@@ -344,8 +371,8 @@ def parse_surface_pressure(
         triangles,
         triangle_polygon_indices,
         polygon_source_indices,
-        point_pressure,
-        cell_pressure,
+        coefficient_point_pressure,
+        coefficient_cell_pressure,
         point_shear,
         cell_shear,
         denominator,
@@ -413,7 +440,11 @@ def parse_surface_pressure(
         abs(_percentile(triangle_total_drag_values, 0.98)),
         0.05,
     )
-    pressure_pa = [float(value) * density_kg_m3 for value in pressure]
+    pressure_pa = (
+        coefficient_pressure
+        if absolute_pressure
+        else [value * density_kg_m3 for value in coefficient_pressure]
+    )
     return {
         "file": str(path),
         "hasPressure": True,

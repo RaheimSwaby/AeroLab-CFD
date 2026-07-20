@@ -1,19 +1,23 @@
 import * as THREE from "./vendor/three.module.min.js";
 
 const INVERT_ORBIT_STORAGE_KEY = "aerolab-invert-orbit";
+const VIEW_MODE_STORAGE_KEY = "aerolab-view-mode";
 const VIEWER_GROUND_Z = -0.58;
 
 const state = {
   busy: false,
+  viewMode: "basic",
   root: "",
   sampleModel: null,
   modelPath: null,
   report: null,
   mesh: null,
   cases: [],
+  sensitivityParameters: {},
   activeCasePath: null,
   solver: null,
   caseReport: null,
+  comparison: null,
   activeRunProgress: null,
   runProgressTimer: null,
   runProgressToken: 0,
@@ -61,6 +65,10 @@ const state = {
 
 const els = {
   sidebar: document.querySelector(".sidebar"),
+  basicModeButton: document.querySelector("#basicModeButton"),
+  engineeringModeButton: document.querySelector("#engineeringModeButton"),
+  viewModeDescription: document.querySelector("#viewModeDescription"),
+  basicAirflowSummary: document.querySelector("#basicAirflowSummary"),
   rootPath: document.querySelector("#rootPath"),
   modelFile: document.querySelector("#modelFile"),
   fileLabel: document.querySelector("#fileLabel"),
@@ -83,15 +91,47 @@ const els = {
   resetRotationButton: document.querySelector("#resetRotationButton"),
   invertOrbit: document.querySelector("#invertOrbit"),
   speedMph: document.querySelector("#speedMph"),
+  airTemperatureC: document.querySelector("#airTemperatureC"),
+  airPressurePa: document.querySelector("#airPressurePa"),
+  airDensity: document.querySelector("#airDensity"),
+  kinematicViscosity: document.querySelector("#kinematicViscosity"),
+  turbulenceIntensity: document.querySelector("#turbulenceIntensity"),
+  turbulenceLengthScale: document.querySelector("#turbulenceLengthScale"),
   flowAxis: document.querySelector("#flowAxis"),
   includeGround: document.querySelector("#includeGround"),
   movingGround: document.querySelector("#movingGround"),
   groundClearanceMm: document.querySelector("#groundClearanceMm"),
+  yawDegrees: document.querySelector("#yawDegrees"),
+  crosswindMps: document.querySelector("#crosswindMps"),
+  roughnessHeightMm: document.querySelector("#roughnessHeightMm"),
+  roughnessConstant: document.querySelector("#roughnessConstant"),
+  backflowSafeOutlet: document.querySelector("#backflowSafeOutlet"),
+  secondOrderTransient: document.querySelector("#secondOrderTransient"),
+  fluidProfile: document.querySelector("#fluidProfile"),
+  turbulenceModel: document.querySelector("#turbulenceModel"),
+  closedTunnel: document.querySelector("#closedTunnel"),
+  tunnelWidthM: document.querySelector("#tunnelWidthM"),
+  tunnelHeightM: document.querySelector("#tunnelHeightM"),
+  tunnelUpstreamM: document.querySelector("#tunnelUpstreamM"),
+  tunnelDownstreamM: document.querySelector("#tunnelDownstreamM"),
+  wheelSetupJson: document.querySelector("#wheelSetupJson"),
+  porousZonesJson: document.querySelector("#porousZonesJson"),
+  fanZonesJson: document.querySelector("#fanZonesJson"),
   caseName: document.querySelector("#caseName"),
   referenceArea: document.querySelector("#referenceArea"),
   referenceLength: document.querySelector("#referenceLength"),
+  cgX: document.querySelector("#cgX"),
+  cgY: document.querySelector("#cgY"),
+  cgZ: document.querySelector("#cgZ"),
+  frontAxleStation: document.querySelector("#frontAxleStation"),
+  rearAxleStation: document.querySelector("#rearAxleStation"),
   qualityPreset: document.querySelector("#qualityPreset"),
   simulationMode: document.querySelector("#simulationMode"),
+  sensitivityParameter: document.querySelector("#sensitivityParameter"),
+  sensitivityValues: document.querySelector("#sensitivityValues"),
+  sensitivityBaselineIndex: document.querySelector("#sensitivityBaselineIndex"),
+  createSensitivityButton: document.querySelector("#createSensitivityButton"),
+  sensitivityStatus: document.querySelector("#sensitivityStatus"),
   smallestFeatureMm: document.querySelector("#smallestFeatureMm"),
   createCaseButton: document.querySelector("#createCaseButton"),
   createStudyButton: document.querySelector("#createStudyButton"),
@@ -113,6 +153,10 @@ const els = {
   warnings: document.querySelector("#warnings"),
   caseStatus: document.querySelector("#caseStatus"),
   caseList: document.querySelector("#caseList"),
+  comparisonBaseline: document.querySelector("#comparisonBaseline"),
+  comparisonVariant: document.querySelector("#comparisonVariant"),
+  compareCasesButton: document.querySelector("#compareCasesButton"),
+  comparisonSummary: document.querySelector("#comparisonSummary"),
   canvas: document.querySelector("#flowCanvas"),
   modelCanvas: document.querySelector("#modelCanvas"),
   dragSummary: document.querySelector("#dragSummary"),
@@ -123,11 +167,13 @@ const els = {
 };
 
 async function boot() {
+  restoreViewMode();
   restoreViewerPreferences();
   const payload = await apiGet("/api/state");
   state.root = payload.root;
   state.sampleModel = payload.sampleModel;
   state.cases = payload.cases || [];
+  state.sensitivityParameters = payload.sensitivityParameters || {};
   state.activeCasePath = state.cases[0]?.path || null;
   state.activeRunProgress = state.cases[0]?.progress || null;
   els.rootPath.textContent = state.root;
@@ -135,9 +181,49 @@ async function boot() {
   await refreshSolverStatus();
   if (state.activeCasePath) await refreshCaseReport(state.activeCasePath);
   syncGroundControls();
+  syncAdvancedFlowControls();
   syncRotationOutputs();
   initFlowVisualization();
   startViewer();
+}
+
+els.basicModeButton.addEventListener("click", () => setViewMode("basic"));
+els.engineeringModeButton.addEventListener("click", () => setViewMode("engineering"));
+
+function restoreViewMode() {
+  let mode = "basic";
+  try {
+    if (window.localStorage.getItem(VIEW_MODE_STORAGE_KEY) === "engineering") mode = "engineering";
+  } catch (_error) {
+    // Basic remains the first-run view when storage is unavailable.
+  }
+  setViewMode(mode, false);
+}
+
+function setViewMode(mode, persist = true) {
+  const normalized = mode === "engineering" ? "engineering" : "basic";
+  state.viewMode = normalized;
+  document.body.dataset.viewMode = normalized;
+  const basic = normalized === "basic";
+  els.basicModeButton.classList.toggle("active", basic);
+  els.engineeringModeButton.classList.toggle("active", !basic);
+  els.basicModeButton.setAttribute("aria-pressed", String(basic));
+  els.engineeringModeButton.setAttribute("aria-pressed", String(!basic));
+  els.viewModeDescription.textContent = basic
+    ? "Guided airflow workflow with safe defaults"
+    : "Full setup, qualification, loads, and comparisons";
+  els.createCaseButton.textContent = basic ? "Prepare Airflow Case" : "Create OpenFOAM Case";
+  els.runCaseButton.textContent = basic ? "Calculate Airflow" : "Run Solver";
+  updateActionAvailability();
+  renderResultSummary();
+  if (state.solver) renderSolverStatus();
+  window.requestAnimationFrame(drawFlow);
+  if (!persist) return;
+  try {
+    window.localStorage.setItem(VIEW_MODE_STORAGE_KEY, normalized);
+  } catch (_error) {
+    // The selected view still works for this session when storage is unavailable.
+  }
 }
 
 els.modelFile.addEventListener("change", async () => {
@@ -235,6 +321,7 @@ els.createCaseButton.addEventListener("click", async () => {
       body: JSON.stringify(currentCasePayload()),
     });
     state.cases = payload.state.cases || [];
+    state.comparison = null;
     state.activeCasePath = payload.casePath;
     els.caseStatus.textContent = `Created ${payload.case.name}`;
     renderCases();
@@ -261,6 +348,7 @@ els.createStudyButton.addEventListener("click", async () => {
       body: JSON.stringify(currentCasePayload()),
     });
     state.cases = payload.state.cases || [];
+    state.comparison = null;
     state.activeCasePath = payload.selectedCasePath;
     state.caseReport = payload.report;
     els.caseStatus.textContent = "Created draft, standard, and fine accuracy cases";
@@ -273,13 +361,130 @@ els.createStudyButton.addEventListener("click", async () => {
   }
 });
 
+els.createSensitivityButton.addEventListener("click", async () => {
+  if (!state.modelPath) return;
+  setBusy(true, "Creating sensitivity study");
+  try {
+    if (state.report && !state.report.is_cfd_candidate) {
+      setBusy(true, "Preparing scan");
+      await prepareCurrentModel();
+      setBusy(true, "Creating sensitivity study");
+    }
+    const values = sensitivityValuesPayload();
+    const baselineIndex = optionalNumber(els.sensitivityBaselineIndex.value);
+    if (baselineIndex != null && (!Number.isInteger(baselineIndex) || baselineIndex < 0 || baselineIndex >= values.length)) {
+      throw new Error(`Baseline index must be a whole number from 0 to ${values.length - 1}.`);
+    }
+    const payload = await fetchJson("/api/sensitivity-study", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...currentCasePayload(),
+        sensitivityParameter: els.sensitivityParameter.value,
+        sensitivityValues: values,
+        sensitivityBaselineIndex: baselineIndex,
+      }),
+    });
+    state.cases = payload.state.cases || [];
+    state.comparison = null;
+    state.activeCasePath = payload.selectedCasePath;
+    state.caseReport = payload.report;
+    const study = payload.study || {};
+    els.sensitivityStatus.textContent = `Created ${study.casePaths?.length || values.length} ${study.parameterLabel || study.parameter} cases; baseline index ${study.baselineIndex}.`;
+    els.caseStatus.textContent = `Created sensitivity family ${study.studyId || ""}`.trim();
+    renderCases();
+    await refreshCaseReport(payload.selectedCasePath);
+  } catch (error) {
+    showError(error);
+    els.sensitivityStatus.textContent = error.message;
+  } finally {
+    setBusy(false);
+  }
+});
+
+function syncBasicSourceUpDirection() {
+  if (state.viewMode !== "basic") return;
+  const flowAxis = signedAxisName(els.sourceFlowDirection.value);
+  if (flowAxis === signedAxisName(els.sourceUpDirection.value)) {
+    els.sourceUpDirection.value = flowAxis === "z" ? "+y" : "+z";
+  }
+}
+
+function sensitivityValuesPayload() {
+  const tokens = String(els.sensitivityValues.value || "")
+    .split(/[\s,]+/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 12) {
+    throw new Error("Enter between 2 and 12 sensitivity values.");
+  }
+  const values = tokens.map(Number);
+  if (!values.every(Number.isFinite)) {
+    throw new Error("Sensitivity values must all be finite numbers.");
+  }
+  if (new Set(values).size !== values.length) {
+    throw new Error("Sensitivity values must be unique.");
+  }
+  return values;
+}
+
+function wheelSetupPayload() {
+  const text = String(els.wheelSetupJson.value || "").trim();
+  if (!text) return null;
+  const payload = JSON.parse(text);
+  if (!Array.isArray(payload)) throw new Error("Wheel setup JSON must be an array.");
+  return payload;
+}
+
+function volumeZonesPayload(input, label) {
+  const text = String(input.value || "").trim();
+  if (!text) return null;
+  const payload = JSON.parse(text);
+  if (!Array.isArray(payload)) throw new Error(`${label} JSON must be an array.`);
+  return payload;
+}
+
 function currentCasePayload() {
+  syncBasicSourceUpDirection();
   const smallestFeatureMm = optionalNumber(els.smallestFeatureMm.value);
   const includeGround = els.includeGround.checked;
+  const engineering = state.viewMode === "engineering";
+  const closedTunnel = engineering && els.closedTunnel.checked
+    ? {
+        width_m: optionalNumber(els.tunnelWidthM.value),
+        height_m: optionalNumber(els.tunnelHeightM.value),
+        upstream_m: optionalNumber(els.tunnelUpstreamM.value),
+        downstream_m: optionalNumber(els.tunnelDownstreamM.value),
+      }
+    : null;
   return {
     modelPath: state.modelPath,
     name: els.caseName.value,
     speedMph: Number(els.speedMph.value || 70),
+    airTemperatureC: optionalFiniteNumber(els.airTemperatureC.value),
+    airPressurePa: optionalNumber(els.airPressurePa.value),
+    airDensityKgM3: optionalNumber(els.airDensity.value),
+    kinematicViscosityM2S: optionalNumber(els.kinematicViscosity.value),
+    turbulenceIntensityPercent: optionalNumber(els.turbulenceIntensity.value),
+    turbulenceLengthScaleM: optionalNumber(els.turbulenceLengthScale.value),
+    yawDegrees: engineering ? optionalFiniteNumber(els.yawDegrees.value) : null,
+    crosswindMps: engineering ? optionalFiniteNumber(els.crosswindMps.value) : null,
+    roughnessHeightM: engineering
+      ? Math.max(0, Number(els.roughnessHeightMm.value || 0)) / 1000
+      : 0,
+    roughnessConstant: engineering ? Number(els.roughnessConstant.value || 0.5) : 0.5,
+    closedTunnel,
+    backflowSafeOutlet: engineering && els.backflowSafeOutlet.checked,
+    wheelSetup: engineering ? wheelSetupPayload() : null,
+    secondOrderTransient: engineering && els.secondOrderTransient.checked,
+    fluidProfile: engineering ? els.fluidProfile.value : "incompressible",
+    turbulenceModel: engineering ? els.turbulenceModel.value : "kOmegaSST",
+    porousZones: engineering
+      ? volumeZonesPayload(els.porousZonesJson, "Porous zones")
+      : null,
+    fanZones: engineering
+      ? volumeZonesPayload(els.fanZonesJson, "Fan zones")
+      : null,
     flowAxis: els.flowAxis.value,
     includeGround,
     movingGround: includeGround && els.movingGround.checked,
@@ -293,6 +498,13 @@ function currentCasePayload() {
     measuredHeightM: optionalNumber(els.targetHeight.value),
     referenceAreaM2: optionalNumber(els.referenceArea.value),
     referenceLengthM: optionalNumber(els.referenceLength.value),
+    centerOfGravityM: {
+      x: optionalFiniteNumber(els.cgX.value),
+      y: optionalFiniteNumber(els.cgY.value),
+      z: optionalFiniteNumber(els.cgZ.value),
+    },
+    frontAxleStationM: optionalFiniteNumber(els.frontAxleStation.value),
+    rearAxleStationM: optionalFiniteNumber(els.rearAxleStation.value),
     quality: els.qualityPreset.value,
     simulationMode: els.simulationMode.value,
     smallestAeroFeatureM: smallestFeatureMm != null
@@ -408,18 +620,85 @@ els.caseList.addEventListener("click", async (event) => {
   }
 });
 
+for (const select of [els.comparisonBaseline, els.comparisonVariant]) {
+  select.addEventListener("change", () => {
+    state.comparison = null;
+    renderComparisonControls();
+  });
+}
+
+els.compareCasesButton.addEventListener("click", async () => {
+  const baselineCasePath = els.comparisonBaseline.value;
+  const variantCasePath = els.comparisonVariant.value;
+  if (!baselineCasePath || !variantCasePath || baselineCasePath === variantCasePath) return;
+  els.compareCasesButton.disabled = true;
+  els.comparisonSummary.innerHTML = `<div class="comparison-status">Checking locked setup and qualified loads...</div>`;
+  try {
+    const payload = await fetchJson("/api/compare-cases", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baselineCasePath, variantCasePath }),
+    });
+    state.comparison = payload.comparison;
+    renderComparisonControls();
+  } catch (error) {
+    state.comparison = {
+      decisionSafe: false,
+      statusLabel: error.message,
+      coefficientDeltas: {},
+      balanceDeltas: {},
+      setupDifferences: [],
+      interpretation: "The comparison request did not complete.",
+    };
+  } finally {
+    renderComparisonControls();
+  }
+});
+
 for (const input of [
   els.speedMph,
+  els.airTemperatureC,
+  els.airPressurePa,
+  els.airDensity,
+  els.kinematicViscosity,
+  els.turbulenceIntensity,
+  els.turbulenceLengthScale,
   els.flowAxis,
   els.includeGround,
   els.movingGround,
   els.groundClearanceMm,
+  els.yawDegrees,
+  els.crosswindMps,
+  els.roughnessHeightMm,
+  els.roughnessConstant,
+  els.backflowSafeOutlet,
+  els.secondOrderTransient,
+  els.fluidProfile,
+  els.turbulenceModel,
+  els.porousZonesJson,
+  els.fanZonesJson,
+  els.closedTunnel,
+  els.tunnelWidthM,
+  els.tunnelHeightM,
+  els.tunnelUpstreamM,
+  els.tunnelDownstreamM,
+  els.wheelSetupJson,
   els.unitScale,
   els.targetLength,
   els.targetWidth,
   els.targetHeight,
+  els.referenceArea,
+  els.referenceLength,
+  els.cgX,
+  els.cgY,
+  els.cgZ,
+  els.frontAxleStation,
+  els.rearAxleStation,
   els.qualityPreset,
   els.simulationMode,
+  els.sensitivityParameter,
+  els.sensitivityValues,
+  els.sensitivityBaselineIndex,
   els.smallestFeatureMm,
 ]) {
   input.addEventListener("input", () => {
@@ -432,6 +711,37 @@ for (const input of [
 }
 
 els.includeGround.addEventListener("change", syncGroundControls);
+els.closedTunnel.addEventListener("change", () => {
+  if (els.closedTunnel.checked) els.includeGround.checked = true;
+  syncGroundControls();
+  syncAdvancedFlowControls();
+});
+els.simulationMode.addEventListener("change", () => {
+  syncAdvancedFlowControls();
+  renderReadiness();
+});
+els.fluidProfile.addEventListener("change", () => {
+  syncAdvancedFlowControls();
+  renderReadiness();
+});
+els.turbulenceModel.addEventListener("change", () => {
+  syncAdvancedFlowControls();
+  renderReadiness();
+});
+els.sensitivityParameter.addEventListener("change", () => {
+  const defaults = {
+    speed_mph: "50, 70, 90",
+    yaw_degrees: "-5, 0, 5",
+    crosswind_mps: "-3, 0, 3",
+    roughness_height_m: "0, 0.0005, 0.001",
+    ground_clearance_m: "0.05, 0.075, 0.1",
+    turbulence_intensity_percent: "0.5, 1, 2",
+  };
+  els.sensitivityValues.value = defaults[els.sensitivityParameter.value] || "";
+  els.sensitivityBaselineIndex.value = "";
+  els.sensitivityStatus.textContent = "";
+  renderReadiness();
+});
 
 function syncGroundControls() {
   const enabled = els.includeGround.checked;
@@ -439,8 +749,33 @@ function syncGroundControls() {
   els.groundClearanceMm.disabled = !enabled;
 }
 
+function syncAdvancedFlowControls() {
+  const tunnelEnabled = els.closedTunnel.checked;
+  for (const input of [
+    els.tunnelWidthM,
+    els.tunnelHeightM,
+    els.tunnelUpstreamM,
+    els.tunnelDownstreamM,
+  ]) {
+    input.disabled = !tunnelEnabled;
+  }
+  const hybridModel = els.turbulenceModel.value !== "kOmegaSST";
+  if (hybridModel) els.simulationMode.value = "transient";
+  const transient = els.simulationMode.value === "transient";
+  els.secondOrderTransient.disabled = !transient;
+  if (!transient) els.secondOrderTransient.checked = false;
+  els.roughnessHeightMm.disabled = hybridModel;
+  els.roughnessConstant.disabled = hybridModel;
+  if (hybridModel) {
+    els.roughnessHeightMm.value = "0";
+    els.roughnessConstant.value = "0.5";
+  }
+  els.speedMph.max = els.fluidProfile.value === "compressible_thermal" ? "1000" : "230";
+}
+
 for (const input of [els.sourceFlowDirection, els.sourceUpDirection]) {
   input.addEventListener("input", async () => {
+    if (input === els.sourceFlowDirection) syncBasicSourceUpDirection();
     await applyRotationChange();
   });
 }
@@ -1015,6 +1350,14 @@ function setupReadinessItems(report) {
   const speedMph = Number(els.speedMph.value);
   const speedMps = speedMph * 0.44704;
   const machNumber = speedMps / 343;
+  const engineering = state.viewMode === "engineering";
+  const fluidProfile = engineering ? els.fluidProfile.value : "incompressible";
+  const turbulenceModel = engineering ? els.turbulenceModel.value : "kOmegaSST";
+  const transientMode = els.simulationMode.value === "transient";
+  const hybridModel = turbulenceModel !== "kOmegaSST";
+  const roughnessHeightM = engineering
+    ? Math.max(0, Number(els.roughnessHeightMm.value || 0)) / 1000
+    : 0;
 
   if (!Number.isFinite(speedMph) || speedMph <= 0) {
     items.push({
@@ -1022,19 +1365,96 @@ function setupReadinessItems(report) {
       status: "fail",
       detail: "Enter a positive finite tunnel speed.",
     });
-  } else if (machNumber >= 0.3) {
+  } else if (fluidProfile === "incompressible" && machNumber >= 0.3) {
     items.push({
       label: "Flow regime",
       status: "fail",
-      detail: `${fmt(speedMph)} mph is Mach ${fmt(machNumber)}; the current incompressible solver is limited to below Mach 0.3.`,
+      detail: `${fmt(speedMph)} mph is approximately Mach ${fmt(machNumber)}; select the compressible + thermal profile at Mach 0.3 or above.`,
+    });
+  } else if (fluidProfile === "compressible_thermal") {
+    items.push({
+      label: "Flow regime",
+      status: "pass",
+      detail: `${fmt(speedMph)} mph is approximately Mach ${fmt(machNumber)}; the fluid profile solves absolute pressure and temperature.`,
     });
   } else {
     items.push({
       label: "Flow regime",
       status: "pass",
-      detail: `${fmt(speedMph)} mph is Mach ${fmt(machNumber)} in standard air; incompressible treatment is applicable.`,
+      detail: `${fmt(speedMph)} mph is approximately Mach ${fmt(machNumber)} in standard air; incompressible treatment is applicable.`,
     });
   }
+
+  const profileLabel = fluidProfile === "compressible_thermal"
+    ? "Compressible + thermal fluid"
+    : "Incompressible fluid";
+  let modelStatus = "pass";
+  let modelDetail = `${profileLabel}; ${turbulenceModel}`;
+  if (hybridModel && !transientMode) {
+    modelStatus = "fail";
+    modelDetail = `${turbulenceModel} requires a transient case.`;
+  } else if (hybridModel && roughnessHeightM > 0) {
+    modelStatus = "fail";
+    modelDetail = `${turbulenceModel} does not support the configured rough wall treatment.`;
+  } else if (hybridModel) {
+    modelDetail += "; transient mode enforced";
+  }
+  items.push({
+    label: "Solver model",
+    status: modelStatus,
+    detail: `${modelDetail}.`,
+  });
+
+  if (engineering) {
+    try {
+      const porousZones = volumeZonesPayload(els.porousZonesJson, "Porous zones") || [];
+      const fanZones = volumeZonesPayload(els.fanZonesJson, "Fan zones") || [];
+      const zoneCount = porousZones.length + fanZones.length;
+      items.push({
+        label: "Volume zones",
+        status: "pass",
+        detail: zoneCount
+          ? `${porousZones.length} porous and ${fanZones.length} fan zone${zoneCount === 1 ? "" : "s"} will be generated from explicit solver-coordinate boxes.`
+          : "No porous or fan volume zones are configured.",
+      });
+    } catch (error) {
+      items.push({
+        label: "Volume zones",
+        status: "fail",
+        detail: error instanceof Error ? error.message : "Volume-zone JSON is invalid.",
+      });
+    }
+  }
+
+  const airTemperatureC = optionalFiniteNumber(els.airTemperatureC.value);
+  const airPressurePa = optionalNumber(els.airPressurePa.value);
+  const airDensity = optionalNumber(els.airDensity.value);
+  const viscosity = optionalNumber(els.kinematicViscosity.value);
+  const turbulenceIntensity = optionalNumber(els.turbulenceIntensity.value);
+  const turbulenceLength = optionalNumber(els.turbulenceLengthScale.value);
+  const atmosphereValid = airTemperatureC != null
+    && airTemperatureC >= -123.15
+    && airTemperatureC <= 126.85
+    && airPressurePa > 0
+    && (airDensity == null || airDensity > 0)
+    && (viscosity == null || viscosity > 0);
+  items.push({
+    label: "Air properties",
+    status: atmosphereValid ? "pass" : "fail",
+    detail: atmosphereValid
+      ? `${fmt(airTemperatureC)} C and ${formatInt(airPressurePa)} Pa; density and viscosity are ${airDensity || viscosity ? "manually overridden where entered" : "derived and written to OpenFOAM"}.`
+      : "Enter a supported dry-air temperature, positive absolute pressure, and positive optional density/viscosity overrides.",
+  });
+  const turbulenceValid = turbulenceIntensity > 0
+    && turbulenceIntensity <= 50
+    && (turbulenceLength == null || turbulenceLength > 0);
+  items.push({
+    label: "Inlet turbulence",
+    status: turbulenceValid ? "pass" : "fail",
+    detail: turbulenceValid
+      ? `${fmt(turbulenceIntensity)}% intensity; ${turbulenceLength ? `${fmt(turbulenceLength)} m` : "7% of reference length"} length scale.`
+      : "Set turbulence intensity above 0% and at most 50%, with a positive optional length scale.",
+  });
 
   if (Math.abs(dot3(sourceFlow, sourceUp)) > 1e-9) {
     items.push({
@@ -1129,7 +1549,7 @@ function setupReadinessItems(report) {
     items.push({
       label: "Measured dimensions",
       status: "warn",
-      detail: `STL coordinates calculate ${fmt(actual.length)} x ${fmt(actual.width)} x ${fmt(actual.height)} m. Enter independent tape/CAD ${dimensionCheck.missingLabels.join(", ").toLowerCase()} values before an accuracy study can be verified.`,
+      detail: `STL coordinates calculate ${fmt(actual.length)} x ${fmt(actual.width)} x ${fmt(actual.height)} m. Enter independent tape/CAD ${dimensionCheck.missingLabels.join(", ").toLowerCase()} values before an accuracy study can be numerically qualified.`,
     });
   }
 
@@ -1174,6 +1594,44 @@ function setupReadinessItems(report) {
       label: "Aero references",
       status: "warn",
       detail: "Using automatic triangle-silhouette area and flow-axis length.",
+    });
+  }
+
+  const cgValues = [els.cgX, els.cgY, els.cgZ].map((input) => optionalFiniteNumber(input.value));
+  const cgCount = cgValues.filter((value) => value != null).length;
+  const axleValues = [
+    optionalFiniteNumber(els.frontAxleStation.value),
+    optionalFiniteNumber(els.rearAxleStation.value),
+  ];
+  const axleCount = axleValues.filter((value) => value != null).length;
+  if (cgCount === 0 && axleCount === 0) {
+    items.push({
+      label: "Vehicle datums",
+      status: "warn",
+      detail: "Moments will use the geometry center; enter solver-coordinate CG and both axle stations to qualify aero balance.",
+    });
+  } else if (cgCount !== 3 || axleCount === 1 || (axleCount && cgCount !== 3)) {
+    items.push({
+      label: "Vehicle datums",
+      status: "fail",
+      detail: "Enter all three CG coordinates together and provide front/rear axle stations as a pair.",
+    });
+  } else if (axleCount === 0) {
+    items.push({
+      label: "Vehicle datums",
+      status: "warn",
+      detail: "CG qualifies the moment reference, but front/rear axle stations are still required for aero balance.",
+    });
+  } else {
+    const cgStation = cgValues[flowAxisIndex()];
+    const [frontAxle, rearAxle] = axleValues;
+    const validOrder = frontAxle < cgStation && cgStation < rearAxle;
+    items.push({
+      label: "Vehicle datums",
+      status: validOrder ? "pass" : "fail",
+      detail: validOrder
+        ? `CG lies between axle stations along +${els.flowAxis.value.toUpperCase()}; wheelbase ${fmt(rearAxle - frontAxle)} m.`
+        : `Require front axle < CG < rear axle along solver +${els.flowAxis.value.toUpperCase()}.`,
     });
   }
 
@@ -1263,7 +1721,6 @@ function setupReadinessItems(report) {
   }
 
   const quality = els.qualityPreset.value;
-  const transientMode = els.simulationMode.value === "transient";
   items.push({
     label: "Flow solution",
     status: transientMode ? "pass" : "warn",
@@ -1427,38 +1884,124 @@ function setupReadinessItems(report) {
     items.push({
       label: "Solver result",
       status: "fail",
-      detail: failedChecks ? `Unverified: ${failedChecks}.` : "The selected run is not verified.",
+      detail: failedChecks ? `Qualification failed: ${failedChecks}.` : "The selected run is not numerically qualified.",
     });
   } else if (state.activeCasePath) {
     items.push({
       label: "Solver result",
       status: "warn",
-      detail: "The selected case has not completed a verified solver run.",
+      detail: "The selected case has not completed a numerically qualified solver run.",
     });
   }
 
   const grid = state.caseReport?.gridConvergence;
   if (grid?.validated) {
     items.push({
-      label: "Grid independence",
+      label: "Mesh sensitivity",
       status: "pass",
-      detail: `Draft, standard, and fine runs agree; fine-grid Cd ${fmt(grid.recommendedCd)} and Cl ${fmt(grid.recommendedCl)}.`,
+      detail: `Within mesh-sensitivity threshold; fine-grid Cd ${fmt(grid.recommendedCd)} and Cl ${fmt(grid.recommendedCl)}.`,
     });
   } else if (grid?.status === "failed") {
     const reason = grid.checks?.find((check) => check.status === "fail")?.detail || "The mesh-sensitivity study failed.";
-    items.push({ label: "Grid independence", status: "fail", detail: reason });
+    items.push({ label: "Mesh sensitivity", status: "fail", detail: reason });
   } else if (grid) {
     const completed = grid.levels?.filter((level) => level.trusted).length || 0;
     items.push({
-      label: "Grid independence",
+      label: "Mesh sensitivity",
       status: "warn",
-      detail: `${completed}/3 study runs verified; complete draft, standard, and fine cases.`,
+      detail: `${completed}/3 study runs numerically qualified; complete draft, standard, and fine cases.`,
     });
   } else {
     items.push({
-      label: "Grid independence",
+      label: "Mesh sensitivity",
       status: "warn",
-      detail: "Create an accuracy study before treating force coefficients as mesh-independent.",
+      detail: "Create an accuracy study before treating force coefficients as within the mesh-sensitivity threshold.",
+    });
+  }
+
+  const transientStatistics = state.caseReport?.transientStatistics;
+  if (transientStatistics?.overall_evidence) {
+    const overall = transientStatistics.overall_evidence;
+    const channels = transientStatistics.channels || {};
+    const effectiveCounts = Object.values(channels)
+      .map((channel) => Number(channel?.effective_sample_count))
+      .filter(Number.isFinite);
+    const minimumEffective = effectiveCounts.length ? Math.min(...effectiveCounts) : null;
+    items.push({
+      label: "Statistical stationarity",
+      status: overall.stationarity_supported === true
+        ? "pass"
+        : overall.stationarity_supported === false
+          ? "fail"
+          : "warn",
+      detail: overall.stationarity_supported === true
+        ? "No requested channel has statistically resolved half-window or linear drift at the configured confidence level; this supports, but does not prove, stationarity."
+        : overall.stationarity_supported === false
+          ? "At least one requested channel has statistically resolved drift; extend or revise the retained averaging window."
+          : "The retained history is too short or too correlated to assess stationarity reliably.",
+    });
+    items.push({
+      label: "Effective samples",
+      status: overall.minimum_effective_samples_30 === true
+        ? "pass"
+        : overall.minimum_effective_samples_30 === false
+          ? "fail"
+          : "warn",
+      detail: minimumEffective != null
+        ? `Minimum autocorrelation-adjusted effective sample count is ${fmt(minimumEffective)}; at least 30 are required in every requested channel.`
+        : "Effective sample counts are unavailable for the retained transient history.",
+    });
+    const confidenceSummaries = ["Cd", "Cl", "Cs", "CmPitch", "frontAeroBalancePercent"]
+      .map((name) => [name, channels[name]])
+      .filter(([, channel]) => channel?.confidence_interval?.lower != null && channel?.confidence_interval?.upper != null)
+      .slice(0, 4)
+      .map(([name, channel]) => `${name} ${fmt(channel.mean)} [${fmt(channel.confidence_interval.lower)}, ${fmt(channel.confidence_interval.upper)}]`);
+    items.push({
+      label: "Mean confidence intervals",
+      status: confidenceSummaries.length ? "pass" : "warn",
+      detail: confidenceSummaries.length
+        ? `Autocorrelation-adjusted 95% evidence: ${confidenceSummaries.join("; ")}.`
+        : "No autocorrelation-adjusted confidence intervals are available yet.",
+    });
+    const meaningfulPeaks = Object.entries(channels)
+      .filter(([, channel]) => channel?.spectrum?.meaningful_peak)
+      .map(([name, channel]) => ({ name, ...channel.spectrum }));
+    const peakCoverage = overall.meaningful_peak_has_at_least_10_cycles;
+    items.push({
+      label: "Spectral cycle coverage",
+      status: meaningfulPeaks.length ? (peakCoverage === true ? "pass" : "fail") : "pass",
+      detail: meaningfulPeaks.length
+        ? meaningfulPeaks.slice(0, 4).map((peak) => `${peak.name} ${fmt(peak.dominant_frequency_hz)} Hz, ${fmt(peak.cycle_coverage)} cycles${peak.strouhal_number == null ? "" : `, St ${fmt(peak.strouhal_number)}`}`).join("; ")
+        : "No meaningful coherent spectral peak was detected, so the 10-cycle peak-coverage gate is not applicable.",
+    });
+  } else if (state.activeCasePath && els.simulationMode.value === "transient") {
+    items.push({
+      label: "Transient statistics",
+      status: "warn",
+      detail: "Run the transient case to evaluate washout, stationarity, effective samples, confidence intervals, and spectral cycle coverage.",
+    });
+  }
+
+  const sensitivityStudy = state.caseReport?.sensitivityStudy;
+  if (sensitivityStudy) {
+    const familyStatus = String(sensitivityStudy.status || "pending").replaceAll("_", " ");
+    items.push({
+      label: "Sensitivity family",
+      status: sensitivityStudy.parameterControlled
+        ? sensitivityStudy.complete ? "pass" : "warn"
+        : "fail",
+      detail: `${sensitivityStudy.parameterLabel || sensitivityStudy.parameter} varies across ${sensitivityStudy.records?.length || 0}/${sensitivityStudy.values?.length || 0} members; setup lock ${sensitivityStudy.planLockVerified ? "verified" : "unverified"}; recorded values ${sensitivityStudy.parameterValuesVerified ? "verified" : "do not match cases"}; status ${familyStatus}.`,
+    });
+    items.push({
+      label: "Sensitivity decision evidence",
+      status: sensitivityStudy.decisionSafeSensitivity
+        ? "pass"
+        : sensitivityStudy.status === "plan_lock_mismatch"
+          ? "fail"
+          : "warn",
+      detail: sensitivityStudy.decisionSafeSensitivity
+        ? "Every member is numerically qualified and statistically ready; baseline difference intervals may be interpreted within this tested family."
+        : `Numerical qualification: ${sensitivityStudy.allNumericallyQualified ? "complete" : "incomplete"}; statistical evidence: ${sensitivityStudy.allStatisticallyReady ? "complete" : "incomplete"}. These remain separate gates.`,
     });
   }
 
@@ -1722,6 +2265,7 @@ function renderWarnings() {
 function renderCases() {
   if (!state.cases.length) {
     els.caseList.innerHTML = `<div class="case-item"><div><strong>No cases yet</strong><span>${state.root}</span></div><span></span></div>`;
+    renderComparisonControls();
     return;
   }
   els.caseList.innerHTML = state.cases
@@ -1730,11 +2274,16 @@ function renderCases() {
       const progress = item.progress || fallbackCaseProgress(item.status);
       const percent = clamp(Number(progress.percent || 0), 0, 100);
       const percentageLabel = progress.state === "ready" ? "Not run" : `${Math.round(percent)}%`;
+      const studyDetail = item.studyLevel
+        ? `${item.studyLevel} accuracy study | ${item.path}`
+        : item.sensitivityParameter
+          ? `${item.sensitivityParameterLabel || item.sensitivityParameter} ${fmt(item.sensitivityValue)}${item.sensitivityUnit ? ` ${item.sensitivityUnit}` : ""}${item.sensitivityBaseline ? " | baseline" : ""} | ${item.path}`
+          : item.path;
       return `
         <div class="case-item tone-${escapeAttr(progress.tone || "ready")}">
           <div>
             <strong>${escapeHtml(item.name)}</strong>
-            <span>${escapeHtml(item.studyLevel ? `${item.studyLevel} study | ${item.path}` : item.path)}</span>
+            <span>${escapeHtml(studyDetail)}</span>
           </div>
           <div class="case-state-block">
             <div class="case-state-line">
@@ -1750,11 +2299,91 @@ function renderCases() {
       `;
     })
     .join("");
+  renderComparisonControls();
+}
+
+function renderComparisonControls() {
+  const paths = new Set(state.cases.map((item) => item.path));
+  const previousBaseline = els.comparisonBaseline.value;
+  const previousVariant = els.comparisonVariant.value;
+  const options = state.cases
+    .map((item) => `<option value="${escapeAttr(item.path)}">${escapeHtml(item.name)}</option>`)
+    .join("");
+  els.comparisonBaseline.innerHTML = options;
+  els.comparisonVariant.innerHTML = options;
+  if (paths.has(previousBaseline)) els.comparisonBaseline.value = previousBaseline;
+  else if (state.cases[1]) els.comparisonBaseline.value = state.cases[1].path;
+  if (paths.has(previousVariant)) els.comparisonVariant.value = previousVariant;
+  else if (state.cases[0]) els.comparisonVariant.value = state.cases[0].path;
+  const comparable = state.cases.length >= 2
+    && els.comparisonBaseline.value
+    && els.comparisonVariant.value
+    && els.comparisonBaseline.value !== els.comparisonVariant.value;
+  els.compareCasesButton.disabled = !comparable;
+
+  const comparison = state.comparison;
+  if (!comparison) {
+    els.comparisonSummary.innerHTML = "";
+    return;
+  }
+  const deltas = comparison.coefficientDeltas || {};
+  const balance = comparison.balanceDeltas || {};
+  const rows = [
+    ["Cd", deltas.Cd],
+    ["Cl", deltas.Cl],
+    ["Cs", deltas.Cs],
+    ["CmPitch", deltas.CmPitch],
+    ["Front balance", balance.frontAeroBalancePercent, "%"],
+  ].filter(([, value]) => value?.delta != null);
+  const statistical = comparison.statisticalDeltas || {};
+  const statisticalRows = [
+    ["Cd", statistical.Cd],
+    ["Cl", statistical.Cl],
+    ["Cs", statistical.Cs],
+    ["CmPitch", statistical.CmPitch],
+    ["Front balance", statistical.frontAeroBalancePercent, "%"],
+  ].filter(([, value]) => value?.delta != null);
+  const mismatch = Array.isArray(comparison.setupDifferences)
+    ? comparison.setupDifferences.slice(0, 4)
+    : [];
+  els.comparisonSummary.innerHTML = `
+    <div class="comparison-status ${comparison.decisionSafe ? "pass" : "fail"}">
+      ${escapeHtml(comparison.statusLabel || comparison.status || "Comparison")}
+    </div>
+    <div class="comparison-status ${comparison.statisticalDecisionSafe ? "pass" : "fail"}">
+      ${escapeHtml(comparison.statisticalStatusLabel || comparison.statisticalStatus || "Statistical evidence pending")}
+    </div>
+    ${rows.map(([label, value, unit = ""]) => `
+      <div class="comparison-delta">
+        <span>${escapeHtml(label)}</span>
+        <strong>${fmt(value.delta)}${unit} (${value.percentDelta == null ? "n/a" : `${fmt(value.percentDelta)}%`})</strong>
+      </div>
+    `).join("")}
+    ${statisticalRows.map(([label, value, unit = ""]) => {
+      const interval = value.confidenceLower != null && value.confidenceUpper != null
+        ? `[${fmt(value.confidenceLower)}, ${fmt(value.confidenceUpper)}]${unit}`
+        : "CI unavailable";
+      const resolution = value.statisticallyResolved == null
+        ? "resolution unavailable"
+        : value.statisticallyResolved
+          ? "interval excludes zero"
+          : "interval includes zero";
+      const gate = comparison.statisticalDecisionSafe ? "" : " | evidence gate pending";
+      return `
+        <div class="comparison-delta statistical-delta">
+          <span>${escapeHtml(label)} 95% difference</span>
+          <strong>${fmt(value.delta)}${unit} | ${escapeHtml(interval)} | ${escapeHtml(resolution + gate)} | N_eff ${fmt(value.baselineEffectiveSamples)} / ${fmt(value.variantEffectiveSamples)}</strong>
+        </div>
+      `;
+    }).join("")}
+    ${mismatch.length ? `<div class="comparison-mismatch"><strong>Lock mismatches</strong><br>${mismatch.map((item) => escapeHtml(item.field)).join("<br>")}</div>` : ""}
+    <div class="comparison-mismatch">${escapeHtml(comparison.interpretation || "")}</div>
+  `;
 }
 
 function fallbackCaseProgress(status) {
   if (status === "solver_verified") {
-    return { state: "complete", tone: "verified", percent: 100, label: "Complete - verified" };
+    return { state: "complete", tone: "verified", percent: 100, label: "Complete - qualified" };
   }
   if (status === "solver_unverified") {
     return { state: "complete", tone: "review", percent: 100, label: "Complete - review checks" };
@@ -1799,6 +2428,7 @@ function applyRunProgress(casePath, progress) {
       els.modelStatus.textContent = "CFD complete - loading solved airflow";
     }
   }
+  renderResultSummary();
   renderCases();
 }
 
@@ -1905,6 +2535,17 @@ function restoreCaseContext(report) {
   const quality = setup.quality || {};
   const units = setup.units || {};
   const reference = report.aerodynamicReference || {};
+  const physical = report.physicalModel || setup.physicalModel || {};
+  const fluid = physical.fluid || {};
+  const inflow = physical.inflow || {};
+  const surface = physical.surface || {};
+  const domain = physical.domain || {};
+  const outlet = physical.outlet || {};
+  const roadAndWheels = physical.road_and_wheels || {};
+  const transient = physical.transient || {};
+  const turbulence = physical.turbulence || {};
+  const volumeZones = physical.volume_zones || {};
+  const datums = report.vehicleDatums || setup.vehicleDatums || {};
 
   state.report = geometry;
   state.repair = null;
@@ -1914,6 +2555,67 @@ function restoreCaseContext(report) {
   setModelRotation(orientation.rotation_degrees || {});
   els.flowAxis.value = orientation.target_flow_axis || flow.axis || "x";
   els.speedMph.value = flow.speed_mph ?? 70;
+  els.airTemperatureC.value = fluid.temperature_c ?? flow.air_temperature_c ?? 15;
+  els.airPressurePa.value = fluid.pressure_pa ?? flow.air_pressure_pa ?? 101325;
+  els.airDensity.value = fluid.property_source === "manual_override"
+    ? String(fluid.density_kg_m3 ?? "")
+    : "";
+  els.kinematicViscosity.value = fluid.property_source === "manual_override"
+    ? String(fluid.kinematic_viscosity_m2_s ?? "")
+    : "";
+  els.turbulenceIntensity.value = inflow.turbulence_intensity_percent ?? 1;
+  els.turbulenceLengthScale.value = inflow.turbulence_length_scale_source === "manual"
+    ? String(inflow.turbulence_length_scale_m ?? "")
+    : "";
+  els.yawDegrees.value = String(inflow.yaw_degrees ?? "");
+  els.crosswindMps.value = "";
+  els.roughnessHeightMm.value = String(Math.max(0, Number(surface.roughness_height_m || 0)) * 1000);
+  els.roughnessConstant.value = String(surface.roughness_constant ?? 0.5);
+  els.backflowSafeOutlet.checked = Boolean(outlet.backflow_safe);
+  els.secondOrderTransient.checked = Boolean(transient.second_order_temporal);
+  els.fluidProfile.value = fluid.profile
+    || (setup.solverModule === "fluid" ? "compressible_thermal" : "incompressible");
+  els.turbulenceModel.value = turbulence.model || "kOmegaSST";
+  const closedTunnel = domain.mode === "closed_tunnel" ? domain.closed_tunnel || {} : null;
+  els.closedTunnel.checked = Boolean(closedTunnel);
+  els.tunnelWidthM.value = closedTunnel?.width_m != null ? String(closedTunnel.width_m) : "";
+  els.tunnelHeightM.value = closedTunnel?.height_m != null ? String(closedTunnel.height_m) : "";
+  els.tunnelUpstreamM.value = closedTunnel?.upstream_m != null ? String(closedTunnel.upstream_m) : "";
+  els.tunnelDownstreamM.value = closedTunnel?.downstream_m != null ? String(closedTunnel.downstream_m) : "";
+  const wheels = Array.isArray(roadAndWheels.wheels)
+    ? roadAndWheels.wheels.map((wheel) => ({
+        name: wheel.name,
+        model_path: wheel.model_path,
+        center_source: wheel.source_center,
+        axis_source: wheel.source_axis,
+        radius_source: wheel.source_radius,
+        surface_speed_mps: wheel.surface_speed_mps,
+      }))
+    : [];
+  els.wheelSetupJson.value = wheels.length ? JSON.stringify(wheels, null, 2) : "";
+  const porousZones = Array.isArray(volumeZones.porous_zones)
+    ? volumeZones.porous_zones.map((zone) => ({
+        name: zone.name,
+        minimum_m: zone.minimum_m,
+        maximum_m: zone.maximum_m,
+        darcy_d_per_m2: zone.darcy_d_per_m2,
+        forchheimer_f_per_m: zone.forchheimer_f_per_m,
+      }))
+    : [];
+  const fanZones = Array.isArray(volumeZones.fan_zones)
+    ? volumeZones.fan_zones.map((zone) => ({
+        name: zone.name,
+        minimum_m: zone.minimum_m,
+        maximum_m: zone.maximum_m,
+        disk_direction: zone.disk_direction,
+        power_coefficient: zone.power_coefficient,
+        thrust_coefficient: zone.thrust_coefficient,
+        disk_area_m2: zone.disk_area_m2,
+        upstream_point_m: zone.upstream_point_m,
+      }))
+    : [];
+  els.porousZonesJson.value = porousZones.length ? JSON.stringify(porousZones, null, 2) : "";
+  els.fanZonesJson.value = fanZones.length ? JSON.stringify(fanZones, null, 2) : "";
   els.includeGround.checked = Boolean(ground.enabled);
   els.movingGround.checked = Boolean(ground.moving);
   els.groundClearanceMm.value = String(Math.max(0, Number(ground.clearance_m || 0)) * 1000);
@@ -1921,6 +2623,20 @@ function restoreCaseContext(report) {
   if (quality.name) els.qualityPreset.value = quality.name;
   const simulationMode = String(quality.simulation_mode || setup.simulationType || "steady");
   els.simulationMode.value = simulationMode.startsWith("transient") ? "transient" : "steady";
+  syncAdvancedFlowControls();
+  const sensitivity = report.sensitivityStudy;
+  if (sensitivity?.parameter) {
+    els.sensitivityParameter.value = sensitivity.parameter;
+    if (Array.isArray(sensitivity.values)) {
+      els.sensitivityValues.value = sensitivity.values.join(", ");
+    }
+    els.sensitivityBaselineIndex.value = sensitivity.baselineIndex != null
+      ? String(sensitivity.baselineIndex)
+      : "";
+    els.sensitivityStatus.textContent = `${sensitivity.parameterLabel || sensitivity.parameter}: ${String(sensitivity.status || "pending").replaceAll("_", " ")}`;
+  } else {
+    els.sensitivityStatus.textContent = "";
+  }
 
   const unitScale = Number(units.scale_to_meters || 1);
   const solvedBounds = report.scaledGeometryReport?.bounds?.dimensions;
@@ -1936,34 +2652,47 @@ function restoreCaseContext(report) {
   els.targetHeight.value = measured.height_m != null ? String(measured.height_m) : "";
   els.referenceArea.value = reference.area_source === "manual" ? String(reference.area_m2 || "") : "";
   els.referenceLength.value = reference.length_source === "manual" ? String(reference.length_m || "") : "";
+  const cg = datums.center_of_gravity_m || {};
+  els.cgX.value = cg.x != null ? String(cg.x) : "";
+  els.cgY.value = cg.y != null ? String(cg.y) : "";
+  els.cgZ.value = cg.z != null ? String(cg.z) : "";
+  els.frontAxleStation.value = datums.front_axle_station_m != null
+    ? String(datums.front_axle_station_m)
+    : "";
+  els.rearAxleStation.value = datums.rear_axle_station_m != null
+    ? String(datums.rear_axle_station_m)
+    : "";
   const storedFeature = Number(report.meshResolution?.smallest_aero_feature_m || 0);
   els.smallestFeatureMm.value = storedFeature > 0 ? String(storedFeature * 1000) : "";
   els.caseName.value = report.caseName || basename(state.modelPath || "case");
   els.fileLabel.textContent = basename(state.modelPath || "case.stl");
   const fidelityBlocked = report.geometryFidelity?.verified === false;
   const geometryCandidate = geometry.is_cfd_candidate && !fidelityBlocked;
-  const verifiedCfd = Boolean(report.qualityAssessment?.trusted) && geometryCandidate;
+  const qualifiedCfd = Boolean(
+    report.qualityAssessment?.numericallyQualified ?? report.qualityAssessment?.trusted,
+  ) && geometryCandidate;
   const runProgress = report.runProgress;
   els.candidateBadge.textContent = runProgress?.isRunning
     ? `${Math.round(runProgress.percent || 0)}%`
-    : verifiedCfd
-      ? "Verified CFD"
+    : qualifiedCfd
+      ? "Qualified CFD"
       : runProgress?.isComplete
         ? "CFD Review"
         : fidelityBlocked
-          ? "Repair Unverified"
+          ? "Repair Fidelity Missing"
           : geometryCandidate
             ? "Preview"
             : "Cleanup";
   els.candidateBadge.className = runProgress?.isRunning
     ? "badge running"
-    : verifiedCfd
+    : qualifiedCfd
       ? "badge"
       : runProgress?.isComplete || !geometryCandidate
         ? "badge warn"
         : "badge muted";
   els.createCaseButton.disabled = fidelityBlocked;
   els.createStudyButton.disabled = fidelityBlocked;
+  els.createSensitivityButton.disabled = fidelityBlocked;
   els.prepareScanButton.disabled = true;
   renderMetrics();
   renderWarnings();
@@ -1976,7 +2705,11 @@ function renderSolverStatus() {
   const unavailable = preferred === "none" && wslMessage.toLowerCase().includes("not installed")
     ? "unavailable (WSL2 not installed)"
     : preferred;
-  els.solverStatus.textContent = `Solver: ${unavailable}${version ? ` (${version})` : ""}`;
+  els.solverStatus.textContent = state.viewMode === "basic"
+    ? preferred === "none"
+      ? "Airflow solver unavailable. Open Engineering for setup details."
+      : "Airflow solver ready."
+    : `Solver: ${unavailable}${version ? ` (${version})` : ""}`;
   renderReadiness();
 }
 
@@ -1997,9 +2730,14 @@ function updateActionAvailability() {
     : "Automatic alignment needs a clearly vehicle-shaped model";
   els.createCaseButton.disabled = state.busy || !usableModel || dimensionStatus === "fail";
   els.createStudyButton.disabled = state.busy || !usableModel || dimensionStatus !== "pass";
-  els.createCaseButton.textContent = usableModel && !geometryCandidate
-    ? "Prepare + Create Case"
-    : "Create OpenFOAM Case";
+  els.createSensitivityButton.disabled = state.busy || !usableModel || dimensionStatus === "fail";
+  els.createCaseButton.textContent = state.viewMode === "basic"
+    ? usableModel && !geometryCandidate
+      ? "Prepare + Set Up Airflow"
+      : "Set Up Airflow"
+    : usableModel && !geometryCandidate
+      ? "Prepare + Create Case"
+      : "Create OpenFOAM Case";
   els.prepareScanButton.disabled = state.busy
     || !report
     || report.is_cfd_candidate
@@ -2010,7 +2748,98 @@ function updateActionAvailability() {
   els.runCaseButton.disabled = state.busy || !state.activeCasePath || state.solver?.preferredBackend == null;
 }
 
+function basicAirflowState() {
+  const progress = state.activeRunProgress || state.caseReport?.runProgress;
+  const solvedTracks = Number(state.caseReport?.solverStreamlines?.lineCount || 0);
+  const solvedSurface = Boolean(state.caseReport?.surfacePressure?.hasPressure);
+  const coefficients = state.caseReport?.forceCoeffs;
+  const assessment = state.caseReport?.qualityAssessment;
+  const qualified = Boolean(assessment?.numericallyQualified ?? assessment?.trusted);
+
+  if (solvedTracks > 0) {
+    return {
+      tone: qualified ? "pass" : "warn",
+      title: "Calculated airflow ready",
+      short: "Calculated airflow is displayed.",
+      detail: qualified
+        ? "The moving paths come from the completed OpenFOAM result, and the run passed its numerical checks."
+        : "The moving paths come from the completed OpenFOAM result. Review numerical checks in Engineering before using it for design decisions.",
+    };
+  }
+  if (progress?.isRunning) {
+    return {
+      tone: "running",
+      title: "Calculating airflow",
+      short: "Airflow calculation is in progress.",
+      detail: "The moving paths remain a visual preview until solved airflow tracks are available.",
+    };
+  }
+  if (progress?.state === "failed") {
+    return {
+      tone: "warn",
+      title: "Calculation did not finish",
+      short: "Airflow calculation needs attention.",
+      detail: "The viewer is showing preview paths, not solved airflow. Open Engineering for the run details.",
+    };
+  }
+  if (progress?.isMeshComplete) {
+    return {
+      tone: "running",
+      title: "Model preparation complete",
+      short: "The model is ready for airflow calculation.",
+      detail: "Choose Calculate Airflow to replace the visual preview with solver results.",
+    };
+  }
+  if (progress?.isComplete || coefficients) {
+    return {
+      tone: "warn",
+      title: solvedSurface ? "Surface result ready" : "Calculation finished",
+      short: solvedSurface ? "Solved surface airflow is displayed." : "Solved airflow paths are unavailable.",
+      detail: solvedSurface
+        ? "The surface coloring is calculated, but the moving paths are still a preview because solved tracks were not exported."
+        : "The current moving paths are a preview. Open Engineering to inspect the completed run and missing output.",
+    };
+  }
+  if (state.activeCasePath) {
+    return {
+      tone: "running",
+      title: "Ready to calculate",
+      short: "Airflow setup is ready.",
+      detail: "The moving paths are a visual preview. Choose Calculate Airflow for solver-generated paths.",
+    };
+  }
+  if (state.report) {
+    return {
+      tone: "running",
+      title: "Preview airflow",
+      short: "Preview airflow is displayed.",
+      detail: "These moving paths are a visual guide around the model, not CFD results. Set up and calculate airflow for solved tracks.",
+    };
+  }
+  return {
+    tone: "",
+    title: "Load a model to begin",
+    short: "",
+    detail: "Choose an STL file or load the sample to see an airflow preview.",
+  };
+}
+
+function renderBasicAirflowSummary(summary = basicAirflowState()) {
+  els.basicAirflowSummary.className = `basic-airflow-summary${summary.tone ? ` ${summary.tone}` : ""}`;
+  els.basicAirflowSummary.innerHTML = `
+    <strong>${summary.title}</strong>
+    <p>${summary.detail}</p>
+  `;
+}
+
 function renderResultSummary() {
+  const basicSummary = basicAirflowState();
+  renderBasicAirflowSummary(basicSummary);
+  if (state.viewMode === "basic") {
+    els.resultSummary.textContent = basicSummary.short;
+    return;
+  }
+
   const coeffs = state.caseReport?.forceCoeffs;
   const forces = state.caseReport?.aerodynamicForces;
   const assessment = state.caseReport?.qualityAssessment;
@@ -2031,22 +2860,56 @@ function renderResultSummary() {
   const cd = coeffs.meanCd ?? coeffs.Cd ?? "n/a";
   const cl = coeffs.meanCl ?? coeffs.Cl ?? "n/a";
   const samples = coeffs.statistics?.sampleCount || 0;
-  const status = assessment?.trusted ? "verified" : "unverified";
+  const qualified = assessment?.numericallyQualified ?? assessment?.trusted;
+  const status = qualified ? "numerically qualified" : "qualification incomplete";
   const yPlus = state.caseReport?.yPlus?.body?.average;
   const tracks = state.caseReport?.solverStreamlines?.lineCount || 0;
   const grid = state.caseReport?.gridConvergence;
+  const transientStatistics = state.caseReport?.transientStatistics;
+  const statisticalOverall = transientStatistics?.overall_evidence;
+  const statisticalChannels = transientStatistics?.channels || {};
+  const cdStatistics = statisticalChannels.Cd;
+  const meaningfulPeak = Object.entries(statisticalChannels)
+    .map(([name, channel]) => ({ name, spectrum: channel?.spectrum }))
+    .filter((item) => item.spectrum?.meaningful_peak)
+    .sort((first, second) => Number(second.spectrum?.peak_power_fraction || 0) - Number(first.spectrum?.peak_power_fraction || 0))[0];
+  const statisticalReady = statisticalOverall
+    && statisticalOverall.stationarity_supported === true
+    && statisticalOverall.minimum_effective_samples_30 === true
+    && statisticalOverall.meaningful_peak_has_at_least_10_cycles !== false;
+  const sensitivityStudy = state.caseReport?.sensitivityStudy;
   const verticalForce = forces?.verticalForceType && forces?.verticalForceN != null
     ? `${forces.verticalForceType} ${fmt(forces.verticalForceN)} N (${fmt(forces.verticalForceLbf)} lbf) @ ${fmt(forces.speedMph)} mph`
     : null;
+  const balance = forces?.aeroBalance;
   const details = [
     `mean Cd ${fmt(cd)}`,
     `mean Cl ${fmt(cl)}`,
+    coeffs.meanCs != null ? `mean Cs ${fmt(coeffs.meanCs)}` : null,
     verticalForce,
     forces?.dragN != null ? `drag ${fmt(forces.dragN)} N (${fmt(forces.dragLbf)} lbf)` : null,
+    forces?.signedSideForceN != null ? `side ${fmt(forces.signedSideForceN)} N` : null,
+    forces?.pitchMomentNm != null ? `pitch ${fmt(forces.pitchMomentNm)} N m` : null,
+    balance?.qualified ? `front balance ${fmt(balance.frontAeroBalancePercent)}%` : "balance datum incomplete",
     `${samples} samples`,
+    cdStatistics?.confidence_interval?.lower != null
+      ? `Cd 95% CI [${fmt(cdStatistics.confidence_interval.lower)}, ${fmt(cdStatistics.confidence_interval.upper)}]`
+      : null,
+    cdStatistics?.effective_sample_count != null
+      ? `Cd N_eff ${fmt(cdStatistics.effective_sample_count)}`
+      : null,
+    statisticalOverall
+      ? `statistics ${statisticalReady ? "ready" : "pending"}; stationarity ${statisticalOverall.stationarity_supported === true ? "supported" : statisticalOverall.stationarity_supported === false ? "not supported" : "unresolved"}`
+      : null,
+    meaningfulPeak
+      ? `${meaningfulPeak.name} peak ${fmt(meaningfulPeak.spectrum.dominant_frequency_hz)} Hz, ${fmt(meaningfulPeak.spectrum.cycle_coverage)} cycles${meaningfulPeak.spectrum.strouhal_number == null ? "" : `, St ${fmt(meaningfulPeak.spectrum.strouhal_number)}`}`
+      : transientStatistics ? "no meaningful spectral peak" : null,
+    sensitivityStudy
+      ? `sensitivity ${String(sensitivityStudy.status || "pending").replaceAll("_", " ")}${sensitivityStudy.decisionSafeSensitivity ? " (decision-safe)" : ""}`
+      : null,
     yPlus != null ? `avg y+ ${fmt(yPlus)}` : null,
     tracks ? `${tracks} solved tracks` : null,
-    grid ? `grid ${grid.status}` : "grid study missing",
+    grid ? (grid.qualificationLabel || `mesh sensitivity ${grid.status}`) : "mesh-sensitivity study missing",
   ].filter(Boolean);
   els.resultSummary.textContent = `Results: ${status} | ${details.join(" | ")}`;
 }
@@ -2401,6 +3264,7 @@ function dragColorChannels(value, minimum, maximum) {
 }
 
 function drawPressureLegend(ctx, width, height) {
+  const basic = state.viewMode === "basic";
   const showDrag = state.viewer.surfaceMode === "drag" && hasSurfaceDrag();
   const surfacePressure = (state.viewer.surfaceMode === "cp" || showDrag) && hasSurfacePressure()
     ? state.caseReport.surfacePressure
@@ -2437,14 +3301,22 @@ function drawPressureLegend(ctx, width, height) {
   ctx.fillStyle = "#dfeaf1";
   ctx.font = "600 11px Inter, system-ui, sans-serif";
   ctx.textAlign = "center";
-  ctx.fillText(showDrag ? hasSurfaceWallShear() ? "Local total drag areas" : "Local pressure-drag areas" : surfacePressure ? "Pressure coefficient Cp" : "Relative pressure", x + panelWidth / 2, y + 16);
+  ctx.fillText(
+    basic
+      ? showDrag ? "Relative drag areas" : "Relative pressure"
+      : showDrag
+        ? hasSurfaceWallShear() ? "Local total drag areas" : "Local pressure-drag areas"
+        : surfacePressure ? "Pressure coefficient Cp" : "Relative pressure",
+    x + panelWidth / 2,
+    y + 16,
+  );
   ctx.font = "600 10px Inter, system-ui, sans-serif";
   ctx.textAlign = "left";
-  ctx.fillText(showDrag ? "Offset" : surfacePressure ? fmt(-limit) : "Low", barX, y + 47);
+  ctx.fillText(basic ? "Low" : showDrag ? "Offset" : surfacePressure ? fmt(-limit) : "Low", barX, y + 47);
   ctx.textAlign = "center";
-  ctx.fillText(showDrag ? "Neutral" : "0", x + panelWidth / 2, y + 47);
+  ctx.fillText(basic ? "Neutral" : showDrag ? "Neutral" : "0", x + panelWidth / 2, y + 47);
   ctx.textAlign = "right";
-  ctx.fillText(showDrag ? "High drag" : surfacePressure ? fmt(limit) : "High", x + panelWidth - 14, y + 47);
+  ctx.fillText(basic ? "High" : showDrag ? "High drag" : surfacePressure ? fmt(limit) : "High", x + panelWidth - 14, y + 47);
   ctx.restore();
 }
 
@@ -3259,17 +4131,23 @@ function drawViewerHud(ctx, width, height) {
   const dynamicPressurePa = 0.5 * 1.225 * speedMps * speedMps;
   const machNumber = speedMps / 343;
   const gapMm = Math.max(0, Number(els.groundClearanceMm.value || 0));
-  const lines = [
-    `${Math.round(speedMph)} mph | M ${fmt(machNumber)} | q ${formatInt(Math.round(dynamicPressurePa))} Pa`,
-    els.includeGround.checked
-      ? `${els.movingGround.checked ? "moving ground" : "ground"} | gap ${fmt(gapMm)} mm`
-      : "open tunnel",
-    state.viewer.surfaceMode === "drag" && hasSurfaceDrag()
-      ? hasSurfaceWallShear() ? "OpenFOAM total drag" : "OpenFOAM pressure drag"
-      : state.viewer.surfaceMode === "cp" && hasSurfacePressure()
-        ? "OpenFOAM body Cp"
-      : solvedFlow ? "OpenFOAM pressure air" : report ? "surface-guided air preview" : "sample airflow preview",
-  ];
+  const lines = state.viewMode === "basic"
+    ? [
+      `${Math.round(speedMph)} mph airflow`,
+      solvedFlow ? "Calculated OpenFOAM paths" : "Visual preview paths",
+      report ? "Drag to orbit | scroll to zoom" : "Load a model to begin",
+    ]
+    : [
+      `${Math.round(speedMph)} mph | M ${fmt(machNumber)} | q ${formatInt(Math.round(dynamicPressurePa))} Pa`,
+      els.includeGround.checked
+        ? `${els.movingGround.checked ? "moving ground" : "ground"} | gap ${fmt(gapMm)} mm`
+        : "open tunnel",
+      state.viewer.surfaceMode === "drag" && hasSurfaceDrag()
+        ? hasSurfaceWallShear() ? "OpenFOAM total drag" : "OpenFOAM pressure drag"
+        : state.viewer.surfaceMode === "cp" && hasSurfacePressure()
+          ? "OpenFOAM body Cp"
+        : solvedFlow ? "OpenFOAM pressure air" : report ? "surface-guided air preview" : "sample airflow preview",
+    ];
   ctx.fillStyle = "rgba(15,24,34,0.68)";
   roundRectPath(ctx, 14, 14, 238, 78, 8);
   ctx.fill();
@@ -3743,6 +4621,12 @@ function slug(value) {
 function selectedUnitLabel() {
   const option = els.unitScale.selectedOptions?.[0];
   return option?.dataset?.label || "m";
+}
+
+function optionalFiniteNumber(value) {
+  if (value === "" || value == null) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function optionalNumber(value) {

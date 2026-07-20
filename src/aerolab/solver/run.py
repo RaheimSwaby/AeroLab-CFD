@@ -44,10 +44,15 @@ class SolverRunResult:
         assessment = self.report.get(assessment_name)
         return bool(isinstance(assessment, dict) and assessment.get("trusted"))
 
+    @property
+    def numerically_qualified(self) -> bool:
+        return self.trusted
+
     def to_dict(self) -> dict[str, object]:
         return {
             "ok": self.ok,
             "trusted": self.trusted,
+            "numericallyQualified": self.numerically_qualified,
             "mode": self.run_mode,
             "reusedMesh": self.reused_mesh,
             "backend": self.backend,
@@ -64,6 +69,7 @@ def _run_record(result: SolverRunResult) -> dict[str, object]:
         "status": "complete" if result.ok else "failed",
         "ok": result.ok,
         "trusted": result.trusted,
+        "numericallyQualified": result.numerically_qualified,
         "mode": result.run_mode,
         "reusedMesh": result.reused_mesh,
         "backend": result.backend,
@@ -125,6 +131,7 @@ def run_case(
                 "status": "running",
                 "ok": None,
                 "trusted": False,
+                "numericallyQualified": False,
                 "mode": run_mode,
                 "reusedMesh": reused_mesh,
                 "backend": selected,

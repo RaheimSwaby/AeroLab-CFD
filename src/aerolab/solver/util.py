@@ -16,7 +16,7 @@ def _read_json_object(path: Path) -> dict[str, object]:
 
 
 def _finite_number(value: object) -> float | None:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    if not isinstance(value, int | float) or isinstance(value, bool):
         return None
     number = float(value)
     return number if math.isfinite(number) else None

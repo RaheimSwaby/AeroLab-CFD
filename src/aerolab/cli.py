@@ -6,8 +6,23 @@ import sys
 from pathlib import Path
 
 from .case import create_case
-from .report import render_html, render_markdown
-from .solver import case_report, run_case, solver_status
+from .report import (
+    render_comparison_html,
+    render_comparison_markdown,
+    render_html,
+    render_markdown,
+    render_sensitivity_html,
+    render_sensitivity_markdown,
+)
+from .solver import (
+    SENSITIVITY_PARAMETERS,
+    case_report,
+    compare_cases,
+    create_sensitivity_study_from_case,
+    run_case,
+    sensitivity_study_report,
+    solver_status,
+)
 from .stl import inspect_stl
 from .webapp import run_app
 
@@ -19,21 +34,233 @@ UNIT_SCALES = {
 }
 
 
+def _text_number(value: object, digits: int = 6) -> str:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return "n/a"
+    return f"{float(value):.{digits}g}"
+
+
 def _report_text(report: dict[str, object]) -> str:
     lines = [
         f"Case: {report.get('caseName')}",
         f"Status: {report.get('status')}",
     ]
     assessment = report.get("qualityAssessment") or {}
-    verified = isinstance(assessment, dict) and assessment.get("trusted")
-    lines.append(f"Verified: {'yes' if verified else 'no'}")
+    qualified = isinstance(assessment, dict) and assessment.get(
+        "numericallyQualified",
+        assessment.get("trusted"),
+    )
+    lines.append(f"Numerically qualified: {'yes' if qualified else 'no'}")
     force_coeffs = report.get("forceCoeffs")
     if isinstance(force_coeffs, dict):
-        lines.append(f"Mean Cd: {force_coeffs.get('meanCd')}")
-        lines.append(f"Mean Cl: {force_coeffs.get('meanCl')}")
+        for key in ("Cd", "Cl", "Cs", "CmRoll", "CmPitch", "CmYaw"):
+            lines.append(f"Mean {key}: {force_coeffs.get(f'mean{key}', force_coeffs.get(key))}")
         lines.append(f"Source: {force_coeffs.get('file')}")
     else:
-        lines.append("No force coefficient output found.")
+        lines.append("No force or moment coefficient output found.")
+
+    statistics = report.get("transientStatistics")
+    if isinstance(statistics, dict):
+        overall = statistics.get("overall_evidence")
+        counts = statistics.get("sample_counts")
+        lines.append("Transient statistical evidence:")
+        if isinstance(counts, dict):
+            lines.append(f"- retained samples: {counts.get('retained')}")
+        if isinstance(overall, dict):
+            ready = bool(
+                overall.get("stationarity_supported") is True
+                and overall.get("minimum_effective_samples_30") is True
+                and overall.get("meaningful_peak_has_at_least_10_cycles") is not False
+            )
+            lines.extend(
+                (
+                    f"- evidence ready: {'yes' if ready else 'no'}",
+                    f"- stationarity supported: {overall.get('stationarity_supported')}",
+                    f"- every channel has at least 30 effective samples: {overall.get('minimum_effective_samples_30')}",
+                    f"- meaningful peak has at least 10 cycles: {overall.get('meaningful_peak_has_at_least_10_cycles')}",
+                )
+            )
+        channels = statistics.get("channels")
+        if isinstance(channels, dict):
+            for key, channel in channels.items():
+                if not isinstance(channel, dict):
+                    continue
+                interval = channel.get("confidence_interval")
+                stationarity = channel.get("stationarity_evidence")
+                spectrum = channel.get("spectrum")
+                lines.append(
+                    f"- {key}: mean {_text_number(channel.get('mean'))}; "
+                    f"95% CI [{_text_number(interval.get('lower') if isinstance(interval, dict) else None)}, "
+                    f"{_text_number(interval.get('upper') if isinstance(interval, dict) else None)}]; "
+                    f"effective samples {_text_number(channel.get('effective_sample_count'))}; "
+                    f"stationarity {stationarity.get('status') if isinstance(stationarity, dict) else 'n/a'}; "
+                    f"dominant {_text_number(spectrum.get('dominant_frequency_hz') if isinstance(spectrum, dict) else None)} Hz; "
+                    f"cycles {_text_number(spectrum.get('cycle_coverage') if isinstance(spectrum, dict) else None)}"
+                )
+
+    study = report.get("sensitivityStudy")
+    if isinstance(study, dict):
+        lines.extend(
+            (
+                "Sensitivity study:",
+                f"- parameter: {study.get('parameterLabel') or study.get('parameter')} ({study.get('unit') or ''})",
+                f"- status: {study.get('status')}",
+                f"- complete: {'yes' if study.get('complete') else 'no'}",
+                f"- numerically qualified family: {'yes' if study.get('allNumericallyQualified') else 'no'}",
+                f"- statistically ready family: {'yes' if study.get('allStatisticallyReady') else 'no'}",
+                f"- decision-safe sensitivity: {'yes' if study.get('decisionSafeSensitivity') else 'no'}",
+            )
+        )
+    return "\n".join(lines)
+
+
+def _center_of_gravity(
+    x: float | None,
+    y: float | None,
+    z: float | None,
+) -> tuple[float, float, float] | None:
+    provided = sum(value is not None for value in (x, y, z))
+    if provided == 0:
+        return None
+    if provided != 3:
+        raise ValueError("Vehicle CG requires --cg-x-m, --cg-y-m, and --cg-z-m together.")
+    return (float(x), float(y), float(z))  # type: ignore[arg-type]
+
+
+def _closed_tunnel_from_args(args: argparse.Namespace) -> dict[str, float] | None:
+    values = {
+        "width_m": args.tunnel_width_m,
+        "height_m": args.tunnel_height_m,
+        "upstream_m": args.tunnel_upstream_m,
+        "downstream_m": args.tunnel_downstream_m,
+    }
+    provided = sum(value is not None for value in values.values())
+    if provided == 0:
+        return None
+    if provided != len(values):
+        raise ValueError(
+            "Closed tunnel requires --tunnel-width-m, --tunnel-height-m, "
+            "--tunnel-upstream-m, and --tunnel-downstream-m together."
+        )
+    return {key: float(value) for key, value in values.items()}  # type: ignore[arg-type]
+
+
+def _wheel_setup_from_file(path: Path | None) -> list[dict[str, object]] | None:
+    if path is None:
+        return None
+    config_path = path.expanduser().resolve()
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    wheels = payload.get("wheels") if isinstance(payload, dict) else payload
+    if not isinstance(wheels, list):
+        raise ValueError("Wheel configuration must be a JSON list or an object with a wheels list.")
+    normalized: list[dict[str, object]] = []
+    for index, value in enumerate(wheels, start=1):
+        if not isinstance(value, dict):
+            raise ValueError(f"Wheel configuration entry {index} must be an object.")
+        wheel = dict(value)
+        model_value = wheel.get("model_path") or wheel.get("geometry")
+        if model_value:
+            model_path = Path(str(model_value)).expanduser()
+            if not model_path.is_absolute():
+                model_path = config_path.parent / model_path
+            wheel["model_path"] = str(model_path.resolve())
+        normalized.append(wheel)
+    return normalized
+
+
+def _volume_zones_from_file(
+    path: Path | None,
+    key: str,
+    label: str,
+) -> list[dict[str, object]] | None:
+    if path is None:
+        return None
+    config_path = path.expanduser().resolve()
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    zones = payload.get(key) if isinstance(payload, dict) else payload
+    if not isinstance(zones, list):
+        raise ValueError(f"{label} configuration must be a JSON list or an object with a {key} list.")
+    normalized: list[dict[str, object]] = []
+    for index, value in enumerate(zones, start=1):
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} configuration entry {index} must be an object.")
+        normalized.append(dict(value))
+    return normalized
+
+
+def _comparison_text(comparison: dict[str, object]) -> str:
+    baseline = comparison.get("baseline") if isinstance(comparison.get("baseline"), dict) else {}
+    variant = comparison.get("variant") if isinstance(comparison.get("variant"), dict) else {}
+    lines = [
+        f"Status: {comparison.get('statusLabel')}",
+        f"Decision-safe numerical comparison: {'yes' if comparison.get('decisionSafe') else 'no'}",
+        f"Decision-safe statistical comparison: {'yes' if comparison.get('statisticalDecisionSafe') else 'no'}",
+        f"Statistical status: {comparison.get('statisticalStatusLabel') or comparison.get('statisticalStatus')}",
+        f"Baseline: {baseline.get('name')}",
+        f"Variant: {variant.get('name')}",
+        f"Setup locks match: {'yes' if comparison.get('locksMatch') else 'no'}",
+    ]
+    deltas = comparison.get("coefficientDeltas")
+    if isinstance(deltas, dict):
+        for key, payload in deltas.items():
+            if isinstance(payload, dict):
+                lines.append(
+                    f"Delta {key}: {payload.get('delta')} ({payload.get('percentDelta')}%)"
+                )
+    statistical = comparison.get("statisticalDeltas")
+    if isinstance(statistical, dict):
+        lines.append("Autocorrelation-adjusted difference evidence:")
+        for key, payload in statistical.items():
+            if not isinstance(payload, dict) or payload.get("delta") is None:
+                continue
+            lines.append(
+                f"- {key}: delta {_text_number(payload.get('delta'))}; "
+                f"95% CI [{_text_number(payload.get('confidenceLower'))}, "
+                f"{_text_number(payload.get('confidenceUpper'))}]; "
+                f"interval excludes zero {payload.get('statisticallyResolved')}; "
+                f"effective samples {_text_number(payload.get('baselineEffectiveSamples'))} / "
+                f"{_text_number(payload.get('variantEffectiveSamples'))}"
+            )
+    differences = comparison.get("setupDifferences")
+    if isinstance(differences, list) and differences:
+        lines.append("Setup mismatches:")
+        for difference in differences:
+            if isinstance(difference, dict):
+                lines.append(
+                    f"- {difference.get('field')}: {difference.get('baseline')} -> "
+                    f"{difference.get('variant')}"
+                )
+    lines.append(str(comparison.get("interpretation") or ""))
+    return "\n".join(lines)
+
+
+def _sensitivity_text(study: dict[str, object]) -> str:
+    lines = [
+        f"Study: {study.get('studyId')}",
+        f"Parameter: {study.get('parameterLabel') or study.get('parameter')} ({study.get('unit') or ''})",
+        f"Values: {study.get('values')}",
+        f"Status: {study.get('status')}",
+        f"One parameter controlled: {'yes' if study.get('parameterControlled') else 'no'}",
+        f"Study metadata verified: {'yes' if study.get('studyMetadataVerified') else 'no'}",
+        f"Member setup lock verified: {'yes' if study.get('planLockVerified') else 'no'}",
+        f"Recorded values match cases: {'yes' if study.get('parameterValuesVerified') else 'no'}",
+        f"Family complete: {'yes' if study.get('complete') else 'no'}",
+        f"All numerically qualified: {'yes' if study.get('allNumericallyQualified') else 'no'}",
+        f"All statistically ready: {'yes' if study.get('allStatisticallyReady') else 'no'}",
+        f"Decision-safe sensitivity: {'yes' if study.get('decisionSafeSensitivity') else 'no'}",
+    ]
+    records = study.get("records")
+    if isinstance(records, list):
+        lines.append("Members:")
+        for record in records:
+            if isinstance(record, dict):
+                lines.append(
+                    f"- {record.get('value')}: {record.get('caseName')}"
+                    f"{' [baseline]' if record.get('isBaseline') else ''}; "
+                    f"numerical={'yes' if record.get('numericallyQualified') else 'no'}, "
+                    f"statistical={'yes' if record.get('statisticallyReady') else 'no'}"
+                )
+    lines.append(str(study.get("interpretation") or ""))
     return "\n".join(lines)
 
 
@@ -73,6 +300,115 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=70.0,
         help="Free-stream air speed in miles per hour.",
+    )
+    case_parser.add_argument(
+        "--air-temperature-c",
+        type=float,
+        help="Dry-air temperature in degrees Celsius; with pressure, derives density and viscosity.",
+    )
+    case_parser.add_argument(
+        "--air-pressure-pa",
+        type=float,
+        help="Absolute dry-air pressure in pascals.",
+    )
+    case_parser.add_argument(
+        "--air-density-kg-m3",
+        type=float,
+        help="Manual air-density override in kilograms per cubic meter.",
+    )
+    case_parser.add_argument(
+        "--kinematic-viscosity-m2-s",
+        type=float,
+        help="Manual kinematic-viscosity override in square meters per second.",
+    )
+    case_parser.add_argument(
+        "--turbulence-intensity-percent",
+        type=float,
+        help="Inlet turbulence intensity in percent (default: 1).",
+    )
+    case_parser.add_argument(
+        "--turbulence-length-scale-m",
+        type=float,
+        help="Inlet turbulence length scale in meters (default: 7%% of reference length).",
+    )
+    case_parser.add_argument(
+        "--yaw-deg",
+        type=float,
+        help="Yaw angle in degrees; positive rotates primary flow toward cross(lift, primary).",
+    )
+    case_parser.add_argument(
+        "--crosswind-mps",
+        type=float,
+        help="Signed crosswind component in m/s; derives yaw from the total freestream speed.",
+    )
+    case_parser.add_argument(
+        "--roughness-height-mm",
+        type=float,
+        default=0.0,
+        help="Equivalent body and wheel roughness height Ks in millimeters.",
+    )
+    case_parser.add_argument(
+        "--roughness-constant",
+        type=float,
+        default=0.5,
+        help="Foundation nutkRoughWallFunction constant Cs (0.5 to 1.0).",
+    )
+    case_parser.add_argument(
+        "--backflow-safe-outlet",
+        action="store_true",
+        help="Use pressure-inlet/outlet velocity and inletOutlet turbulence at the outlet.",
+    )
+    case_parser.add_argument(
+        "--second-order-transient",
+        action="store_true",
+        help="Use the second-order backward time scheme; requires --simulation-mode transient.",
+    )
+    case_parser.add_argument(
+        "--fluid-profile",
+        choices=["incompressible", "compressible_thermal"],
+        default="incompressible",
+        help="Use the byte-compatible incompressible profile or Foundation v13 fluid with thermal/compressible fields.",
+    )
+    case_parser.add_argument(
+        "--turbulence-model",
+        choices=["kOmegaSST", "SpalartAllmarasDES", "SpalartAllmarasIDDES"],
+        default="kOmegaSST",
+        help="Momentum-transport model; DES and IDDES require transient mode and smooth walls.",
+    )
+    case_parser.add_argument(
+        "--porous-zones-config",
+        type=Path,
+        help="JSON list of explicit solver-coordinate porous box zones.",
+    )
+    case_parser.add_argument(
+        "--fan-zones-config",
+        type=Path,
+        help="JSON list of explicit solver-coordinate actuation-disk box zones.",
+    )
+    case_parser.add_argument(
+        "--tunnel-width-m",
+        type=float,
+        help="Closed-tunnel internal width in solver meters.",
+    )
+    case_parser.add_argument(
+        "--tunnel-height-m",
+        type=float,
+        help="Closed-tunnel internal height above the road in solver meters.",
+    )
+    case_parser.add_argument(
+        "--tunnel-upstream-m",
+        type=float,
+        help="Closed-tunnel distance upstream of the transformed model bounds.",
+    )
+    case_parser.add_argument(
+        "--tunnel-downstream-m",
+        type=float,
+        help="Closed-tunnel distance downstream of the transformed model bounds.",
+    )
+    case_parser.add_argument(
+        "--wheel-config",
+        type=Path,
+        help="JSON file defining separate wheel STLs, source-frame centers/axes, and radii.",
     )
     case_parser.add_argument(
         "--flow-axis",
@@ -122,6 +458,31 @@ def main(argv: list[str] | None = None) -> int:
         "--reference-length-m",
         type=float,
         help="Manual aerodynamic reference length in meters for force coefficients.",
+    )
+    case_parser.add_argument(
+        "--cg-x-m",
+        type=float,
+        help="Vehicle CG X coordinate in transformed solver meters.",
+    )
+    case_parser.add_argument(
+        "--cg-y-m",
+        type=float,
+        help="Vehicle CG Y coordinate in transformed solver meters.",
+    )
+    case_parser.add_argument(
+        "--cg-z-m",
+        type=float,
+        help="Vehicle CG Z coordinate in transformed solver meters.",
+    )
+    case_parser.add_argument(
+        "--front-axle-station-m",
+        type=float,
+        help="Front axle station along the positive solver flow axis in meters.",
+    )
+    case_parser.add_argument(
+        "--rear-axle-station-m",
+        type=float,
+        help="Rear axle station along the positive solver flow axis in meters.",
     )
     case_parser.add_argument(
         "--measured-length-m",
@@ -263,6 +624,92 @@ def main(argv: list[str] | None = None) -> int:
         help="Shortcut for --format json.",
     )
 
+    compare_parser = subparsers.add_parser(
+        "compare-cases",
+        help="Compare a qualified variant against a setup-locked qualified baseline.",
+    )
+    compare_parser.add_argument("baseline", type=Path, help="Path to the baseline case folder.")
+    compare_parser.add_argument("variant", type=Path, help="Path to the variant case folder.")
+    compare_parser.add_argument(
+        "--format",
+        choices=["text", "json", "markdown", "html"],
+        default="text",
+        help="Output format for the controlled comparison.",
+    )
+    compare_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Write the comparison to this file instead of standard output.",
+    )
+
+    sensitivity_parser = subparsers.add_parser(
+        "create-sensitivity-study",
+        help="Create a setup-preserving one-factor family from an existing AeroLab case.",
+    )
+    sensitivity_parser.add_argument(
+        "base_case",
+        type=Path,
+        help="Existing case whose complete physical and numerical setup will be preserved.",
+    )
+    sensitivity_parser.add_argument(
+        "--parameter",
+        required=True,
+        choices=sorted(SENSITIVITY_PARAMETERS),
+        help="Single input parameter varied across the family.",
+    )
+    sensitivity_parser.add_argument(
+        "--values",
+        required=True,
+        nargs="+",
+        type=float,
+        help="Two to twelve unique finite values for the selected parameter.",
+    )
+    sensitivity_parser.add_argument(
+        "--baseline-index",
+        type=int,
+        help="Zero-based baseline position; defaults to the value nearest the base case.",
+    )
+    sensitivity_parser.add_argument(
+        "--name",
+        help="Base name for generated members; defaults to the existing case name.",
+    )
+    sensitivity_parser.add_argument(
+        "--cases-dir",
+        type=Path,
+        help="Destination directory; defaults to the existing case's parent directory.",
+    )
+    sensitivity_parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Create case metadata without OpenFOAM dictionaries.",
+    )
+    sensitivity_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the created study descriptor as JSON.",
+    )
+
+    sensitivity_report_parser = subparsers.add_parser(
+        "report-sensitivity-study",
+        help="Collect qualification and confidence-interval evidence for a sensitivity family.",
+    )
+    sensitivity_report_parser.add_argument(
+        "case",
+        type=Path,
+        help="Any member case in the sensitivity family.",
+    )
+    sensitivity_report_parser.add_argument(
+        "--format",
+        choices=["text", "json", "markdown", "html"],
+        default="text",
+        help="Output format for the sensitivity report.",
+    )
+    sensitivity_report_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Write the sensitivity report to this file instead of standard output.",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "check":
@@ -278,6 +725,12 @@ def main(argv: list[str] | None = None) -> int:
             model_path=args.model,
             case_name=args.name,
             speed_mph=args.speed_mph,
+            air_temperature_c=args.air_temperature_c,
+            air_pressure_pa=args.air_pressure_pa,
+            air_density_kg_m3=args.air_density_kg_m3,
+            kinematic_viscosity_m2_s=args.kinematic_viscosity_m2_s,
+            turbulence_intensity_percent=args.turbulence_intensity_percent,
+            turbulence_length_scale_m=args.turbulence_length_scale_m,
             flow_axis=args.flow_axis,
             cases_dir=args.cases_dir,
             include_ground=args.ground,
@@ -288,6 +741,9 @@ def main(argv: list[str] | None = None) -> int:
             unit_label=args.units,
             reference_area_m2=args.reference_area_m2,
             reference_length_m=args.reference_length_m,
+            center_of_gravity_m=_center_of_gravity(args.cg_x_m, args.cg_y_m, args.cg_z_m),
+            front_axle_station_m=args.front_axle_station_m,
+            rear_axle_station_m=args.rear_axle_station_m,
             measured_length_m=args.measured_length_m,
             measured_width_m=args.measured_width_m,
             measured_height_m=args.measured_height_m,
@@ -301,6 +757,26 @@ def main(argv: list[str] | None = None) -> int:
             source_flow_direction=args.source_flow_direction,
             source_up_direction=args.source_up_direction,
             model_rotation_degrees=(args.rotate_x_deg, args.rotate_y_deg, args.rotate_z_deg),
+            yaw_degrees=args.yaw_deg,
+            crosswind_mps=args.crosswind_mps,
+            roughness_height_m=args.roughness_height_mm / 1000.0,
+            roughness_constant=args.roughness_constant,
+            closed_tunnel=_closed_tunnel_from_args(args),
+            backflow_safe_outlet=args.backflow_safe_outlet,
+            wheel_setup=_wheel_setup_from_file(args.wheel_config),
+            second_order_transient=args.second_order_transient,
+            fluid_profile=args.fluid_profile,
+            turbulence_model=args.turbulence_model,
+            porous_zones=_volume_zones_from_file(
+                args.porous_zones_config,
+                "porous_zones",
+                "Porous-zone",
+            ),
+            fan_zones=_volume_zones_from_file(
+                args.fan_zones_config,
+                "fan_zones",
+                "Fan-zone",
+            ),
         )
         print(f"Created case: {case_path}")
         if args.metadata_only:
@@ -340,7 +816,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Mode: {result.run_mode}")
             print(f"Reused mesh: {'yes' if result.reused_mesh else 'no'}")
             print(f"Return code: {result.returncode}")
-            print(f"Verified: {'yes' if result.trusted else 'no'}")
+            print(f"Numerically qualified: {'yes' if result.trusted else 'no'}")
             print(f"Log: {result.log_path}")
             force_coeffs = result.report.get("forceCoeffs")
             if force_coeffs:
@@ -364,6 +840,66 @@ def main(argv: list[str] | None = None) -> int:
         if args.output:
             args.output.write_text(content + "\n", encoding="utf-8")
             print(f"Report written to {args.output}")
+        else:
+            print(content)
+        return 0
+
+    if args.command == "compare-cases":
+        comparison = compare_cases(args.baseline, args.variant)
+        if args.format == "json":
+            content = json.dumps(comparison, indent=2)
+        elif args.format == "markdown":
+            content = render_comparison_markdown(comparison)
+        elif args.format == "html":
+            content = render_comparison_html(comparison)
+        else:
+            content = _comparison_text(comparison)
+        if args.output:
+            args.output.write_text(content + "\n", encoding="utf-8")
+            print(f"Comparison written to {args.output}")
+        else:
+            print(content)
+        return 0 if comparison.get("decisionSafe") else 2
+
+    if args.command == "create-sensitivity-study":
+        study = create_sensitivity_study_from_case(
+            base_case_path=args.base_case,
+            parameter=args.parameter,
+            values=args.values,
+            cases_dir=args.cases_dir,
+            base_name=args.name,
+            generate_openfoam=not args.metadata_only,
+            baseline_index=args.baseline_index,
+        )
+        if args.json:
+            print(json.dumps(study, indent=2))
+        else:
+            print(f"Created sensitivity study: {study.get('studyId')}")
+            print(
+                f"Parameter: {study.get('parameterLabel')} ({study.get('unit')}) = "
+                f"{study.get('values')}"
+            )
+            for path in study.get("casePaths", []):
+                print(f"- {path}")
+            print(f"Selected baseline member: {study.get('selectedCasePath')}")
+        return 0
+
+    if args.command == "report-sensitivity-study":
+        study = sensitivity_study_report(args.case)
+        if study is None:
+            print("The selected case is not part of a sensitivity study.", file=sys.stderr)
+            return 2
+        if args.format == "json":
+            content = json.dumps(study, indent=2)
+        elif args.format == "markdown":
+            content = render_sensitivity_markdown(study)
+        elif args.format == "html":
+            content = render_sensitivity_html(study)
+        else:
+            content = _sensitivity_text(study)
+        if args.output:
+            args.output.write_text(content + "\n", encoding="utf-8")
+            print(f"Sensitivity report written to {args.output}")
         else:
             print(content)
         return 0

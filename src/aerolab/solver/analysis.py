@@ -7,6 +7,7 @@ import os
 import re
 from pathlib import Path
 
+from ..case import comparison_lock_metadata
 from ..repair import repair_fidelity_for_model, surface_deviation_metrics
 from ..stl import (
     Triangle,
@@ -274,6 +275,12 @@ def case_report(
             case_payload = {}
 
     force_coeffs = parse_force_coeffs(case_path)
+    transient_statistics = (
+        force_coeffs.get("transientStatistics")
+        if isinstance(force_coeffs, dict)
+        and isinstance(force_coeffs.get("transientStatistics"), dict)
+        else None
+    )
     aerodynamic_forces = _aerodynamic_force_summary(case_payload, force_coeffs)
     run_json_path = case_path / "aerolab-run.json"
     run_payload: dict[str, object] | None = None
@@ -281,7 +288,7 @@ def case_report(
         try:
             stored_run = json.loads(run_json_path.read_text(encoding="utf-8"))
             run_payload = {key: stored_run.get(key) for key in (
-                "status", "ok", "trusted", "mode", "reusedMesh", "backend", "returncode",
+                "status", "ok", "trusted", "numericallyQualified", "mode", "reusedMesh", "backend", "returncode",
                 "logPath", "startedAt", "finishedAt"
             )}
         except json.JSONDecodeError:
@@ -348,9 +355,22 @@ def case_report(
         case_payload.get("placement"),
     )
     validation = grid_convergence_report(case_path) if include_validation else None
+    if include_validation:
+        from .studies import sensitivity_study_report
+
+        sensitivity = sensitivity_study_report(case_path)
+    else:
+        sensitivity = None
+    stored_comparison_lock = case_payload.get("comparison_lock")
+    comparison_lock = (
+        stored_comparison_lock
+        if isinstance(stored_comparison_lock, dict)
+        else comparison_lock_metadata(case_payload) if case_payload else None
+    )
 
     visualization = _case_visualization(case_path, case_payload) if include_visualization else {}
     return {
+        "schemaVersion": case_payload.get("schema_version", 1),
         "casePath": str(case_path),
         "caseName": case_payload.get("name", case_path.name),
         "status": case_payload.get("status", "unknown"),
@@ -368,22 +388,32 @@ def case_report(
             "placement": case_payload.get("placement"),
             "quality": case_payload.get("cfd_quality"),
             "simulationType": case_payload.get("simulation_type"),
+            "solverModule": case_payload.get("solver_module"),
+            "physicalModel": case_payload.get("physical_model"),
+            "vehicleDatums": case_payload.get("vehicle_datums"),
         },
+        "physicalModel": case_payload.get("physical_model"),
+        "vehicleDatums": case_payload.get("vehicle_datums"),
+        "comparisonLock": comparison_lock,
         "aerodynamicReference": case_payload.get("aerodynamic_reference"),
         "wallResolution": case_payload.get("wall_resolution"),
         "meshResolution": case_payload.get("mesh_resolution"),
         "surfacePressureSetup": _surface_pressure_setup(case_path),
         "forceCoeffs": force_coeffs,
+        "transientStatistics": transient_statistics,
         "aerodynamicForces": aerodynamic_forces,
         "meshQuality": mesh_quality,
         "layerCoverage": layer_coverage,
         "residuals": residuals,
         "transientState": transient_state,
         "yPlus": y_plus,
+        "numericallyQualified": bool(assessment.get("numericallyQualified")),
+        "qualificationStatus": assessment.get("qualificationStatus"),
         "qualityAssessment": assessment,
         "meshAssessment": mesh_assessment,
         "meshRecord": mesh_record or None,
         "gridConvergence": validation,
+        "sensitivityStudy": sensitivity,
         "lastRun": run_payload,
         "runProgress": case_run_progress(case_path),
         **visualization,
@@ -699,10 +729,10 @@ def grid_convergence_report(case_path: Path) -> dict[str, object] | None:
             "The study cases do not share an identical physical setup.",
         ),
         _study_check(
-            "Verified runs",
+            "Numerically qualified runs",
             True if all_trusted else False if failed_runs else None,
-            "All three OpenFOAM runs passed mesh, residual, force, and y+ gates.",
-            "Run and verify all three cases before evaluating grid sensitivity.",
+            "All three OpenFOAM runs passed geometry, mesh, residual, six-axis load, and wall-treatment gates.",
+            "Complete and numerically qualify all three cases before evaluating mesh sensitivity.",
         ),
     ]
 
@@ -776,6 +806,17 @@ def grid_convergence_report(case_path: Path) -> dict[str, object] | None:
         "studyId": study_id,
         "status": "validated" if validated else "failed" if failed else "incomplete",
         "validated": validated,
+        "meshSensitivityPassed": validated,
+        "qualificationStatus": (
+            "within_mesh_sensitivity_threshold"
+            if validated
+            else "outside_mesh_sensitivity_threshold" if failed else "incomplete"
+        ),
+        "qualificationLabel": (
+            "Within mesh-sensitivity threshold"
+            if validated
+            else "Mesh-sensitivity failed" if failed else "Mesh-sensitivity incomplete"
+        ),
         "levels": records,
         "checks": checks,
         "dragMetrics": cd_metrics,
@@ -799,9 +840,11 @@ def _study_setup_signature(payload: dict[str, object]) -> str:
         "simulation_type",
         "solver_module",
         "flow",
+        "physical_model",
         "ground",
         "aerodynamic_reference",
         "wall_resolution",
+        "vehicle_datums",
     )
     return json.dumps({key: payload.get(key) for key in keys}, sort_keys=True, separators=(",", ":"))
 
@@ -819,8 +862,10 @@ def _aerodynamic_force_summary(
 ) -> dict[str, object] | None:
     if not isinstance(force_coeffs, dict):
         return None
-    mean_cd = _coefficient_value(force_coeffs, "meanCd", "Cd")
-    mean_cl = _coefficient_value(force_coeffs, "meanCl", "Cl")
+    coefficients = {
+        key: _coefficient_value(force_coeffs, f"mean{key}", key)
+        for key in ("Cd", "Cl", "Cs", "CmRoll", "CmPitch", "CmYaw")
+    }
     flow = case_payload.get("flow")
     reference = case_payload.get("aerodynamic_reference")
     if not isinstance(flow, dict) or not isinstance(reference, dict):
@@ -829,29 +874,148 @@ def _aerodynamic_force_summary(
     speed_mph = _finite_number(flow.get("speed_mph"))
     density = _finite_number(flow.get("air_density_kg_m3")) or 1.225
     area_m2 = _finite_number(reference.get("area_m2"))
+    length_m = _finite_number(reference.get("length_m"))
     if speed_mps is None or area_m2 is None or speed_mps < 0 or area_m2 <= 0:
         return None
     dynamic_pressure = 0.5 * density * speed_mps * speed_mps
-    lift_n = mean_cl * dynamic_pressure * area_m2 if mean_cl is not None else None
-    drag_n = mean_cd * dynamic_pressure * area_m2 if mean_cd is not None else None
+    force_scale = dynamic_pressure * area_m2
+    moment_scale = force_scale * length_m if length_m is not None and length_m > 0 else None
+    drag_n = coefficients["Cd"] * force_scale if coefficients["Cd"] is not None else None
+    side_n = coefficients["Cs"] * force_scale if coefficients["Cs"] is not None else None
+    lift_n = coefficients["Cl"] * force_scale if coefficients["Cl"] is not None else None
+    moments = {
+        name: coefficients[key] * moment_scale
+        if coefficients[key] is not None and moment_scale is not None
+        else None
+        for name, key in (
+            ("rollMomentNm", "CmRoll"),
+            ("pitchMomentNm", "CmPitch"),
+            ("yawMomentNm", "CmYaw"),
+        )
+    }
     newtons_per_lbf = 4.4482216152605
+    newton_meters_per_lbf_ft = 1.3558179483314
     vertical_type = None
     vertical_n = None
     if lift_n is not None:
         vertical_type = "downforce" if lift_n < 0 else "lift"
         vertical_n = abs(lift_n)
+
+    balance = _aero_balance_summary(case_payload.get("vehicle_datums"), lift_n, moments["pitchMomentNm"])
+    six_axis_available = all(coefficients[key] is not None for key in coefficients)
+    balance_qualified = bool(balance and balance.get("qualified"))
+    if not six_axis_available:
+        qualification_status = "six_axis_coefficients_missing"
+    elif not balance_qualified:
+        qualification_status = "six_axis_qualified_balance_datum_incomplete"
+    else:
+        qualification_status = "six_axis_and_balance_qualified"
     return {
         "speedMps": speed_mps,
         "speedMph": speed_mph,
         "airDensityKgM3": density,
         "referenceAreaM2": area_m2,
+        "referenceLengthM": length_m,
         "dynamicPressurePa": dynamic_pressure,
+        "forceScaleN": force_scale,
+        "momentScaleNm": moment_scale,
+        "coefficients": coefficients,
+        "sixAxisLoadsAvailable": six_axis_available,
+        "qualificationStatus": qualification_status,
         "dragN": drag_n,
         "dragLbf": drag_n / newtons_per_lbf if drag_n is not None else None,
+        "signedSideForceN": side_n,
+        "signedSideForceLbf": side_n / newtons_per_lbf if side_n is not None else None,
         "signedLiftN": lift_n,
         "verticalForceType": vertical_type,
         "verticalForceN": vertical_n,
         "verticalForceLbf": vertical_n / newtons_per_lbf if vertical_n is not None else None,
+        **moments,
+        "rollMomentLbfFt": (
+            moments["rollMomentNm"] / newton_meters_per_lbf_ft
+            if moments["rollMomentNm"] is not None
+            else None
+        ),
+        "pitchMomentLbfFt": (
+            moments["pitchMomentNm"] / newton_meters_per_lbf_ft
+            if moments["pitchMomentNm"] is not None
+            else None
+        ),
+        "yawMomentLbfFt": (
+            moments["yawMomentNm"] / newton_meters_per_lbf_ft
+            if moments["yawMomentNm"] is not None
+            else None
+        ),
+        "aeroBalance": balance,
+    }
+
+
+def _aero_balance_summary(
+    datums: object,
+    signed_lift_n: float | None,
+    pitch_moment_nm: float | None,
+) -> dict[str, object] | None:
+    if not isinstance(datums, dict):
+        return {
+            "qualified": False,
+            "status": "vehicle_datums_missing",
+            "detail": "This legacy case has no explicit vehicle CG or axle stations.",
+        }
+    if not datums.get("balance_qualified"):
+        return {
+            "qualified": False,
+            "status": "vehicle_datums_incomplete",
+            "detail": str(datums.get("qualification_detail") or "CG and axle stations are required."),
+        }
+    cg = datums.get("center_of_gravity_m")
+    axis = str(datums.get("axle_station_axis") or datums.get("flow_axis") or "x")
+    if not isinstance(cg, dict) or axis not in {"x", "y", "z"}:
+        return {
+            "qualified": False,
+            "status": "vehicle_datums_invalid",
+            "detail": "The solver-coordinate CG or axle axis is invalid.",
+        }
+    cg_station = _finite_number(cg.get(axis))
+    front_station = _finite_number(datums.get("front_axle_station_m"))
+    rear_station = _finite_number(datums.get("rear_axle_station_m"))
+    if (
+        cg_station is None
+        or front_station is None
+        or rear_station is None
+        or rear_station <= front_station
+    ):
+        return {
+            "qualified": False,
+            "status": "vehicle_datums_invalid",
+            "detail": "The CG and front/rear axle stations do not define a positive wheelbase.",
+        }
+    if signed_lift_n is None or pitch_moment_nm is None:
+        return {
+            "qualified": False,
+            "status": "load_channels_missing",
+            "detail": "Signed lift and pitch moment are required to resolve axle loads.",
+        }
+    front_arm = front_station - cg_station
+    rear_arm = rear_station - cg_station
+    wheelbase = rear_station - front_station
+    front_load_n = (pitch_moment_nm + rear_arm * signed_lift_n) / wheelbase
+    rear_load_n = signed_lift_n - front_load_n
+    front_balance = (
+        front_load_n / signed_lift_n * 100.0
+        if abs(signed_lift_n) > 1e-12
+        else None
+    )
+    return {
+        "qualified": True,
+        "status": "qualified",
+        "axis": axis,
+        "wheelbaseM": wheelbase,
+        "frontArmFromCgM": front_arm,
+        "rearArmFromCgM": rear_arm,
+        "signedFrontVerticalLoadN": front_load_n,
+        "signedRearVerticalLoadN": rear_load_n,
+        "frontAeroBalancePercent": front_balance,
+        "detail": "Axle loads resolve signed lift and pitch moment about the declared CG.",
     }
 
 
@@ -1102,14 +1266,14 @@ def _quality_assessment(
             ),
         ),
         _quality_check(
-            "Force stability",
+            "Six-axis load stability",
             _completed_gate(force_coeffs, "stable", completed),
             (
-                "Time-averaged Cd and Cl are stable over the averaging window."
+                "Time-averaged force and moment coefficients are complete and stable over the averaging window."
                 if transient
-                else "Cd and Cl are stable in the final sample window."
+                else "Force and moment coefficients are complete and stable in the final sample window."
             ),
-            "Force coefficients are missing or their mean is still changing.",
+            "Six-axis force/moment coefficients are missing or their means are still changing.",
         ),
     ]
     if transient:
@@ -1170,6 +1334,17 @@ def _quality_assessment(
     return {
         "status": "verified" if trusted else "failed" if failed else "incomplete",
         "trusted": trusted,
+        "numericallyQualified": trusted,
+        "qualificationStatus": (
+            "numerically_qualified"
+            if trusted
+            else "qualification_failed" if failed else "qualification_incomplete"
+        ),
+        "qualificationLabel": (
+            "Numerically qualified"
+            if trusted
+            else "Numerical qualification failed" if failed else "Numerical qualification incomplete"
+        ),
         "checks": checks,
     }
 

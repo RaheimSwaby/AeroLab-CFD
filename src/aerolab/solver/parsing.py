@@ -7,6 +7,7 @@ import re
 import statistics
 from pathlib import Path
 
+from .statistics import analyze_transient_history
 from .util import _finite_number, _percentile, _read_json_object
 
 
@@ -24,15 +25,20 @@ def parse_force_coeffs(case_path: Path) -> dict[str, object] | None:
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
-    quality = _read_json_object(case_path / "case.json").get("cfd_quality")
+    case_payload = _read_json_object(case_path / "case.json")
+    quality = case_payload.get("cfd_quality")
     for path in candidates:
-        parsed = _parse_coeff_file(path, quality)
+        parsed = _parse_coeff_file(path, quality, case_payload)
         if parsed:
             return parsed
     return None
 
 
-def _parse_coeff_file(path: Path, quality: object = None) -> dict[str, object] | None:
+def _parse_coeff_file(
+    path: Path,
+    quality: object = None,
+    case_payload: dict[str, object] | None = None,
+) -> dict[str, object] | None:
     header: list[str] | None = None
     rows: list[dict[str, float]] = []
 
@@ -72,8 +78,11 @@ def _parse_coeff_file(path: Path, quality: object = None) -> dict[str, object] |
         if transient
         else min(len(rows), max(20, math.ceil(len(rows) * 0.2)))
     )
-    cd_stats = _series_statistics(averaging_rows, "Cd", window_count)
-    cl_stats = _series_statistics(averaging_rows, "Cl", window_count)
+    channel_names = ("Cd", "Cl", "Cs", "CmRoll", "CmPitch", "CmYaw")
+    channel_statistics = {
+        key: _series_statistics(averaging_rows, key, window_count)
+        for key in channel_names
+    }
     reasons: list[str] = []
     minimum_samples = 30
     if transient and isinstance(quality, dict):
@@ -85,47 +94,155 @@ def _parse_coeff_file(path: Path, quality: object = None) -> dict[str, object] |
             f"At least {minimum_samples} force samples are required"
             + (" in the averaging window." if transient else ".")
         )
-    if not cd_stats:
+
+    missing_channels = [key for key, stats in channel_statistics.items() if stats is None]
+    six_axis_complete = not missing_channels
+    if missing_channels:
         stable = False
-        reasons.append("Cd history is missing.")
-    else:
+        reasons.append(f"Six-axis history is missing: {', '.join(missing_channels)}.")
+
+    cd_stats = channel_statistics["Cd"]
+    if cd_stats:
         if not transient and cd_stats["relativeRange"] > 0.03:
             stable = False
             reasons.append("Cd varies by more than 3% in the final window.")
         if cd_stats["relativeDrift"] > 0.01:
             stable = False
             reasons.append("Mean Cd is still drifting by more than 1%.")
-    if cl_stats and (
-        cl_stats["absoluteDrift"] > 0.02
-        or (not transient and cl_stats["range"] > 0.05)
-    ):
-        stable = False
-        reasons.append("Mean Cl has not settled in the final window.")
 
-    return {
+    for key in ("Cl", "Cs"):
+        stats = channel_statistics[key]
+        if stats and (stats["absoluteDrift"] > 0.02 or (not transient and stats["range"] > 0.05)):
+            stable = False
+            reasons.append(f"Mean {key} has not settled in the final window.")
+
+    for key in ("CmRoll", "CmPitch", "CmYaw"):
+        stats = channel_statistics[key]
+        if stats and (stats["absoluteDrift"] > 0.01 or (not transient and stats["range"] > 0.05)):
+            stable = False
+            reasons.append(f"Mean {key} has not settled in the final window.")
+
+    transient_statistics = None
+    if transient:
+        transient_statistics = _transient_statistical_evidence(
+            rows,
+            channel_names,
+            quality,
+            case_payload or {},
+        )
+
+    result: dict[str, object] = {
         "file": str(path),
         "latest": latest,
         "time": latest.get("Time"),
-        "Cd": latest.get("Cd"),
-        "Cl": latest.get("Cl"),
-        "Cs": latest.get("Cs"),
-        "CmPitch": latest.get("CmPitch"),
-        "meanCd": cd_stats.get("mean") if cd_stats else None,
-        "meanCl": cl_stats.get("mean") if cl_stats else None,
         "averagingMode": "time-window" if transient else "final-sample-window",
         "windowStartTime": averaging_rows[0].get("Time") if averaging_rows else None,
         "windowEndTime": averaging_rows[-1].get("Time") if averaging_rows else None,
         "stable": stable,
+        "sixAxisComplete": six_axis_complete,
+        "availableChannels": [key for key in channel_names if channel_statistics[key] is not None],
+        "missingChannels": missing_channels,
         "statistics": {
             "sampleCount": len(rows),
             "windowSampleCount": window_count,
             "averagingWindowSeconds": averaging_window,
-            "Cd": cd_stats,
-            "Cl": cl_stats,
+            **channel_statistics,
+            "sixAxisComplete": six_axis_complete,
             "stable": stable,
             "reasons": reasons,
         },
     }
+    if transient_statistics is not None:
+        result["transientStatistics"] = transient_statistics
+    for key in channel_names:
+        result[key] = latest.get(key)
+        stats = channel_statistics[key]
+        result[f"mean{key}"] = stats.get("mean") if stats else None
+    return result
+
+
+def _transient_statistical_evidence(
+    rows: list[dict[str, float]],
+    channel_names: tuple[str, ...],
+    quality: object,
+    case_payload: dict[str, object],
+) -> dict[str, object]:
+    history = [dict(row) for row in rows]
+    balance_samples = _add_aero_balance_history(history, case_payload)
+    channels = channel_names + (("frontAeroBalancePercent",) if balance_samples else ())
+    quality_settings = quality if isinstance(quality, dict) else {}
+    flow = case_payload.get("flow") if isinstance(case_payload.get("flow"), dict) else {}
+    reference = (
+        case_payload.get("aerodynamic_reference")
+        if isinstance(case_payload.get("aerodynamic_reference"), dict)
+        else {}
+    )
+    result = analyze_transient_history(
+        history,
+        channels=channels,
+        warmup_time_s=_finite_number(quality_settings.get("warmup_time_s")),
+        averaging_window_s=_finite_number(quality_settings.get("averaging_window_s")),
+        flow_through_time_s=_finite_number(quality_settings.get("flow_through_time_s")),
+        reference_length_m=_finite_number(reference.get("length_m")),
+        speed_mps=_finite_number(flow.get("speed_mps")),
+    )
+    result["balance_evidence"] = {
+        "available": balance_samples > 0,
+        "sample_count": balance_samples,
+        "channel": "frontAeroBalancePercent" if balance_samples else None,
+        "detail": (
+            "Front aero-balance history was derived from Cl and CmPitch using the declared CG, "
+            "axle stations, and reference length."
+            if balance_samples
+            else "Aero-balance statistics require Cl, CmPitch, reference length, CG, and axle stations."
+        ),
+    }
+    return result
+
+
+def _add_aero_balance_history(
+    rows: list[dict[str, float]],
+    case_payload: dict[str, object],
+) -> int:
+    datums = case_payload.get("vehicle_datums")
+    reference = case_payload.get("aerodynamic_reference")
+    if not isinstance(datums, dict) or not datums.get("balance_qualified"):
+        return 0
+    if not isinstance(reference, dict):
+        return 0
+    center = datums.get("center_of_gravity_m")
+    axis = str(datums.get("axle_station_axis") or datums.get("flow_axis") or "x")
+    if not isinstance(center, dict) or axis not in {"x", "y", "z"}:
+        return 0
+    cg_station = _finite_number(center.get(axis))
+    front_station = _finite_number(datums.get("front_axle_station_m"))
+    rear_station = _finite_number(datums.get("rear_axle_station_m"))
+    reference_length = _finite_number(reference.get("length_m"))
+    if (
+        cg_station is None
+        or front_station is None
+        or rear_station is None
+        or reference_length is None
+        or reference_length <= 0
+        or rear_station <= front_station
+    ):
+        return 0
+    rear_arm = rear_station - cg_station
+    wheelbase = rear_station - front_station
+    count = 0
+    for row in rows:
+        lift_coefficient = _finite_number(row.get("Cl"))
+        pitch_coefficient = _finite_number(row.get("CmPitch"))
+        if lift_coefficient is None or pitch_coefficient is None or abs(lift_coefficient) <= 1e-12:
+            continue
+        front_coefficient = (
+            pitch_coefficient * reference_length + rear_arm * lift_coefficient
+        ) / wheelbase
+        balance = front_coefficient / lift_coefficient * 100.0
+        if math.isfinite(balance):
+            row["frontAeroBalancePercent"] = balance
+            count += 1
+    return count
 
 
 def _series_statistics(rows: list[dict[str, float]], key: str, window_count: int) -> dict[str, float] | None:
@@ -355,7 +472,7 @@ def parse_residuals(case_path: Path, quality: object = None) -> dict[str, object
     required_groups = {
         "velocity": any(name.lower().startswith("u") for name in histories),
         "pressure": any(name.lower() in {"p", "p_rgh"} for name in histories),
-        "turbulence": any(name.lower() in {"k", "omega"} for name in histories),
+        "turbulence": any(name.lower() in {"k", "omega", "nutilde"} for name in histories),
     }
     missing = [name for name, present in required_groups.items() if not present]
     if missing:
@@ -561,7 +678,7 @@ def _residual_threshold(field: str, quality: object = None) -> float:
             "pressure_residual_control"
             if name in {"p", "p_rgh"}
             else "turbulence_residual_control"
-            if name in {"k", "omega"}
+            if name in {"k", "omega", "nuTilda"}
             else "velocity_residual_control"
         )
         value = _finite_number(quality.get(key))

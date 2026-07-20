@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -162,9 +163,10 @@ def mesh_resolution_metadata(
     include_ground: bool,
     quality: str = "standard",
     smallest_aero_feature_m: float | None = None,
+    domain: dict[str, object] | None = None,
 ) -> dict[str, object]:
     preset = _quality_preset(quality)
-    tunnel = _wind_tunnel(bounds, flow_axis.lower(), include_ground, preset)
+    tunnel = _wind_tunnel(bounds, flow_axis.lower(), include_ground, preset, domain)
     minimum = tunnel["min"]
     maximum = tunnel["max"]
     cells = tunnel["cells"]
@@ -315,6 +317,13 @@ def generate_openfoam_case(
     smallest_aero_feature_m: float | None = None,
     wall_quality: str | None = None,
     simulation_mode: str = "steady",
+    air_density_kg_m3: float = 1.225,
+    kinematic_viscosity_m2_s: float = 1.5e-5,
+    turbulence_intensity: float = 0.01,
+    turbulence_length_scale_m: float | None = None,
+    force_reference_m: Vector | None = None,
+    physical_model: dict[str, object] | None = None,
+    body_rotation_center_source: Vector | None = None,
 ) -> list[Path]:
     flow_axis = flow_axis.lower()
     if flow_axis not in AXES:
@@ -325,6 +334,35 @@ def generate_openfoam_case(
     simulation_mode = str(simulation_mode or "steady").lower()
     if simulation_mode not in SIMULATION_MODES:
         raise ValueError(f"Unsupported simulation mode: {simulation_mode}")
+
+    model_settings = physical_model or {}
+    inflow_settings = _mapping_section(model_settings, "inflow")
+    surface_settings = _mapping_section(model_settings, "surface")
+    domain_settings = _mapping_section(model_settings, "domain")
+    outlet_settings = _mapping_section(model_settings, "outlet")
+    transient_settings = _mapping_section(model_settings, "transient")
+    road_settings = _mapping_section(model_settings, "road_and_wheels")
+    fluid_settings = _mapping_section(model_settings, "fluid")
+    turbulence_settings = _mapping_section(model_settings, "turbulence")
+    volume_zone_settings = _mapping_section(model_settings, "volume_zones")
+    wheels_value = road_settings.get("wheels")
+    wheels = [wheel for wheel in wheels_value if isinstance(wheel, dict)] if isinstance(wheels_value, list) else []
+    porous_value = volume_zone_settings.get("porous_zones")
+    porous_zones = (
+        [zone for zone in porous_value if isinstance(zone, dict)]
+        if isinstance(porous_value, list)
+        else []
+    )
+    fan_value = volume_zone_settings.get("fan_zones")
+    fan_zones = (
+        [zone for zone in fan_value if isinstance(zone, dict)]
+        if isinstance(fan_value, list)
+        else []
+    )
+    volume_zones = [*porous_zones, *fan_zones]
+    fluid_profile = str(fluid_settings.get("profile") or "incompressible")
+    solver_module = "fluid" if fluid_profile == "compressible_thermal" else "incompressibleFluid"
+    turbulence_model = str(turbulence_settings.get("model") or "kOmegaSST")
 
     dirs = [
         case_path / "0",
@@ -355,17 +393,40 @@ def generate_openfoam_case(
         rotation_degrees=model_rotation_degrees,
         translation=model_translation_m,
     )
+    wheel_stls: list[Path] = []
+    if wheels and body_rotation_center_source is None:
+        raise ValueError("Wheel geometry requires the shared body rotation center.")
+    for wheel in wheels:
+        patch = str(wheel["patch"])
+        wheel_stl = case_path / "constant" / "geometry" / f"{patch}.stl"
+        write_transformed_binary_stl(
+            Path(str(wheel["model_path"])),
+            wheel_stl,
+            scale=model_scale,
+            source_flow_direction=source_flow_direction,
+            source_up_direction=source_up_direction,
+            target_flow_axis=flow_axis,
+            rotation_degrees=model_rotation_degrees,
+            translation=model_translation_m,
+            rotation_center=body_rotation_center_source,
+        )
+        wheel_stls.append(wheel_stl)
 
-    tunnel = _wind_tunnel(report.bounds, flow_axis, include_ground, preset)
+    tunnel = _wind_tunnel(report.bounds, flow_axis, include_ground, preset, domain_settings)
     mesh_resolution = mesh_resolution_metadata(
         report.bounds,
         flow_axis,
         include_ground,
         quality,
         smallest_aero_feature_m,
+        domain=domain_settings,
     )
-    flow_vector = _axis_vector(flow_axis, speed_mps)
-    drag_dir = _axis_vector(flow_axis, 1.0)
+    flow_vector = (
+        _vector_value(inflow_settings["flow_vector_mps"])
+        if "flow_vector_mps" in inflow_settings
+        else _axis_vector(flow_axis, speed_mps)
+    )
+    drag_dir = _normalize_vector(flow_vector)
     lift_dir = (0.0, 0.0, 1.0) if flow_axis != "z" else (0.0, 1.0, 0.0)
     pitch_axis = _cross(lift_dir, drag_dir)
     reference_area = reference_area_m2 or estimate_reference_area(report, flow_axis)
@@ -378,7 +439,9 @@ def generate_openfoam_case(
         reference_length,
         float(mesh_resolution["estimated_surface_cell_m"]),
     )
-    center = _center(report.bounds)
+    center = force_reference_m or _center(report.bounds)
+    turbulent_length = turbulence_length_scale_m or 0.07 * reference_length
+    patch_names = ["body", *(str(wheel["patch"]) for wheel in wheels)]
 
     values = {
         "speed_mps": speed_mps,
@@ -389,27 +452,65 @@ def generate_openfoam_case(
         "reference_area": reference_area,
         "reference_length": reference_length,
         "center": center,
+        "air_density_kg_m3": air_density_kg_m3,
+        "kinematic_viscosity_m2_s": kinematic_viscosity_m2_s,
+        "turbulence_intensity": turbulence_intensity,
+        "turbulence_length_scale_m": turbulent_length,
         "include_ground": include_ground,
         "moving_ground": moving_ground,
         "ground_velocity": flow_vector if moving_ground else (0.0, 0.0, 0.0),
-        "k": _turbulent_kinetic_energy(speed_mps),
-        "omega": _specific_dissipation_rate(speed_mps, reference_length),
+        "k": _turbulent_kinetic_energy(speed_mps, turbulence_intensity),
+        "omega": _specific_dissipation_rate(
+            speed_mps,
+            turbulence_intensity,
+            turbulent_length,
+        ),
         "location_in_mesh": _location_in_mesh(tunnel),
         "refinement_boxes": _refinement_boxes(report.bounds, flow_axis),
         "wall_resolution": wall_resolution,
         "mesh_resolution": mesh_resolution,
         "quality": simulation_quality,
         "simulation_mode": simulation_mode,
+        "domain": domain_settings,
+        "backflow_safe_outlet": bool(outlet_settings.get("backflow_safe", False)),
+        "roughness_height_m": float(surface_settings.get("roughness_height_m", 0.0)),
+        "roughness_constant": float(surface_settings.get("roughness_constant", 0.5)),
+        "wheels": wheels,
+        "patch_names": patch_names,
+        "yawed_inflow": abs(float(inflow_settings.get("yaw_degrees", 0.0))) > 1e-12,
+        "second_order_temporal": bool(transient_settings.get("second_order_temporal", False)),
+        "fluid_profile": fluid_profile,
+        "solver_module": solver_module,
+        "turbulence_model": turbulence_model,
+        "air_temperature_k": float(fluid_settings.get("temperature_k", 288.15)),
+        "air_pressure_pa": float(fluid_settings.get("pressure_pa", 101325.0)),
+        "dynamic_viscosity_pa_s": float(
+            fluid_settings.get(
+                "dynamic_viscosity_pa_s",
+                air_density_kg_m3 * kinematic_viscosity_m2_s,
+            )
+        ),
+        "porous_zones": porous_zones,
+        "fan_zones": fan_zones,
+        "volume_zones": volume_zones,
+        "nu_tilda": 3.0 * kinematic_viscosity_m2_s,
     }
 
     files = {
-        "system/blockMeshDict": _block_mesh_dict(tunnel, flow_axis, include_ground),
+        "system/blockMeshDict": _block_mesh_dict(
+            tunnel,
+            flow_axis,
+            include_ground,
+            domain_settings,
+        ),
         "system/snappyHexMeshDict": _snappy_hex_mesh_dict(
             values["location_in_mesh"],
             values["refinement_boxes"],
             values["wall_resolution"],
             values["mesh_resolution"],
             preset,
+            wheels,
+            volume_zones,
         ),
         "system/streamlines": _streamlines_dict(
             tunnel,
@@ -417,30 +518,74 @@ def generate_openfoam_case(
             flow_axis,
             include_ground,
             simulation_mode,
+            "nuTilda" if turbulence_model != "kOmegaSST" else "k",
         ),
-        "system/wallShearStress": _wall_shear_stress_dict(),
-        "system/bodyPressure": _body_pressure_dict(simulation_mode),
+        "system/wallShearStress": _wall_shear_stress_dict(patch_names),
+        "system/bodyPressure": _body_pressure_dict(simulation_mode, patch_names),
         "system/yPlus": _y_plus_dict(),
-        "system/surfaceFeaturesDict": _surface_features_dict(),
+        "system/surfaceFeaturesDict": _surface_features_dict(wheels),
         "system/controlDict": _control_dict(values),
-        "system/fvSchemes": _fv_schemes(simulation_mode),
-        "system/fvSolution": _fv_solution(simulation_quality, simulation_mode),
+        "system/fvSchemes": _fv_schemes(
+            simulation_mode,
+            bool(values["second_order_temporal"]),
+            solver_module,
+            turbulence_model,
+        ),
+        "system/fvSolution": _fv_solution(
+            simulation_quality,
+            simulation_mode,
+            solver_module,
+            turbulence_model,
+        ),
         "system/decomposeParDict": _decompose_par_dict(),
-        "constant/physicalProperties": _physical_properties(),
-        "constant/momentumTransport": _momentum_transport(),
+        "constant/physicalProperties": (
+            _compressible_physical_properties(values)
+            if solver_module == "fluid"
+            else _physical_properties(kinematic_viscosity_m2_s)
+        ),
+        "constant/momentumTransport": _momentum_transport(turbulence_model),
         "0/U": _field_u(values),
-        "0/p": _field_p(include_ground),
-        "0/k": _field_scalar("k", "0 2 -2 0 0 0 0", values["k"], include_ground),
-        "0/omega": _field_scalar("omega", "0 0 -1 0 0 0 0", values["omega"], include_ground),
-        "0/nut": _field_nut(include_ground),
+        "0/p": (
+            _field_p_compressible(include_ground, values)
+            if solver_module == "fluid"
+            else _field_p(include_ground, values)
+        ),
+        "0/k": _field_scalar("k", "0 2 -2 0 0 0 0", values["k"], include_ground, values),
+        "0/omega": _field_scalar(
+            "omega",
+            "0 0 -1 0 0 0 0",
+            values["omega"],
+            include_ground,
+            values,
+        ),
+        "0/nut": _field_nut(include_ground, values),
         "Allmesh": _allmesh(),
-        "Allsolve": _allsolve(include_y_plus=int(wall_resolution["surface_layers"]) > 0),
-        "Allrun": _allrun(include_y_plus=int(wall_resolution["surface_layers"]) > 0),
+        "Allsolve": _allsolve(
+            include_y_plus=int(wall_resolution["surface_layers"]) > 0,
+            solver_module=solver_module,
+        ),
+        "Allrun": _allrun(
+            include_y_plus=int(wall_resolution["surface_layers"]) > 0,
+            solver_module=solver_module,
+        ),
         "run-wsl.ps1": _run_wsl_ps1(),
-        "README.case.md": _case_readme(include_ground, moving_ground),
+        "README.case.md": _case_readme(include_ground, moving_ground, values),
     }
+    if turbulence_model != "kOmegaSST":
+        files.pop("0/k")
+        files.pop("0/omega")
+        files["0/nuTilda"] = _field_nu_tilda(include_ground, values)
+        files["0/nut"] = _field_nut_spalart_allmaras(include_ground, values)
+    if solver_module == "fluid":
+        files["constant/thermophysicalTransport"] = _thermophysical_transport(
+            turbulence_model
+        )
+        files["0/T"] = _field_temperature(include_ground, values)
+        files["0/alphat"] = _field_alphat(include_ground, values)
+    if volume_zones:
+        files["constant/fvModels"] = _fv_models(porous_zones, fan_zones)
 
-    written: list[Path] = [body_stl]
+    written: list[Path] = [body_stl, *wheel_stls]
     for relative_path, content in files.items():
         path = case_path / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,8 +624,18 @@ def ensure_case_postprocessing(case_path: Path) -> dict[str, bool]:
             stream.write(_wall_shear_stress_dict())
 
     allrun = allrun_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    solver_module = "incompressibleFluid"
+    case_json_path = case_path / "case.json"
+    if case_json_path.is_file():
+        try:
+            case_payload = json.loads(case_json_path.read_text(encoding="utf-8"))
+            solver_module = str(case_payload.get("solver_module") or solver_module)
+        except (OSError, ValueError, TypeError):
+            pass
     body_command = "foamPostProcess -func bodyPressure -latestTime\n"
-    wall_command = "foamPostProcess -solver incompressibleFluid -func wallShearStress -latestTime\n"
+    wall_command = (
+        f"foamPostProcess -solver {solver_module} -func wallShearStress -latestTime\n"
+    )
     allrun_updated = body_command not in allrun or wall_command not in allrun
     if body_command not in allrun:
         body_step = (
@@ -532,25 +687,37 @@ def _quality_preset(quality: str) -> dict[str, object]:
     return QUALITY_PRESETS[key]
 
 
-def _wind_tunnel(bounds: Bounds, flow_axis: str, include_ground: bool, preset: dict[str, object]) -> dict[str, object]:
-    axis = AXES[flow_axis]
-    dims = bounds.dimensions
-    flow_dim = max(dims[axis], 1.0)
-    cross_dim = max((dims[i] for i in range(3) if i != axis), default=1.0)
-    cross_dim = max(cross_dim, 1.0)
+def _wind_tunnel(
+    bounds: Bounds,
+    flow_axis: str,
+    include_ground: bool,
+    preset: dict[str, object],
+    domain: dict[str, object] | None = None,
+) -> dict[str, object]:
+    domain = domain or {}
+    closed = domain.get("closed_tunnel")
+    if domain.get("mode") == "closed_tunnel" and isinstance(closed, dict):
+        minimum = list(_vector_value(closed["minimum_m"]))
+        maximum = list(_vector_value(closed["maximum_m"]))
+    else:
+        axis = AXES[flow_axis]
+        dims = bounds.dimensions
+        flow_dim = max(dims[axis], 1.0)
+        cross_dim = max((dims[i] for i in range(3) if i != axis), default=1.0)
+        cross_dim = max(cross_dim, 1.0)
 
-    minimum = list(bounds.minimum)
-    maximum = list(bounds.maximum)
-    for i in range(3):
-        if i == axis:
-            minimum[i] -= 3.0 * flow_dim
-            maximum[i] += 7.0 * flow_dim
-        else:
-            minimum[i] -= 3.0 * cross_dim
-            maximum[i] += 3.0 * cross_dim
+        minimum = list(bounds.minimum)
+        maximum = list(bounds.maximum)
+        for i in range(3):
+            if i == axis:
+                minimum[i] -= 3.0 * flow_dim
+                maximum[i] += 7.0 * flow_dim
+            else:
+                minimum[i] -= 3.0 * cross_dim
+                maximum[i] += 3.0 * cross_dim
 
-    if include_ground:
-        minimum[2] = 0.0
+        if include_ground:
+            minimum[2] = 0.0
 
     size = [maximum[i] - minimum[i] for i in range(3)]
     target_divisions = float(preset["tunnel_divisions"])
@@ -593,7 +760,12 @@ def _refinement_boxes(bounds: Bounds, flow_axis: str) -> dict[str, dict[str, Vec
     }
 
 
-def _block_mesh_dict(tunnel: dict[str, object], flow_axis: str, include_ground: bool) -> str:
+def _block_mesh_dict(
+    tunnel: dict[str, object],
+    flow_axis: str,
+    include_ground: bool,
+    domain: dict[str, object] | None = None,
+) -> str:
     minimum = tunnel["min"]
     maximum = tunnel["max"]
     cells = tunnel["cells"]
@@ -614,6 +786,16 @@ def _block_mesh_dict(tunnel: dict[str, object], flow_axis: str, include_ground: 
     }
     inlet_face = {"x": "x_min", "y": "y_min", "z": "z_min"}[flow_axis]
     outlet_face = {"x": "x_max", "y": "y_max", "z": "z_max"}[flow_axis]
+    if (domain or {}).get("mode") == "closed_tunnel":
+        return _closed_tunnel_block_mesh_dict(
+            minimum,
+            maximum,
+            cells,
+            faces,
+            inlet_face,
+            outlet_face,
+            flow_axis,
+        )
     farfield_faces = [name for name in faces if name not in {inlet_face, outlet_face}]
 
     ground_section = ""
@@ -691,12 +873,101 @@ mergePatchPairs
 """
 
 
+def _closed_tunnel_block_mesh_dict(
+    minimum: tuple[float, float, float],
+    maximum: tuple[float, float, float],
+    cells: tuple[int, int, int],
+    faces: dict[str, str],
+    inlet_face: str,
+    outlet_face: str,
+    flow_axis: str,
+) -> str:
+    x0, y0, z0 = minimum
+    x1, y1, z1 = maximum
+    nx, ny, nz = cells
+    side_faces = ("y_min", "y_max") if flow_axis == "x" else ("x_min", "x_max")
+    side_face_lines = "\n            ".join(faces[name] for name in side_faces)
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object blockMeshDict;
+}}
+
+convertToMeters 1;
+
+vertices
+(
+    ({x0:.9g} {y0:.9g} {z0:.9g})
+    ({x1:.9g} {y0:.9g} {z0:.9g})
+    ({x1:.9g} {y1:.9g} {z0:.9g})
+    ({x0:.9g} {y1:.9g} {z0:.9g})
+    ({x0:.9g} {y0:.9g} {z1:.9g})
+    ({x1:.9g} {y0:.9g} {z1:.9g})
+    ({x1:.9g} {y1:.9g} {z1:.9g})
+    ({x0:.9g} {y1:.9g} {z1:.9g})
+);
+
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) ({nx} {ny} {nz}) simpleGrading (1 1 1)
+);
+
+edges
+(
+);
+
+boundary
+(
+    inlet
+    {{
+        type patch;
+        faces ({faces[inlet_face]});
+    }}
+
+    outlet
+    {{
+        type patch;
+        faces ({faces[outlet_face]});
+    }}
+
+    sideWalls
+    {{
+        type wall;
+        faces
+        (
+            {side_face_lines}
+        );
+    }}
+
+    ceiling
+    {{
+        type wall;
+        faces ({faces["z_max"]});
+    }}
+
+    ground
+    {{
+        type wall;
+        faces ({faces["z_min"]});
+    }}
+);
+
+mergePatchPairs
+(
+);
+"""
+
+
 def _snappy_hex_mesh_dict(
     location_in_mesh: object,
     refinement_boxes: object,
     wall_resolution: object,
     mesh_resolution: object,
     preset: dict[str, object],
+    wheels: list[dict[str, object]] | None = None,
+    volume_zones: list[dict[str, object]] | None = None,
 ) -> str:
     assert isinstance(refinement_boxes, dict)
     body_box = refinement_boxes["bodyRefinement"]
@@ -714,6 +985,70 @@ def _snappy_hex_mesh_dict(
     wake_region_level = int(mesh_resolution["configured_wake_region_level"])
     transition_levels = int(mesh_resolution["configured_n_cells_between_levels"])
     surface_layers = int(wall_resolution["surface_layers"])
+    wheel_list = wheels or []
+    wheel_geometry = "".join(
+        f'''\n\n    {wheel["patch"]}
+    {{
+        type triSurface;
+        file "{wheel["patch"]}.stl";
+    }}'''
+        for wheel in wheel_list
+    )
+    wheel_feature_entries = "".join(
+        f'''\n        {{
+            file "{wheel["patch"]}.eMesh";
+            level {feature_level};
+        }}'''
+        for wheel in wheel_list
+    )
+    wheel_refinement_surfaces = "".join(
+        f'''\n\n        {wheel["patch"]}
+        {{
+            level ({surface_min_level} {surface_max_level});
+            patchInfo
+            {{
+                type wall;
+                inGroups (bodyGroup);
+            }}
+        }}'''
+        for wheel in wheel_list
+    )
+    wheel_layers = "".join(
+        f'''\n\n        {wheel["patch"]}
+        {{
+            nSurfaceLayers {surface_layers};
+        }}'''
+        for wheel in wheel_list
+    )
+    zone_list = volume_zones or []
+    zone_geometry = "".join(
+        f'''\n\n    {zone["name"]}
+    {{
+        type box;
+        min {_foam_vec(_vector_value(zone["minimum_m"]))};
+        max {_foam_vec(_vector_value(zone["maximum_m"]))};
+    }}'''
+        for zone in zone_list
+    )
+    zone_refinement_surfaces = "".join(
+        f'''\n\n        {zone["name"]}
+        {{
+            level ({body_region_level} {body_region_level});
+            faceZone {zone["face_zone"]};
+            cellZone {zone["cell_zone"]};
+            mode inside;
+            faceType internal;
+        }}'''
+        for zone in zone_list
+    )
+    zone_refinement_regions = "".join(
+        f'''\n\n        {zone["name"]}
+        {{
+            mode inside;
+            level {body_region_level};
+        }}'''
+        for zone in zone_list
+    )
     add_layers = "true" if surface_layers > 0 else "false"
     layers = (
         f"""layers
@@ -721,7 +1056,7 @@ def _snappy_hex_mesh_dict(
         body
         {{
             nSurfaceLayers {surface_layers};
-        }}
+        }}{wheel_layers}
     }}"""
         if surface_layers > 0
         else "layers {}"
@@ -744,7 +1079,7 @@ geometry
     {{
         type triSurface;
         file "body.stl";
-    }}
+    }}{wheel_geometry}
 
     bodyRefinement
     {{
@@ -758,7 +1093,7 @@ geometry
         type box;
         min {_foam_vec(wake_box["min"])};
         max {_foam_vec(wake_box["max"])};
-    }}
+    }}{zone_geometry}
 }}
 
 castellatedMeshControls
@@ -774,7 +1109,7 @@ castellatedMeshControls
         {{
             file "body.eMesh";
             level {feature_level};
-        }}
+        }}{wheel_feature_entries}
     );
 
     refinementSurfaces
@@ -787,7 +1122,7 @@ castellatedMeshControls
                 type wall;
                 inGroups (bodyGroup);
             }}
-        }}
+        }}{wheel_refinement_surfaces}{zone_refinement_surfaces}
     }}
 
     resolveFeatureAngle 30;
@@ -803,7 +1138,7 @@ castellatedMeshControls
         {{
             mode inside;
             level {wake_region_level};
-        }}
+        }}{zone_refinement_regions}
     }}
 
     insidePoint {_foam_vec(location_in_mesh)};
@@ -866,23 +1201,26 @@ mergeTolerance 1e-6;
 """
 
 
-def _surface_features_dict() -> str:
-    return """FoamFile
-{
+def _surface_features_dict(wheels: list[dict[str, object]] | None = None) -> str:
+    surfaces = " ".join(
+        ["\"body.stl\"", *(f'\"{wheel["patch"]}.stl\"' for wheel in (wheels or []))]
+    )
+    return f"""FoamFile
+{{
     version 2.0;
     format ascii;
     class dictionary;
     object surfaceFeaturesDict;
-}
+}}
 
-surfaces ("body.stl");
+surfaces ({surfaces});
 includedAngle 150;
 
 subsetFeatures
-{
+{{
     nonManifoldEdges no;
     openEdges yes;
-}
+}}
 """
 
 
@@ -892,12 +1230,17 @@ def _streamlines_dict(
     flow_axis: str,
     include_ground: bool,
     simulation_mode: str = "steady",
+    turbulence_field_name: str = "k",
 ) -> str:
     seed_points = _streamline_seed_points(tunnel, bounds, flow_axis, include_ground)
     point_lines = "\n".join(f"        {_foam_vec(point)}" for point in seed_points)
     velocity_field = "UMean" if simulation_mode == "transient" else "U"
     pressure_field = "pMean" if simulation_mode == "transient" else "p"
-    turbulence_field = "kMean" if simulation_mode == "transient" else "k"
+    turbulence_field = (
+        f"{turbulence_field_name}Mean"
+        if simulation_mode == "transient"
+        else turbulence_field_name
+    )
     return f"""type streamlines;
 libs ("libfieldFunctionObjects.so");
 writeControl writeTime;
@@ -993,21 +1336,26 @@ log yes;
 """
 
 
-def _wall_shear_stress_dict() -> str:
-    return """type wallShearStress;
+def _wall_shear_stress_dict(patch_names: list[str] | None = None) -> str:
+    patches = " ".join(patch_names or ["body"])
+    return f"""type wallShearStress;
 libs ("libfieldFunctionObjects.so");
 writeControl writeTime;
-patches (body);
+patches ({patches});
 log yes;
 """
 
 
-def _body_pressure_dict(simulation_mode: str = "steady") -> str:
+def _body_pressure_dict(
+    simulation_mode: str = "steady",
+    patch_names: list[str] | None = None,
+) -> str:
     fields = (
         "pMean wallShearStressMean"
         if simulation_mode == "transient"
         else "p wallShearStress"
     )
+    patches = " ".join(patch_names or ["body"])
     return f"""type surfaces;
 libs ("libsampling.so");
 writeControl writeTime;
@@ -1021,7 +1369,7 @@ surfaces
     body
     {{
         type patch;
-        patches (body);
+        patches ({patches});
         triangulate yes;
         interpolate no;
     }}
@@ -1030,9 +1378,14 @@ surfaces
 
 
 def _control_dict(values: dict[str, object]) -> str:
+    solver_module = str(values.get("solver_module") or "incompressibleFluid")
+    turbulence_model = str(values.get("turbulence_model") or "kOmegaSST")
+    if solver_module != "incompressibleFluid" or turbulence_model != "kOmegaSST":
+        return _control_dict_advanced(values, solver_module, turbulence_model)
     quality = values["quality"]
     assert isinstance(quality, dict)
     simulation_mode = str(values.get("simulation_mode") or "steady")
+    patches = " ".join(str(patch) for patch in values.get("patch_names", ["body"]))
     if simulation_mode == "transient":
         time_controls = f"""endTime {float(quality["end_time"]):.9g};
 deltaT {float(quality["initial_delta_t_s"]):.9g};
@@ -1047,7 +1400,7 @@ maxDeltaT {float(quality["maximum_delta_t_s"]):.9g};"""
     {{
         type wallShearStress;
         libs ("libfieldFunctionObjects.so");
-        patches (body);
+        patches ({patches});
         writeControl writeTime;
         log no;
     }}
@@ -1100,9 +1453,9 @@ functions
     {{
         type forceCoeffs;
         libs ("libforces.so");
-        patches (body);
+        patches ({patches});
         rho rhoInf;
-        rhoInf 1.225;
+        rhoInf {values["air_density_kg_m3"]:.9g};
         CofR {_foam_vec(values["center"])};
         liftDir {_foam_vec(values["lift_dir"])};
         dragDir {_foam_vec(values["drag_dir"])};
@@ -1118,8 +1471,129 @@ functions
 """
 
 
-def _fv_schemes(simulation_mode: str = "steady") -> str:
-    ddt_scheme = "Euler" if simulation_mode == "transient" else "steadyState"
+def _control_dict_advanced(
+    values: dict[str, object],
+    solver_module: str,
+    turbulence_model: str,
+) -> str:
+    quality = values["quality"]
+    assert isinstance(quality, dict)
+    simulation_mode = str(values.get("simulation_mode") or "steady")
+    patches = " ".join(str(patch) for patch in values.get("patch_names", ["body"]))
+    if simulation_mode == "transient":
+        time_controls = f"""endTime {float(quality["end_time"]):.9g};
+deltaT {float(quality["initial_delta_t_s"]):.9g};
+writeControl adjustableRunTime;
+writeInterval {float(quality["write_interval_s"]):.9g};
+adjustTimeStep yes;
+maxCo {float(quality["maximum_courant_number"]):.9g};
+maxDeltaT {float(quality["maximum_delta_t_s"]):.9g};"""
+        turbulence_field = "nuTilda" if turbulence_model != "kOmegaSST" else "k"
+        average_fields = ["U", "p"]
+        if solver_module == "fluid":
+            average_fields.append("T")
+        average_fields.extend((turbulence_field, "wallShearStress"))
+        average_functions = f"""
+
+    wallShearStressAverageInput
+    {{
+        type wallShearStress;
+        libs ("libfieldFunctionObjects.so");
+        patches ({patches});
+        writeControl writeTime;
+        log no;
+    }}
+
+    fieldAverage
+    {{
+        type fieldAverage;
+        libs ("libfieldFunctionObjects.so");
+        writeControl writeTime;
+        restartOnRestart false;
+        restartOnOutput false;
+        periodicRestart false;
+        base time;
+        window {float(quality["averaging_window_s"]):.9g};
+        mean yes;
+        prime2Mean yes;
+        fields ({" ".join(average_fields)});
+    }}"""
+    else:
+        time_controls = f"""endTime {quality["end_time"]};
+deltaT 1;
+writeControl timeStep;
+writeInterval {quality["write_interval"]};"""
+        average_functions = ""
+    density_setup = (
+        "rho rho;"
+        if solver_module == "fluid"
+        else f'rho rhoInf;\n        rhoInf {values["air_density_kg_m3"]:.9g};'
+    )
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object controlDict;
+}}
+
+solver {solver_module};
+
+startFrom startTime;
+startTime 0;
+stopAt endTime;
+{time_controls}
+purgeWrite 2;
+writeFormat ascii;
+writePrecision 6;
+writeCompression off;
+timeFormat general;
+timePrecision 6;
+runTimeModifiable true;
+
+functions
+{{
+    forceCoeffs
+    {{
+        type forceCoeffs;
+        libs ("libforces.so");
+        patches ({patches});
+        {density_setup}
+        CofR {_foam_vec(values["center"])};
+        liftDir {_foam_vec(values["lift_dir"])};
+        dragDir {_foam_vec(values["drag_dir"])};
+        pitchAxis {_foam_vec(values["pitch_axis"])};
+        magUInf {values["speed_mps"]:.9g};
+        lRef {values["reference_length"]:.9g};
+        Aref {values["reference_area"]:.9g};
+        writeControl timeStep;
+        timeInterval {quality["force_write_interval"]};
+        log yes;
+    }}{average_functions}
+}}
+"""
+
+
+def _fv_schemes(
+    simulation_mode: str = "steady",
+    second_order_temporal: bool = False,
+    solver_module: str = "incompressibleFluid",
+    turbulence_model: str = "kOmegaSST",
+) -> str:
+    if solver_module != "incompressibleFluid" or turbulence_model != "kOmegaSST":
+        return _fv_schemes_advanced(
+            simulation_mode,
+            second_order_temporal,
+            solver_module,
+            turbulence_model,
+        )
+    ddt_scheme = (
+        "backward"
+        if simulation_mode == "transient" and second_order_temporal
+        else "Euler"
+        if simulation_mode == "transient"
+        else "steadyState"
+    )
     bounded = "" if simulation_mode == "transient" else "bounded "
     template = """FoamFile
 {
@@ -1172,10 +1646,104 @@ wallDist
     return template.replace("__DDT_SCHEME__", ddt_scheme).replace("__BOUNDED__", bounded)
 
 
+def _fv_schemes_advanced(
+    simulation_mode: str,
+    second_order_temporal: bool,
+    solver_module: str,
+    turbulence_model: str,
+) -> str:
+    ddt_scheme = (
+        "backward"
+        if simulation_mode == "transient" and second_order_temporal
+        else "Euler"
+        if simulation_mode == "transient"
+        else "steadyState"
+    )
+    bounded = "" if simulation_mode == "transient" else "bounded "
+    turbulence_field = "nuTilda" if turbulence_model != "kOmegaSST" else "k"
+    turbulence_divergence = (
+        f"    div(phi,k) {bounded}Gauss upwind;\n"
+        f"    div(phi,omega) {bounded}Gauss upwind;"
+        if turbulence_model == "kOmegaSST"
+        else f"    div(phi,nuTilda) {bounded}Gauss limitedLinear 1;"
+    )
+    stress_divergence = (
+        "    div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;"
+        if solver_module == "fluid"
+        else "    div((nuEff*dev2(T(grad(U))))) Gauss linear;"
+    )
+    energy_divergence = ""
+    if solver_module == "fluid":
+        energy_divergence = f"""
+    div(phi,h) {bounded}Gauss linearUpwind grad(h);
+    div(phi,e) {bounded}Gauss linearUpwind grad(e);
+    div(phi,K) {bounded}Gauss linearUpwind grad(K);
+    div(phi,Ekp) {bounded}Gauss linearUpwind grad(Ekp);
+    div(phi,(p|rho)) {bounded}Gauss upwind;
+    div((phi|interpolate(rho)),p) Gauss upwind;"""
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object fvSchemes;
+}}
+
+ddtSchemes
+{{
+    default {ddt_scheme};
+}}
+
+gradSchemes
+{{
+    default Gauss linear;
+    grad(U) cellLimited Gauss linear 1;
+    grad({turbulence_field}) cellLimited Gauss linear 1;
+}}
+
+divSchemes
+{{
+    default none;
+    div(phi,U) {bounded}Gauss linearUpwind grad(U);
+{turbulence_divergence}{energy_divergence}
+{stress_divergence}
+}}
+
+laplacianSchemes
+{{
+    default Gauss linear corrected;
+}}
+
+interpolationSchemes
+{{
+    default linear;
+}}
+
+snGradSchemes
+{{
+    default corrected;
+}}
+
+wallDist
+{{
+    method meshWave;
+}}
+"""
+
+
 def _fv_solution(
     quality: dict[str, object],
     simulation_mode: str = "steady",
+    solver_module: str = "incompressibleFluid",
+    turbulence_model: str = "kOmegaSST",
 ) -> str:
+    if solver_module != "incompressibleFluid" or turbulence_model != "kOmegaSST":
+        return _fv_solution_advanced(
+            quality,
+            simulation_mode,
+            solver_module,
+            turbulence_model,
+        )
     if simulation_mode == "transient":
         return f"""FoamFile
 {{
@@ -1362,6 +1930,102 @@ cache
     )
 
 
+def _fv_solution_advanced(
+    quality: dict[str, object],
+    simulation_mode: str,
+    solver_module: str,
+    turbulence_model: str,
+) -> str:
+    turbulence_pattern = "k|omega" if turbulence_model == "kOmegaSST" else "nuTilda"
+    energy_pattern = "|h|e|rho" if solver_module == "fluid" else ""
+    field_pattern = f"U|{turbulence_pattern}{energy_pattern}"
+    outer_correctors = int(quality["pimple_outer_correctors"]) if simulation_mode == "transient" else 1
+    pressure_correctors = (
+        int(quality["pimple_pressure_correctors"])
+        if simulation_mode == "transient"
+        else 2
+    )
+    residual_energy = f'        "(h|e)" {float(quality["turbulence_residual_control"]):.9g};\n' if solver_module == "fluid" else ""
+    relaxation_fields = (
+        """    fields
+    {
+        p 0.3;
+        rho 0.01;
+    }
+
+"""
+        if solver_module == "fluid" and simulation_mode == "steady"
+        else ""
+    )
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object fvSolution;
+}}
+
+solvers
+{{
+    p
+    {{
+        solver GAMG;
+        tolerance 1e-7;
+        relTol 0.01;
+        smoother GaussSeidel;
+    }}
+
+    pFinal
+    {{
+        $p;
+        relTol 0;
+    }}
+
+    "({field_pattern})"
+    {{
+        solver PBiCGStab;
+        preconditioner DILU;
+        tolerance 1e-8;
+        relTol 0.1;
+    }}
+
+    "({field_pattern})Final"
+    {{
+        $U;
+        relTol 0;
+    }}
+}}
+
+PIMPLE
+{{
+    nOuterCorrectors {outer_correctors};
+    nCorrectors {pressure_correctors};
+    nNonOrthogonalCorrectors 0;
+    momentumPredictor yes;
+    consistent yes;
+    residualControl
+    {{
+        p {float(quality["pressure_residual_control"]):.9g};
+        U {float(quality["velocity_residual_control"]):.9g};
+        "({turbulence_pattern})" {float(quality["turbulence_residual_control"]):.9g};
+{residual_energy}    }}
+}}
+
+relaxationFactors
+{{
+{relaxation_fields}    equations
+    {{
+        ".*" {1 if simulation_mode == "transient" else float(quality["velocity_relaxation"]):.9g};
+    }}
+}}
+
+cache
+{{
+    grad(U);
+}}
+"""
+
+
 def _decompose_par_dict() -> str:
     return """FoamFile
 {
@@ -1376,21 +2040,118 @@ method scotch;
 """
 
 
-def _physical_properties() -> str:
-    return """FoamFile
-{
+def _physical_properties(kinematic_viscosity_m2_s: float = 1.5e-5) -> str:
+    return f"""FoamFile
+{{
     version 2.0;
     format ascii;
     class dictionary;
     object physicalProperties;
-}
+}}
 
 viscosityModel constant;
-nu [0 2 -1 0 0 0 0] 1.5e-05;
+nu [0 2 -1 0 0 0 0] {kinematic_viscosity_m2_s:.9g};
 """
 
 
-def _momentum_transport() -> str:
+def _compressible_physical_properties(values: dict[str, object]) -> str:
+    energy = (
+        "sensibleInternalEnergy"
+        if values.get("simulation_mode") == "transient"
+        else "sensibleEnthalpy"
+    )
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object physicalProperties;
+}}
+
+thermoType
+{{
+    type hePsiThermo;
+    mixture pureMixture;
+    transport const;
+    thermo hConst;
+    equationOfState perfectGas;
+    specie specie;
+    energy {energy};
+}}
+
+mixture
+{{
+    specie
+    {{
+        molWeight 28.965;
+    }}
+    thermodynamics
+    {{
+        Cp 1005;
+        hf 0;
+    }}
+    transport
+    {{
+        mu {float(values["dynamic_viscosity_pa_s"]):.9g};
+        Pr 0.71;
+    }}
+}}
+"""
+
+
+def _thermophysical_transport(turbulence_model: str) -> str:
+    simulation_type = "RAS" if turbulence_model == "kOmegaSST" else "LES"
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object thermophysicalTransport;
+}}
+
+{simulation_type}
+{{
+    model eddyDiffusivity;
+    Prt 0.85;
+}}
+"""
+
+
+def _momentum_transport(turbulence_model: str = "kOmegaSST") -> str:
+    if turbulence_model != "kOmegaSST":
+        delta = "IDDESDelta" if turbulence_model == "SpalartAllmarasIDDES" else "cubeRootVol"
+        delta_coefficients = (
+            """
+    IDDESDeltaCoeffs
+    {
+        Cw 0.15;
+    }
+"""
+            if delta == "IDDESDelta"
+            else """
+    cubeRootVolCoeffs
+    {
+        deltaCoeff 1;
+    }
+"""
+        )
+        return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object momentumTransport;
+}}
+
+simulationType LES;
+
+LES
+{{
+    model {turbulence_model};
+    delta {delta};
+    turbulence on;
+{delta_coefficients}}}
+"""
     return """FoamFile
 {
     version 2.0;
@@ -1410,6 +2171,17 @@ RAS
 
 
 def _field_u(values: dict[str, object]) -> str:
+    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
+    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    advanced = bool(
+        values.get("backflow_safe_outlet")
+        or values.get("yawed_inflow")
+        or domain.get("mode") == "closed_tunnel"
+        or wheels
+    )
+    if advanced:
+        return _field_u_advanced(values, domain, wheels)
+
     ground_patch = ""
     if values["include_ground"]:
         ground_patch = f"""
@@ -1456,7 +2228,426 @@ boundaryField
 """
 
 
-def _field_p(include_ground: bool) -> str:
+def _field_u_advanced(
+    values: dict[str, object],
+    domain: dict[str, object],
+    wheels: list[object],
+) -> str:
+    flow = _foam_vec(values["flow_vector"])
+    if values.get("backflow_safe_outlet"):
+        outlet_patch = f"""    outlet
+    {{
+        type pressureInletOutletVelocity;
+        value uniform {flow};
+    }}"""
+    else:
+        outlet_patch = """    outlet
+    {
+        type zeroGradient;
+    }"""
+    if domain.get("mode") == "closed_tunnel":
+        domain_patch = """    sideWalls
+    {
+        type noSlip;
+    }
+
+    ceiling
+    {
+        type noSlip;
+    }"""
+    elif values.get("yawed_inflow"):
+        domain_patch = f"""    farfield
+    {{
+        type inletOutlet;
+        inletValue uniform {flow};
+        value uniform {flow};
+    }}"""
+    else:
+        domain_patch = """    farfield
+    {
+        type slip;
+    }"""
+    ground_patch = ""
+    if values["include_ground"]:
+        ground_patch = f"""
+
+    ground
+    {{
+        type fixedValue;
+        value uniform {_foam_vec(values["ground_velocity"])};
+    }}"""
+    wheel_patches = ""
+    for wheel_value in wheels:
+        if not isinstance(wheel_value, dict):
+            continue
+        wheel_patches += f"""
+
+    {wheel_value["patch"]}
+    {{
+        type rotatingWallVelocity;
+        origin {_foam_vec(_vector_value(wheel_value["center_m"]))};
+        axis {_foam_vec(_vector_value(wheel_value["axis"]))};
+        omega {float(wheel_value["omega_rad_s"]):.9g};
+    }}"""
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class volVectorField;
+    object U;
+}}
+
+dimensions [0 1 -1 0 0 0 0];
+internalField uniform {flow};
+
+boundaryField
+{{
+    inlet
+    {{
+        type fixedValue;
+        value uniform {flow};
+    }}
+
+{outlet_patch}
+
+{domain_patch}{ground_patch}
+
+    body
+    {{
+        type noSlip;
+    }}{wheel_patches}
+}}
+"""
+
+
+def _field_p_compressible(
+    include_ground: bool,
+    values: dict[str, object],
+) -> str:
+    pressure = float(values["air_pressure_pa"])
+    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
+    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    if values.get("simulation_mode") == "transient":
+        outlet_patch = f"""    outlet
+    {{
+        type waveTransmissive;
+        field p;
+        gamma 1.4;
+        fieldInf {pressure:.9g};
+        lInf {float(values["reference_length"]):.9g};
+        value uniform {pressure:.9g};
+    }}"""
+    else:
+        outlet_patch = f"""    outlet
+    {{
+        type fixedValue;
+        value uniform {pressure:.9g};
+    }}"""
+    if domain.get("mode") == "closed_tunnel":
+        domain_patches = """    sideWalls
+    {
+        type zeroGradient;
+    }
+
+    ceiling
+    {
+        type zeroGradient;
+    }"""
+    elif values.get("yawed_inflow"):
+        domain_patches = f"""    farfield
+    {{
+        type freestreamPressure;
+        freestreamValue uniform {pressure:.9g};
+        value uniform {pressure:.9g};
+    }}"""
+    else:
+        domain_patches = """    farfield
+    {
+        type zeroGradient;
+    }"""
+    ground_patch = ""
+    if include_ground:
+        ground_patch = """
+
+    ground
+    {
+        type zeroGradient;
+    }"""
+    wheel_patches = "".join(
+        f"""
+
+    {wheel["patch"]}
+    {{
+        type zeroGradient;
+    }}"""
+        for wheel in wheels
+        if isinstance(wheel, dict)
+    )
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class volScalarField;
+    object p;
+}}
+
+dimensions [1 -1 -2 0 0 0 0];
+internalField uniform {pressure:.9g};
+
+boundaryField
+{{
+    inlet
+    {{
+        type zeroGradient;
+    }}
+
+{outlet_patch}
+
+{domain_patches}{ground_patch}
+
+    body
+    {{
+        type zeroGradient;
+    }}{wheel_patches}
+}}
+"""
+
+
+def _field_temperature(
+    include_ground: bool,
+    values: dict[str, object],
+) -> str:
+    temperature = float(values["air_temperature_k"])
+    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
+    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    outlet_patch = (
+        f"""    outlet
+    {{
+        type inletOutlet;
+        inletValue uniform {temperature:.9g};
+        value uniform {temperature:.9g};
+    }}"""
+        if values.get("backflow_safe_outlet")
+        else """    outlet
+    {
+        type zeroGradient;
+    }"""
+    )
+    if domain.get("mode") == "closed_tunnel":
+        domain_patches = """    sideWalls
+    {
+        type zeroGradient;
+    }
+
+    ceiling
+    {
+        type zeroGradient;
+    }"""
+    elif values.get("yawed_inflow"):
+        domain_patches = f"""    farfield
+    {{
+        type inletOutlet;
+        inletValue uniform {temperature:.9g};
+        value uniform {temperature:.9g};
+    }}"""
+    else:
+        domain_patches = """    farfield
+    {
+        type zeroGradient;
+    }"""
+    ground_patch = ""
+    if include_ground:
+        ground_patch = """
+
+    ground
+    {
+        type zeroGradient;
+    }"""
+    wheel_patches = "".join(
+        f"""
+
+    {wheel["patch"]}
+    {{
+        type zeroGradient;
+    }}"""
+        for wheel in wheels
+        if isinstance(wheel, dict)
+    )
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class volScalarField;
+    object T;
+}}
+
+dimensions [0 0 0 1 0 0 0];
+internalField uniform {temperature:.9g};
+
+boundaryField
+{{
+    inlet
+    {{
+        type fixedValue;
+        value uniform {temperature:.9g};
+    }}
+
+{outlet_patch}
+
+{domain_patches}{ground_patch}
+
+    body
+    {{
+        type zeroGradient;
+    }}{wheel_patches}
+}}
+"""
+
+
+def _field_alphat(
+    include_ground: bool,
+    values: dict[str, object],
+) -> str:
+    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
+    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    wall = """type compressible::alphatWallFunction;
+        value uniform 0;"""
+    if domain.get("mode") == "closed_tunnel":
+        domain_patches = f"""    sideWalls
+    {{
+        {wall}
+    }}
+
+    ceiling
+    {{
+        {wall}
+    }}"""
+    else:
+        domain_patches = """    farfield
+    {
+        type calculated;
+        value uniform 0;
+    }"""
+    ground_patch = ""
+    if include_ground:
+        ground_patch = f"""
+
+    ground
+    {{
+        {wall}
+    }}"""
+    wheel_patches = "".join(
+        f"""
+
+    {wheel["patch"]}
+    {{
+        {wall}
+    }}"""
+        for wheel in wheels
+        if isinstance(wheel, dict)
+    )
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class volScalarField;
+    object alphat;
+}}
+
+dimensions [1 -1 -1 0 0 0 0];
+internalField uniform 0;
+
+boundaryField
+{{
+    inlet
+    {{
+        type calculated;
+        value uniform 0;
+    }}
+
+    outlet
+    {{
+        type calculated;
+        value uniform 0;
+    }}
+
+{domain_patches}{ground_patch}
+
+    body
+    {{
+        {wall}
+    }}{wheel_patches}
+}}
+"""
+
+
+def _field_p(
+    include_ground: bool,
+    values: dict[str, object] | None = None,
+) -> str:
+    values = values or {}
+    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
+    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    if domain.get("mode") == "closed_tunnel" or wheels:
+        wall_names = ["sideWalls", "ceiling"] if domain.get("mode") == "closed_tunnel" else ["farfield"]
+        domain_patches = "".join(
+            f"""
+    {name}
+    {{
+        type zeroGradient;
+    }}
+"""
+            for name in wall_names
+        )
+        ground_patch = ""
+        if include_ground:
+            ground_patch = """
+    ground
+    {
+        type zeroGradient;
+    }
+"""
+        wheel_patches = "".join(
+            f"""
+    {wheel["patch"]}
+    {{
+        type zeroGradient;
+    }}
+"""
+            for wheel in wheels
+            if isinstance(wheel, dict)
+        )
+        return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class volScalarField;
+    object p;
+}}
+
+dimensions [0 2 -2 0 0 0 0];
+internalField uniform 0;
+
+boundaryField
+{{
+    inlet
+    {{
+        type zeroGradient;
+    }}
+
+    outlet
+    {{
+        type fixedValue;
+        value uniform 0;
+    }}
+{domain_patches}{ground_patch}
+    body
+    {{
+        type zeroGradient;
+    }}
+{wheel_patches}}}
+"""
+
     ground_patch = ""
     if include_ground:
         ground_patch = """
@@ -1502,7 +2693,25 @@ boundaryField
 """
 
 
-def _field_scalar(name: str, dimensions: str, value: float, include_ground: bool) -> str:
+def _field_scalar(
+    name: str,
+    dimensions: str,
+    value: float,
+    include_ground: bool,
+    values: dict[str, object] | None = None,
+) -> str:
+    settings = values or {}
+    domain = settings.get("domain") if isinstance(settings.get("domain"), dict) else {}
+    wheels = settings.get("wheels") if isinstance(settings.get("wheels"), list) else []
+    advanced = bool(
+        settings.get("backflow_safe_outlet")
+        or settings.get("yawed_inflow")
+        or domain.get("mode") == "closed_tunnel"
+        or wheels
+    )
+    if advanced:
+        return _field_scalar_advanced(name, dimensions, value, include_ground, settings, domain, wheels)
+
     ground_patch = ""
     if include_ground:
         ground_patch = """
@@ -1563,7 +2772,287 @@ boundaryField
 """
 
 
-def _field_nut(include_ground: bool) -> str:
+def _field_scalar_advanced(
+    name: str,
+    dimensions: str,
+    value: float,
+    include_ground: bool,
+    settings: dict[str, object],
+    domain: dict[str, object],
+    wheels: list[object],
+) -> str:
+    wall_type = "kqRWallFunction" if name == "k" else "omegaWallFunction"
+    wall_value = 0.0 if name == "k" else value
+    outlet = (
+        f"""    outlet
+    {{
+        type inletOutlet;
+        inletValue uniform {value:.9g};
+        value uniform {value:.9g};
+    }}"""
+        if settings.get("backflow_safe_outlet")
+        else """    outlet
+    {
+        type zeroGradient;
+    }"""
+    )
+    if domain.get("mode") == "closed_tunnel":
+        domain_patches = f"""    sideWalls
+    {{
+        type {wall_type};
+        value uniform {wall_value:.9g};
+    }}
+
+    ceiling
+    {{
+        type {wall_type};
+        value uniform {wall_value:.9g};
+    }}"""
+    elif settings.get("yawed_inflow"):
+        domain_patches = f"""    farfield
+    {{
+        type inletOutlet;
+        inletValue uniform {value:.9g};
+        value uniform {value:.9g};
+    }}"""
+    else:
+        domain_patches = """    farfield
+    {
+        type zeroGradient;
+    }"""
+    ground_patch = ""
+    if include_ground:
+        ground_patch = f"""
+
+    ground
+    {{
+        type {wall_type};
+        value uniform {wall_value:.9g};
+    }}"""
+    wheel_patches = "".join(
+        f"""
+
+    {wheel["patch"]}
+    {{
+        type {wall_type};
+        value uniform {wall_value:.9g};
+    }}"""
+        for wheel in wheels
+        if isinstance(wheel, dict)
+    )
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class volScalarField;
+    object {name};
+}}
+
+dimensions [{dimensions}];
+internalField uniform {value:.9g};
+
+boundaryField
+{{
+    inlet
+    {{
+        type fixedValue;
+        value uniform {value:.9g};
+    }}
+
+{outlet}
+
+{domain_patches}{ground_patch}
+
+    body
+    {{
+        type {wall_type};
+        value uniform {wall_value:.9g};
+    }}{wheel_patches}
+}}
+"""
+
+
+def _field_nu_tilda(
+    include_ground: bool,
+    values: dict[str, object],
+) -> str:
+    value = float(values["nu_tilda"])
+    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
+    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    outlet_patch = (
+        f"""    outlet
+    {{
+        type inletOutlet;
+        inletValue uniform {value:.9g};
+        value uniform {value:.9g};
+    }}"""
+        if values.get("backflow_safe_outlet")
+        else """    outlet
+    {
+        type zeroGradient;
+    }"""
+    )
+    wall = """type fixedValue;
+        value uniform 0;"""
+    if domain.get("mode") == "closed_tunnel":
+        domain_patches = f"""    sideWalls
+    {{
+        {wall}
+    }}
+
+    ceiling
+    {{
+        {wall}
+    }}"""
+    elif values.get("yawed_inflow"):
+        domain_patches = f"""    farfield
+    {{
+        type inletOutlet;
+        inletValue uniform {value:.9g};
+        value uniform {value:.9g};
+    }}"""
+    else:
+        domain_patches = """    farfield
+    {
+        type zeroGradient;
+    }"""
+    ground_patch = ""
+    if include_ground:
+        ground_patch = f"""
+
+    ground
+    {{
+        {wall}
+    }}"""
+    wheel_patches = "".join(
+        f"""
+
+    {wheel["patch"]}
+    {{
+        {wall}
+    }}"""
+        for wheel in wheels
+        if isinstance(wheel, dict)
+    )
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class volScalarField;
+    object nuTilda;
+}}
+
+dimensions [0 2 -1 0 0 0 0];
+internalField uniform {value:.9g};
+
+boundaryField
+{{
+    inlet
+    {{
+        type fixedValue;
+        value uniform {value:.9g};
+    }}
+
+{outlet_patch}
+
+{domain_patches}{ground_patch}
+
+    body
+    {{
+        {wall}
+    }}{wheel_patches}
+}}
+"""
+
+
+def _field_nut_spalart_allmaras(
+    include_ground: bool,
+    values: dict[str, object],
+) -> str:
+    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
+    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    wall = """type nutUSpaldingWallFunction;
+        value uniform 0;"""
+    if domain.get("mode") == "closed_tunnel":
+        domain_patches = f"""    sideWalls
+    {{
+        {wall}
+    }}
+
+    ceiling
+    {{
+        {wall}
+    }}"""
+    else:
+        domain_patches = """    farfield
+    {
+        type calculated;
+        value uniform 0;
+    }"""
+    ground_patch = ""
+    if include_ground:
+        ground_patch = f"""
+
+    ground
+    {{
+        {wall}
+    }}"""
+    wheel_patches = "".join(
+        f"""
+
+    {wheel["patch"]}
+    {{
+        {wall}
+    }}"""
+        for wheel in wheels
+        if isinstance(wheel, dict)
+    )
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class volScalarField;
+    object nut;
+}}
+
+dimensions [0 2 -1 0 0 0 0];
+internalField uniform 0;
+
+boundaryField
+{{
+    inlet
+    {{
+        type calculated;
+        value uniform 0;
+    }}
+
+    outlet
+    {{
+        type calculated;
+        value uniform 0;
+    }}
+
+{domain_patches}{ground_patch}
+
+    body
+    {{
+        {wall}
+    }}{wheel_patches}
+}}
+"""
+
+
+def _field_nut(
+    include_ground: bool,
+    values: dict[str, object] | None = None,
+) -> str:
+    settings = values or {}
+    domain = settings.get("domain") if isinstance(settings.get("domain"), dict) else {}
+    wheels = settings.get("wheels") if isinstance(settings.get("wheels"), list) else []
+    roughness = float(settings.get("roughness_height_m", 0.0))
+    if domain.get("mode") == "closed_tunnel" or wheels or roughness > 0:
+        return _field_nut_advanced(include_ground, settings, domain, wheels)
+
     ground_patch = ""
     if include_ground:
         ground_patch = """
@@ -1613,6 +3102,151 @@ boundaryField
 """
 
 
+def _field_nut_advanced(
+    include_ground: bool,
+    settings: dict[str, object],
+    domain: dict[str, object],
+    wheels: list[object],
+) -> str:
+    roughness = float(settings.get("roughness_height_m", 0.0))
+    roughness_constant = float(settings.get("roughness_constant", 0.5))
+    if roughness > 0:
+        body_bc = f"""type nutkRoughWallFunction;
+        Ks {roughness:.9g};
+        Cs {roughness_constant:.9g};
+        value uniform 0;"""
+    else:
+        body_bc = """type nutkWallFunction;
+        value uniform 0;"""
+    if domain.get("mode") == "closed_tunnel":
+        domain_patches = """    sideWalls
+    {
+        type nutkWallFunction;
+        value uniform 0;
+    }
+
+    ceiling
+    {
+        type nutkWallFunction;
+        value uniform 0;
+    }"""
+    else:
+        domain_patches = """    farfield
+    {
+        type calculated;
+        value uniform 0;
+    }"""
+    ground_patch = ""
+    if include_ground:
+        ground_patch = """
+
+    ground
+    {
+        type nutkWallFunction;
+        value uniform 0;
+    }"""
+    wheel_patches = "".join(
+        f"""
+
+    {wheel["patch"]}
+    {{
+        {body_bc}
+    }}"""
+        for wheel in wheels
+        if isinstance(wheel, dict)
+    )
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class volScalarField;
+    object nut;
+}}
+
+dimensions [0 2 -1 0 0 0 0];
+internalField uniform 0;
+
+boundaryField
+{{
+    inlet
+    {{
+        type calculated;
+        value uniform 0;
+    }}
+
+    outlet
+    {{
+        type calculated;
+        value uniform 0;
+    }}
+
+{domain_patches}{ground_patch}
+
+    body
+    {{
+        {body_bc}
+    }}{wheel_patches}
+}}
+"""
+
+
+def _fv_models(
+    porous_zones: list[dict[str, object]],
+    fan_zones: list[dict[str, object]],
+) -> str:
+    entries: list[str] = []
+    for zone in porous_zones:
+        entries.append(
+            f"""{zone["name"]}
+{{
+    type porosityForce;
+
+    porosityForceCoeffs
+    {{
+        cellZone {zone["cell_zone"]};
+        type DarcyForchheimer;
+        d {_foam_vec(_vector_value(zone["darcy_d_per_m2"]))};
+        f {_foam_vec(_vector_value(zone["forchheimer_f_per_m"]))};
+        coordinateSystem
+        {{
+            type cartesian;
+            origin (0 0 0);
+            coordinateRotation
+            {{
+                type axesRotation;
+                e1 (1 0 0);
+                e2 (0 1 0);
+            }}
+        }}
+    }}
+}}"""
+        )
+    for zone in fan_zones:
+        entries.append(
+            f"""{zone["name"]}
+{{
+    type actuationDisk;
+    cellZone {zone["cell_zone"]};
+    diskDir {_foam_vec(_vector_value(zone["disk_direction"]))};
+    Cp {float(zone["power_coefficient"]):.9g};
+    Ct {float(zone["thrust_coefficient"]):.9g};
+    diskArea {float(zone["disk_area_m2"]):.9g};
+    upstreamPoint {_foam_vec(_vector_value(zone["upstream_point_m"]))};
+}}"""
+        )
+    body = "\n\n".join(entries)
+    return f"""FoamFile
+{{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object fvModels;
+}}
+
+{body}
+"""
+
+
 def _mesh_steps() -> str:
     return """echo "=== AEROLAB STEP: surfaceFeatures ==="
 surfaceFeatures
@@ -1638,9 +3272,13 @@ echo "=== AEROLAB MESH COMPLETE ==="
 """
 
 
-def _solve_steps(include_y_plus: bool, validate_mesh: bool) -> str:
-    y_plus_step = """echo "=== AEROLAB STEP: yPlus ==="
-foamPostProcess -solver incompressibleFluid -func yPlus -latestTime
+def _solve_steps(
+    include_y_plus: bool,
+    validate_mesh: bool,
+    solver_module: str = "incompressibleFluid",
+) -> str:
+    y_plus_step = f"""echo "=== AEROLAB STEP: yPlus ==="
+foamPostProcess -solver {solver_module} -func yPlus -latestTime
 """ if include_y_plus else ""
     mesh_check = """echo "=== AEROLAB STEP: checkMesh ==="
 checkMesh | tee log.checkMesh
@@ -1651,14 +3289,19 @@ fi
 echo "=== AEROLAB STEP: checkMeshDiagnostics ==="
 checkMesh -allGeometry -allTopology
 """ if validate_mesh else ""
-    return f"""{mesh_check}echo "=== AEROLAB STEP: potentialFoam ==="
+    initialization = (
+        """echo "=== AEROLAB STEP: potentialFoam ==="
 potentialFoam
-echo "=== AEROLAB STEP: foamRun ==="
+"""
+        if solver_module == "incompressibleFluid"
+        else ""
+    )
+    return f"""{mesh_check}{initialization}echo "=== AEROLAB STEP: foamRun ==="
 foamRun
 echo "=== AEROLAB STEP: streamlines ==="
 foamPostProcess -func streamlines -latestTime
 echo "=== AEROLAB STEP: wallShearStress ==="
-foamPostProcess -solver incompressibleFluid -func wallShearStress -latestTime
+foamPostProcess -solver {solver_module} -func wallShearStress -latestTime
 echo "=== AEROLAB STEP: bodyPressure ==="
 foamPostProcess -func bodyPressure -latestTime
 {y_plus_step}echo "=== AEROLAB COMPLETE ==="
@@ -1672,18 +3315,24 @@ set -eu
 {_mesh_steps()}"""
 
 
-def _allsolve(include_y_plus: bool) -> str:
+def _allsolve(
+    include_y_plus: bool,
+    solver_module: str = "incompressibleFluid",
+) -> str:
     return f"""#!/bin/sh
 set -eu
 
-{_solve_steps(include_y_plus, validate_mesh=True)}"""
+{_solve_steps(include_y_plus, validate_mesh=True, solver_module=solver_module)}"""
 
 
-def _allrun(include_y_plus: bool) -> str:
+def _allrun(
+    include_y_plus: bool,
+    solver_module: str = "incompressibleFluid",
+) -> str:
     return f"""#!/bin/sh
 set -eu
 
-{_mesh_steps()}{_solve_steps(include_y_plus, validate_mesh=False)}"""
+{_mesh_steps()}{_solve_steps(include_y_plus, validate_mesh=False, solver_module=solver_module)}"""
 
 
 def _run_wsl_ps1() -> str:
@@ -1692,10 +3341,16 @@ wsl bash -lc "cd \"$(wslpath -a '$PWD')\" && chmod +x Allrun && ./Allrun"
 """
 
 
-def _case_readme(include_ground: bool, moving_ground: bool) -> str:
+def _case_readme(
+    include_ground: bool,
+    moving_ground: bool,
+    values: dict[str, object] | None = None,
+) -> str:
     ground = "enabled" if include_ground else "disabled"
     moving = "enabled" if moving_ground else "disabled"
-    return f"""# AeroLab OpenFOAM Case
+    settings = values or {}
+    solver_module = str(settings.get("solver_module") or "incompressibleFluid")
+    base = f"""# AeroLab OpenFOAM Case
 
 Ground patch: {ground}
 Moving ground: {moving}
@@ -1714,10 +3369,41 @@ chmod +x Allrun
 ```
 
 This case targets OpenFOAM Foundation v13 and uses `foamRun` with the
-`incompressibleFluid` solver module. Results appear under
+`{solver_module}` solver module. Results appear under
 `postProcessing/forceCoeffs` only after mesh, initialization, and solver steps
 finish successfully. AeroLab will keep the result unverified until mesh quality,
 residual, and force-coefficient stability checks pass.
+"""
+    domain = settings.get("domain") if isinstance(settings.get("domain"), dict) else {}
+    wheels = settings.get("wheels") if isinstance(settings.get("wheels"), list) else []
+    volume_zones = (
+        settings.get("volume_zones")
+        if isinstance(settings.get("volume_zones"), list)
+        else []
+    )
+    advanced = bool(
+        settings.get("yawed_inflow")
+        or settings.get("backflow_safe_outlet")
+        or settings.get("roughness_height_m")
+        or settings.get("second_order_temporal")
+        or settings.get("fluid_profile") == "compressible_thermal"
+        or str(settings.get("turbulence_model") or "kOmegaSST") != "kOmegaSST"
+        or volume_zones
+        or domain.get("mode") == "closed_tunnel"
+        or wheels
+    )
+    if not advanced:
+        return base
+    return base + f"""
+## Applied advanced setup
+
+- Solver profile: {settings.get("fluid_profile", "incompressible")} / {settings.get("turbulence_model", "kOmegaSST")}
+- Domain: {domain.get("mode", "open_field")}
+- Backflow-safe outlet: {"enabled" if settings.get("backflow_safe_outlet") else "disabled"}
+- Surface roughness height: {float(settings.get("roughness_height_m", 0.0)):.9g} m
+- Rotating wheel patches: {len(wheels)}
+- Porous/fan cell zones: {len(volume_zones)}
+- Temporal scheme: {"backward" if settings.get("second_order_temporal") else "legacy/default"}
 """
 
 
@@ -1766,16 +3452,50 @@ def _cross(a: Vector, b: Vector) -> Vector:
     )
 
 
-def _turbulent_kinetic_energy(speed_mps: float) -> float:
-    intensity = 0.01
+def _turbulent_kinetic_energy(speed_mps: float, intensity: float = 0.01) -> float:
     return 1.5 * (speed_mps * intensity) ** 2
 
 
-def _specific_dissipation_rate(speed_mps: float, reference_length: float) -> float:
-    k = _turbulent_kinetic_energy(speed_mps)
+def _specific_dissipation_rate(
+    speed_mps: float,
+    intensity: float = 0.01,
+    turbulent_length_scale_m: float = 0.07,
+) -> float:
+    k = _turbulent_kinetic_energy(speed_mps, intensity)
     c_mu = 0.09
-    turbulent_length = max(0.07 * reference_length, 1e-6)
+    turbulent_length = max(turbulent_length_scale_m, 1e-6)
     return math.sqrt(k) / ((c_mu**0.25) * turbulent_length)
+
+
+def _mapping_section(mapping: dict[str, object], key: str) -> dict[str, object]:
+    value = mapping.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _vector_value(value: object) -> Vector:
+    if isinstance(value, dict):
+        try:
+            vector = (float(value["x"]), float(value["y"]), float(value["z"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Expected a finite X, Y, Z vector.") from exc
+    else:
+        try:
+            components = tuple(float(component) for component in value)  # type: ignore[union-attr]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Expected a finite X, Y, Z vector.") from exc
+        if len(components) != 3:
+            raise ValueError("Expected a finite X, Y, Z vector.")
+        vector = components  # type: ignore[assignment]
+    if not all(math.isfinite(component) for component in vector):
+        raise ValueError("Expected a finite X, Y, Z vector.")
+    return vector  # type: ignore[return-value]
+
+
+def _normalize_vector(vector: Vector) -> Vector:
+    magnitude = math.sqrt(sum(component * component for component in vector))
+    if magnitude <= 1e-12:
+        raise ValueError("Flow direction must have non-zero length.")
+    return tuple(component / magnitude for component in vector)  # type: ignore[return-value]
 
 
 def _foam_vec(vector: object) -> str:

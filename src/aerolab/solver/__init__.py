@@ -23,6 +23,7 @@ from .backends import (  # noqa: F401
     _run_command,
     solver_status,
 )
+from .comparison import compare_cases  # noqa: F401
 from .parsing import (  # noqa: F401
     parse_check_mesh,
     parse_force_coeffs,
@@ -37,6 +38,13 @@ from .run import (  # noqa: F401
     _mesh_input_fingerprint,
     _mesh_record_reusable,
     run_case,
+)
+from .statistics import analyze_transient_history  # noqa: F401
+from .studies import (  # noqa: F401
+    SENSITIVITY_PARAMETERS,
+    create_sensitivity_study,
+    create_sensitivity_study_from_case,
+    sensitivity_study_report,
 )
 from .visualization import (  # noqa: F401
     CASE_PREVIEW_TRIANGLE_LIMIT,
