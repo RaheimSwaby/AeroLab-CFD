@@ -669,7 +669,7 @@ def _run_command(
         ]
     if backend == "wsl":
         wsl_case_path = _windows_path_to_wsl(case_path)
-        stage_id = hashlib.sha256(str(case_path.resolve()).encode("utf-8")).hexdigest()[:16]
+        stage_id = _wsl_stage_id(case_path, execution_id)
         run_timeout = max(1, int(timeout_seconds))
         wsl_script = (
             f"{OPENFOAM_BOOTSTRAP}\n"
@@ -684,6 +684,7 @@ def _run_command(
             'STAGE_ROOT=$(cd "$STAGE_ROOT" && pwd -P)\n'
             f'STAGE_CASE="$STAGE_ROOT/case-{stage_id}"\n'
             f'STAGE_MARKER="$STAGE_ROOT/.case-{stage_id}.aerolab-stage"\n'
+            f'RUN_PID_FILE="$STAGE_ROOT/.case-{stage_id}.pid"\n'
             'case "$STAGE_CASE" in "$STAGE_ROOT"/case-[0-9a-f]*) ;; '
             '*) printf "Unsafe AeroLab WSL staging path: %s\\n" "$STAGE_CASE" >&2; exit 90 ;; esac\n'
             'if [ -e "$STAGE_CASE" ]; then\n'
@@ -695,14 +696,15 @@ def _run_command(
             '  rm -f -- "$STAGE_CASE/aerolab-run.log" "$STAGE_CASE/aerolab-run.json"\n'
             '  cp -a -- "$STAGE_CASE/." "$SOURCE_CASE/"\n'
             '  rm -rf -- "$STAGE_CASE"\n'
-            '  rm -f -- "$STAGE_MARKER"\n'
+            '  rm -f -- "$STAGE_MARKER" "$RUN_PID_FILE"\n'
             'fi\n'
             'mkdir -p -- "$STAGE_CASE"\n'
             ': > "$STAGE_MARKER"\n'
+            'printf "%s\\n" "$$" > "$RUN_PID_FILE"\n'
             'printf "=== AEROLAB WSL: staging case on Linux filesystem ===\\n"\n'
             'if ! cp -a -- "$SOURCE_CASE/." "$STAGE_CASE/"; then\n'
             '  rm -rf -- "$STAGE_CASE"\n'
-            '  rm -f -- "$STAGE_MARKER"\n'
+            '  rm -f -- "$STAGE_MARKER" "$RUN_PID_FILE"\n'
             '  exit 92\n'
             'fi\n'
             'copy_back() {\n'
@@ -712,7 +714,7 @@ def _run_command(
             '  rm -f -- "$STAGE_CASE/aerolab-run.log" "$STAGE_CASE/aerolab-run.json"\n'
             '  if cp -a -- "$STAGE_CASE/." "$SOURCE_CASE/"; then\n'
             '    rm -rf -- "$STAGE_CASE"\n'
-            '    rm -f -- "$STAGE_MARKER"\n'
+            '    rm -f -- "$STAGE_MARKER" "$RUN_PID_FILE"\n'
             '  else\n'
             '    printf "AeroLab copy-back failed; Linux results remain at %s\\n" "$STAGE_CASE" >&2\n'
             '    run_status=91\n'
@@ -730,11 +732,19 @@ def _run_command(
             'exit "$run_status"'
         )
         encoded_script = base64.b64encode(wsl_script.encode("utf-8")).decode("ascii")
+        launcher = (
+            "exec env "
+            f"AEROLAB_EXECUTION_ID={shlex.quote(execution_id or 'manual')} "
+            "setsid --wait bash"
+        )
         return [
             "wsl",
             "bash",
             "-lc",
-            f"printf %s {shlex.quote(encoded_script)} | base64 -d | bash",
+            (
+                f"printf %s {shlex.quote(encoded_script)} | base64 -d | "
+                f"bash -c {shlex.quote(launcher)}"
+            ),
         ]
     if backend == "docker":
         image = os.environ.get("AEROLAB_OPENFOAM_IMAGE")
@@ -802,6 +812,59 @@ def _run_command(
     raise RuntimeError(f"Unsupported backend: {backend}")
 
 
+def _wsl_stage_id(case_path: Path, execution_id: str | None) -> str:
+    identity = f"{case_path.resolve()}\0{execution_id or 'manual'}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
+def _wsl_stage_cleanup_script(
+    case_path: Path,
+    execution_id: str,
+    *,
+    verify_only: bool,
+) -> str:
+    stage_id = _wsl_stage_id(case_path, execution_id)
+    expected_identity = shlex.quote(f"AEROLAB_EXECUTION_ID={execution_id}")
+    common = (
+        "set -eu\n"
+        'STAGE_ROOT="${AEROLAB_WSL_STAGE_ROOT:-$HOME/.cache/aerolab-cfd/runs}"\n'
+        f'STAGE_CASE="$STAGE_ROOT/case-{stage_id}"\n'
+        f'STAGE_MARKER="$STAGE_ROOT/.case-{stage_id}.aerolab-stage"\n'
+        f'RUN_PID_FILE="$STAGE_ROOT/.case-{stage_id}.pid"\n'
+        "RUN_PID=\n"
+        'if [ -f "$RUN_PID_FILE" ]; then RUN_PID=$(cat "$RUN_PID_FILE" 2>/dev/null || true); fi\n'
+        'case "$RUN_PID" in ""|*[!0-9]*) RUN_PID= ;; esac\n'
+        "owned_process() {\n"
+        '  [ -n "$RUN_PID" ] && [ -r "/proc/$RUN_PID/environ" ] && '
+        f'tr "\\0" "\\n" < "/proc/$RUN_PID/environ" | grep -Fqx -- {expected_identity}\n'
+        "}\n"
+    )
+    if verify_only:
+        return common + (
+            "remaining=0\n"
+            'if owned_process && kill -0 "$RUN_PID" 2>/dev/null; then '
+            'printf "process:%s\\n" "$RUN_PID"; remaining=1; fi\n'
+            'for artifact in "$STAGE_CASE" "$STAGE_MARKER" "$RUN_PID_FILE"; do\n'
+            '  if [ -e "$artifact" ]; then printf "%s\\n" "$artifact"; remaining=1; fi\n'
+            "done\n"
+            'exit "$remaining"\n'
+        )
+    return common + (
+        'if [ -n "$RUN_PID" ] && kill -0 "$RUN_PID" 2>/dev/null; then\n'
+        '  if ! owned_process; then printf "WSL stage PID is not owned by this AeroLab execution.\\n" >&2; exit 94; fi\n'
+        '  kill -TERM -- "-$RUN_PID" 2>/dev/null || kill -TERM "$RUN_PID" 2>/dev/null || true\n'
+        "  attempts=0\n"
+        '  while kill -0 "$RUN_PID" 2>/dev/null && [ "$attempts" -lt 120 ]; do attempts=$((attempts + 1)); sleep 0.25; done\n'
+        '  if kill -0 "$RUN_PID" 2>/dev/null; then kill -KILL -- "-$RUN_PID" 2>/dev/null || kill -KILL "$RUN_PID" 2>/dev/null || true; fi\n'
+        "fi\n"
+        "attempts=0\n"
+        'while [ -n "$RUN_PID" ] && kill -0 "$RUN_PID" 2>/dev/null && [ "$attempts" -lt 20 ]; do attempts=$((attempts + 1)); sleep 0.25; done\n'
+        'if [ -n "$RUN_PID" ] && kill -0 "$RUN_PID" 2>/dev/null; then printf "WSL process %s is still active.\\n" "$RUN_PID" >&2; exit 95; fi\n'
+        'rm -rf -- "$STAGE_CASE"\n'
+        'rm -f -- "$STAGE_MARKER" "$RUN_PID_FILE"\n'
+    )
+
+
 def _docker_container_name(case_path: Path, execution_id: str | None) -> str:
     identity = f"{case_path.resolve()}\0{execution_id or 'manual'}"
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
@@ -813,6 +876,17 @@ def _backend_cleanup_command(
     backend: str,
     execution_id: str,
 ) -> list[str] | None:
+    if backend == "wsl":
+        return [
+            "wsl",
+            "bash",
+            "-lc",
+            _wsl_stage_cleanup_script(
+                case_path,
+                execution_id,
+                verify_only=False,
+            ),
+        ]
     if backend == "docker":
         return [
             "docker",
@@ -829,6 +903,17 @@ def _backend_cleanup_verification_command(
     backend: str,
     execution_id: str,
 ) -> list[str] | None:
+    if backend == "wsl":
+        return [
+            "wsl",
+            "bash",
+            "-lc",
+            _wsl_stage_cleanup_script(
+                case_path,
+                execution_id,
+                verify_only=True,
+            ),
+        ]
     if backend == "docker":
         container_name = _docker_container_name(case_path, execution_id)
         return [

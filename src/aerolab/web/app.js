@@ -60,6 +60,7 @@ const SPEED_COLOR_STOPS_LINEAR = SPEED_COLOR_STOPS.map((stop) => stop.map((chann
 
 const state = {
   busy: false,
+  stopRequestInFlight: false,
   viewMode: "basic",
   root: "",
   sampleModel: null,
@@ -217,6 +218,8 @@ const els = {
   runCaseButton: document.querySelector("#runCaseButton"),
   runStudyButton: document.querySelector("#runStudyButton"),
   retryBudgetButton: document.querySelector("#retryBudgetButton"),
+  stopRunButton: document.querySelector("#stopRunButton"),
+  deleteRunOutputsButton: document.querySelector("#deleteRunOutputsButton"),
   runProgress: document.querySelector("#runProgress"),
   runProgressLabel: document.querySelector("#runProgressLabel"),
   runProgressPercent: document.querySelector("#runProgressPercent"),
@@ -301,6 +304,7 @@ async function boot() {
   syncRunLogForActiveCase();
   els.rootPath.textContent = state.root;
   renderCases();
+  updateActionAvailability();
   await refreshSolverStatus();
   if (state.activeCasePath) await refreshCaseReport(state.activeCasePath);
   syncGroundControls();
@@ -663,6 +667,8 @@ els.meshCaseButton.addEventListener("click", () => runActiveCase("mesh"));
 els.runCaseButton.addEventListener("click", () => runActiveCase("full"));
 els.runStudyButton.addEventListener("click", () => runActiveStudy());
 els.retryBudgetButton.addEventListener("click", () => retryRecommendedBudget());
+els.stopRunButton.addEventListener("click", () => stopActiveRun());
+els.deleteRunOutputsButton.addEventListener("click", () => deleteActiveRunOutputs());
 els.runLogDetails.addEventListener("toggle", () => {
   if (els.runLogDetails.open) startRunLogPolling();
   else stopRunLogPolling();
@@ -811,6 +817,125 @@ async function retryRecommendedBudget() {
   });
 }
 
+function activeCaseItem() {
+  return state.cases.find((item) => item.path === state.activeCasePath) || null;
+}
+
+function activeCaseFamilyItems() {
+  const selected = activeCaseItem();
+  if (!selected) return [];
+  if (selected.studyId) {
+    return state.cases.filter((item) => item.studyId === selected.studyId);
+  }
+  if (selected.sensitivityStudyId) {
+    return state.cases.filter(
+      (item) => item.sensitivityStudyId === selected.sensitivityStudyId,
+    );
+  }
+  return [selected];
+}
+
+function activeCaseFamilyHasServerRun() {
+  return activeCaseFamilyItems().some((item) => item.runActive === true);
+}
+
+function markServerRunActive(casePaths, active) {
+  const paths = new Set(casePaths || []);
+  for (const item of state.cases) {
+    if (paths.has(item.path)) item.runActive = active;
+  }
+  updateActionAvailability();
+  renderCases();
+}
+
+async function refreshAfterRunMutation(casePath, casePaths, maximumWaitMs = 45_000) {
+  const targetPaths = new Set(casePaths?.length ? casePaths : [casePath]);
+  const deadline = Date.now() + maximumWaitMs;
+  while (true) {
+    const latestState = await apiGet("/api/state");
+    state.cases = latestState.cases || state.cases;
+    renderCases();
+    updateActionAvailability();
+    const targetRunActive = state.cases.some(
+      (item) => targetPaths.has(item.path) && item.runActive === true,
+    );
+    if (!targetRunActive || Date.now() >= deadline) break;
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+  }
+  if (state.activeCasePath === casePath) {
+    await refreshCaseReport(casePath);
+    syncRunLogForActiveCase();
+  }
+}
+
+async function stopActiveRun() {
+  const casePath = state.activeCasePath;
+  if (!casePath || !activeCaseFamilyHasServerRun() || state.stopRequestInFlight) return;
+  state.stopRequestInFlight = true;
+  updateActionAvailability();
+  els.caseStatus.classList.remove("error");
+  els.caseStatus.textContent = "Stopping the active OpenFOAM process tree...";
+  try {
+    const payload = await fetchJson("/api/stop-run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ casePath }),
+    });
+    const stoppedCasePaths = payload.casePaths || [casePath];
+    markServerRunActive(stoppedCasePaths, true);
+    els.caseStatus.textContent = payload.kind === "study"
+      ? "Stopping all active members in this study..."
+      : "Stopping the active OpenFOAM run...";
+    await refreshAfterRunMutation(casePath, stoppedCasePaths);
+    els.caseStatus.textContent = payload.kind === "study"
+      ? "Study run stopped; case setup and reusable meshes were preserved."
+      : "OpenFOAM run stopped; case setup and reusable mesh were preserved.";
+  } catch (error) {
+    showError(error);
+  } finally {
+    state.stopRequestInFlight = false;
+    updateActionAvailability();
+  }
+}
+
+async function deleteActiveRunOutputs() {
+  const casePath = state.activeCasePath;
+  if (!casePath || state.busy || activeCaseFamilyHasServerRun()) return;
+  const family = activeCaseFamilyItems();
+  const studyNote = family.length > 1
+    ? ` Shared study progress will also be cleared from all ${family.length} members.`
+    : "";
+  const confirmed = window.confirm(
+    `Delete generated solver results and the run log for ${basename(casePath)}? `
+    + `Case setup, geometry, and a safely reusable mesh will be kept.${studyNote} `
+    + "This cannot be undone.",
+  );
+  if (!confirmed) return;
+
+  setBusy(true, "Deleting run outputs");
+  try {
+    const payload = await fetchJson("/api/delete-run-outputs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ casePath }),
+    });
+    state.cases = payload.state?.cases || state.cases;
+    state.comparison = null;
+    syncRunLogForActiveCase();
+    renderCases();
+    if (state.activeCasePath === casePath) await refreshCaseReport(casePath);
+    const preservedMesh = payload.cleanup?.preservedMesh === true;
+    els.caseStatus.classList.remove("error");
+    els.caseStatus.textContent = preservedMesh
+      ? "Deleted run outputs and preserved the reusable mesh."
+      : "Deleted run outputs and preserved the case setup and geometry.";
+  } catch (error) {
+    showError(error);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function runActiveCase(mode, options = {}) {
   if (!state.activeCasePath) return;
   const runningCasePath = state.activeCasePath;
@@ -846,7 +971,7 @@ async function runActiveCase(mode, options = {}) {
         runMode: mode,
       });
       const requestStartedAt = Date.now();
-      await fetchJson("/api/run-case", {
+      const acceptedRun = await fetchJson("/api/run-case", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -860,11 +985,13 @@ async function runActiveCase(mode, options = {}) {
           reuseMesh: true,
         }),
       });
+      markServerRunActive([acceptedRun.casePath || runningCasePath], true);
       if (!meshOnly) els.resumeSolver.checked = false;
       const progress = await startRunProgressPolling(
         runningCasePath,
         (timeoutSeconds + 1800) * 1000,
         requestStartedAt,
+        acceptedRun.attemptId,
       );
       if (progress?.state !== "failed") break;
       const recommendation = progress.budgetRecommendation
@@ -929,7 +1056,7 @@ async function runActiveStudy(options = {}) {
   setBusy(true, options.budgetRetry ? "Retrying study" : "Running study");
   try {
     const requestStartedAt = Date.now();
-    await fetchJson("/api/run-study", {
+    const acceptedStudy = await fetchJson("/api/run-study", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -943,12 +1070,17 @@ async function runActiveStudy(options = {}) {
         reuseMesh: true,
       }),
     });
+    markServerRunActive(
+      acceptedStudy.study?.casePaths || [runningCasePath],
+      true,
+    );
     const studyRun = await startStudyProgressPolling(
       runningCasePath,
       (timeoutSeconds * 12 + 1800) * 1000,
       requestStartedAt,
+      acceptedStudy.attemptId,
     );
-    if (studyRun?.status !== "complete") {
+    if (!["complete", "stopped"].includes(studyRun?.status)) {
       throw new Error(
         studyRun?.budgetRecommendation?.detail
         || "One or more study members did not complete successfully.",
@@ -972,7 +1104,12 @@ async function runActiveStudy(options = {}) {
   }
 }
 
-function startStudyProgressPolling(casePath, maximumWaitMs, minimumUpdatedAt = 0) {
+function startStudyProgressPolling(
+  casePath,
+  maximumWaitMs,
+  minimumUpdatedAt = 0,
+  expectedAttemptId = null,
+) {
   stopStudyProgressPolling();
   const token = state.studyRunToken + 1;
   state.studyRunToken = token;
@@ -986,31 +1123,46 @@ function startStudyProgressPolling(casePath, maximumWaitMs, minimumUpdatedAt = 0
         const studyRun = payload.studyRun;
         if (studyRun) {
           const complete = studyRun.status === "complete";
+          const stopped = studyRun.status === "stopped";
           const failed = ["failed", "partial_failure"].includes(studyRun.status);
+          const terminal = complete || stopped || failed;
           const finishedAt = Date.parse(studyRun.finishedAt || "");
-          const staleTerminal = (complete || failed)
+          const attemptMatches = !expectedAttemptId
+            || studyRun.attemptId === expectedAttemptId;
+          const staleTerminal = !expectedAttemptId
+            && terminal
             && Number.isFinite(finishedAt)
             && finishedAt < minimumUpdatedAt;
-          if (!staleTerminal) {
+          if (attemptMatches && !staleTerminal) {
             if (state.caseReport) state.caseReport.studyRun = studyRun;
             const completedCases = Number(studyRun.completedCases || 0);
             const totalCases = Number(studyRun.totalCases || studyRun.plan?.casePaths?.length || 0);
             const percent = clamp(Number(studyRun.percent || 0), 0, 100);
+            const phase = complete
+              ? "Study complete"
+              : stopped
+                ? "Study stopped"
+                : failed
+                  ? "Study needs attention"
+                  : "Running study";
             applyRunProgress(casePath, {
-              state: complete ? "complete" : failed ? "failed" : "running",
-              tone: complete ? "verified" : failed ? "failed" : "running",
-              phase: complete ? "Study complete" : failed ? "Study needs attention" : "Running study",
+              state: complete ? "complete" : stopped ? "stopped" : failed ? "failed" : "running",
+              tone: complete ? "verified" : stopped ? "review" : failed ? "failed" : "running",
+              phase,
               percent,
-              label: `${complete ? "Study complete" : failed ? "Study needs attention" : "Running study"} - ${Math.round(percent)}%`,
-              detail: `${completedCases} of ${totalCases} members finished within the shared process budget.`,
-              isRunning: !complete && !failed,
+              label: `${phase} - ${Math.round(percent)}%`,
+              detail: stopped
+                ? `${completedCases} of ${totalCases} members finished before the study was stopped safely.`
+                : `${completedCases} of ${totalCases} members finished within the shared process budget.`,
+              isRunning: !terminal,
               isComplete: complete,
               isMeshComplete: false,
+              isStopped: stopped,
               runMode: "full",
               studyRun,
             });
             renderOptimizationStatus();
-            if (complete || failed) {
+            if (terminal) {
               state.studyRunTimer = null;
               resolve(studyRun);
               return;
@@ -3614,7 +3766,19 @@ function renderCases() {
   els.caseList.innerHTML = state.cases
     .slice(0, 8)
     .map((item) => {
-      const progress = item.progress || fallbackCaseProgress(item.status);
+      const storedProgress = item.progress || fallbackCaseProgress(item.status);
+      const progress = item.runActive && !storedProgress.isRunning
+        ? {
+            ...storedProgress,
+            state: "running",
+            tone: "running",
+            percent: Math.max(1, Number(storedProgress.percent || 0)),
+            label: item.studyId || item.sensitivityStudyId
+              ? "Active study run"
+              : "Active OpenFOAM run",
+            isRunning: true,
+          }
+        : storedProgress;
       const percent = clamp(Number(progress.percent || 0), 0, 100);
       const percentageLabel = progress.state === "ready" ? "Not run" : `${Math.round(percent)}%`;
       const studyDetail = item.studyLevel
@@ -3734,6 +3898,9 @@ function fallbackCaseProgress(status) {
   if (status === "solver_failed") {
     return { state: "failed", tone: "failed", percent: 0, label: "Failed" };
   }
+  if (["solver_stopped", "mesh_stopped"].includes(status)) {
+    return { state: "stopped", tone: "review", percent: 0, label: "Stopped by user" };
+  }
   if (status === "solver_running") {
     return { state: "running", tone: "running", percent: 1, label: "Starting - 1%" };
   }
@@ -3766,6 +3933,10 @@ function applyRunProgress(casePath, progress) {
       els.modelStatus.textContent = `${progress.phase} ${Math.round(progress.percent || 0)}% - current 3D view is preview`;
       els.candidateBadge.textContent = `${Math.round(progress.percent || 0)}%`;
       els.candidateBadge.className = "badge running";
+    } else if (progress.isStopped || progress.state === "stopped") {
+      els.modelStatus.textContent = "OpenFOAM run stopped - preview and preserved results only";
+      els.candidateBadge.textContent = "Stopped";
+      els.candidateBadge.className = "badge warn";
     } else if (progress.isMeshComplete) {
       els.modelStatus.textContent = "Mesh validation complete - solver has not run";
     } else if (progress.isComplete) {
@@ -3777,7 +3948,12 @@ function applyRunProgress(casePath, progress) {
   renderCases();
 }
 
-function startRunProgressPolling(casePath, maximumWaitMs, minimumUpdatedAt = 0) {
+function startRunProgressPolling(
+  casePath,
+  maximumWaitMs,
+  minimumUpdatedAt = 0,
+  expectedAttemptId = null,
+) {
   stopRunProgressPolling();
   const token = state.runProgressToken + 1;
   state.runProgressToken = token;
@@ -3789,12 +3965,15 @@ function startRunProgressPolling(casePath, maximumWaitMs, minimumUpdatedAt = 0) 
         const payload = await apiGet(`/api/case-progress?casePath=${encodeURIComponent(casePath)}`);
         if (state.runProgressToken !== token) return;
         const progress = payload.progress;
-        const terminal = ["complete", "mesh_complete", "failed"].includes(progress.state);
+        const terminal = ["complete", "mesh_complete", "failed", "stopped"].includes(progress.state);
         const updatedAt = Date.parse(progress.updatedAt || "");
-        const staleTerminal = terminal
+        const attemptMatches = !expectedAttemptId
+          || progress.attemptId === expectedAttemptId;
+        const staleTerminal = !expectedAttemptId
+          && terminal
           && Number.isFinite(updatedAt)
           && updatedAt < minimumUpdatedAt;
-        if (!staleTerminal) {
+        if (attemptMatches && !staleTerminal) {
           applyRunProgress(casePath, progress);
           if (terminal) {
             state.runProgressTimer = null;
@@ -3872,13 +4051,15 @@ async function refreshCaseReport(casePath) {
         ? "Solved OpenFOAM surface oil flow"
         : progress?.isRunning
           ? `${progress.phase} ${Math.round(progress.percent || 0)}% - current 3D view is preview`
-          : progress?.state === "failed"
-            ? "OpenFOAM run failed - preview only"
-            : progress?.isMeshComplete
-              ? "Mesh validated - preview flow until solver runs"
-              : progress?.isComplete
-                ? "OpenFOAM finished - solved visualization unavailable"
-                : "Preview only - case created, solver not run";
+          : progress?.state === "stopped"
+            ? "OpenFOAM run stopped - preview only"
+            : progress?.state === "failed"
+              ? "OpenFOAM run failed - preview only"
+              : progress?.isMeshComplete
+                ? "Mesh validated - preview flow until solver runs"
+                : progress?.isComplete
+                  ? "OpenFOAM finished - solved visualization unavailable"
+                  : "Preview only - case created, solver not run";
     initFlowVisualization();
     renderMetrics();
     void loadExactStl(payload.report.geometryModelPath || payload.report.sourceModelPath);
@@ -4051,20 +4232,22 @@ function restoreCaseContext(report) {
   const runProgress = report.runProgress;
   els.candidateBadge.textContent = runProgress?.isRunning
     ? `${Math.round(runProgress.percent || 0)}%`
-    : qualifiedCfd
-      ? "Qualified CFD"
-      : runProgress?.isComplete
-        ? "CFD Review"
-        : fidelityBlocked
-          ? "Repair Fidelity Missing"
-          : geometryCandidate
-            ? "Preview"
-            : "Cleanup";
+    : runProgress?.state === "stopped"
+      ? "Stopped"
+      : qualifiedCfd
+        ? "Qualified CFD"
+        : runProgress?.isComplete
+          ? "CFD Review"
+          : fidelityBlocked
+            ? "Repair Fidelity Missing"
+            : geometryCandidate
+              ? "Preview"
+              : "Cleanup";
   els.candidateBadge.className = runProgress?.isRunning
     ? "badge running"
     : qualifiedCfd
       ? "badge"
-      : runProgress?.isComplete || !geometryCandidate
+      : runProgress?.state === "stopped" || runProgress?.isComplete || !geometryCandidate
         ? "badge warn"
         : "badge muted";
   els.createCaseButton.disabled = fidelityBlocked;
@@ -4162,13 +4345,30 @@ function updateActionAvailability() {
     || Boolean(report.repair_fidelity)
     || caseGeometrySelected;
   els.checkSolverButton.disabled = state.busy;
-  els.meshCaseButton.disabled = state.busy || !state.activeCasePath || state.solver?.preferredBackend == null;
-  els.runCaseButton.disabled = state.busy || !state.activeCasePath || state.solver?.preferredBackend == null;
-  const activeCase = state.cases.find((item) => item.path === state.activeCasePath);
+  const activeCase = activeCaseItem();
   const activeStudy = Boolean(activeCase?.studyId || activeCase?.sensitivityStudyId);
+  const serverRunActive = activeCaseFamilyHasServerRun();
+  const solverUnavailable = state.solver?.preferredBackend == null;
+  els.meshCaseButton.disabled = state.busy
+    || !state.activeCasePath
+    || solverUnavailable
+    || serverRunActive;
+  els.runCaseButton.disabled = state.busy
+    || !state.activeCasePath
+    || solverUnavailable
+    || serverRunActive;
   els.runStudyButton.disabled = state.busy
     || !activeStudy
-    || state.solver?.preferredBackend == null;
+    || solverUnavailable
+    || serverRunActive;
+  els.stopRunButton.disabled = !serverRunActive || state.stopRequestInFlight;
+  els.stopRunButton.textContent = state.stopRequestInFlight ? "Stopping..." : "Stop Run";
+  els.deleteRunOutputsButton.disabled = state.busy
+    || !state.activeCasePath
+    || serverRunActive;
+  els.deleteRunOutputsButton.title = serverRunActive
+    ? "Stop the active run before deleting generated outputs."
+    : "Delete generated solver results while preserving case setup, geometry, and reusable mesh.";
   const progress = state.activeRunProgress || state.caseReport?.runProgress;
   const studyRun = progress?.studyRun || state.caseReport?.studyRun;
   const recommendation = activeBudgetRecommendation();
@@ -4210,6 +4410,14 @@ function basicAirflowState() {
       title: "Calculating airflow",
       short: "Airflow calculation is in progress.",
       detail: "The moving paths remain a visual preview until solved airflow tracks are available.",
+    };
+  }
+  if (progress?.state === "stopped") {
+    return {
+      tone: "warn",
+      title: "Calculation stopped",
+      short: "The OpenFOAM calculation was stopped safely.",
+      detail: "Case setup and any reusable mesh were preserved. Start the calculation again when ready, or delete its generated outputs.",
     };
   }
   if (progress?.state === "failed") {

@@ -36,12 +36,18 @@ from .parsing import (  # noqa: F401
     parse_y_plus,
 )
 from .run import (  # noqa: F401
+    SolverRunCancelled,
+    SolverRunController,
     SolverRunResult,
+    _case_execution_locks,
     _clear_previous_solver_outputs,
     _mesh_input_fingerprint,
     _mesh_record_reusable,
+    clear_case_run_outputs,
     normalize_file_handler,
     normalize_process_request,
+    reconcile_interrupted_case_run,
+    run_cancellation_context,
     run_case,
 )
 from .statistics import analyze_transient_history  # noqa: F401

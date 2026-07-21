@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import NormalDist
@@ -19,7 +20,11 @@ from .run import (
     MANUAL_MIN_BYTES_PER_PROCESS,
     QUALITY_ESTIMATED_BYTES_PER_CELL,
     QUALITY_FIXED_MEMORY_BYTES,
+    SolverRunCancelled,
+    SolverRunController,
     _case_cell_budget,
+    _case_execution_locks,
+    _current_run_controller,
     normalize_file_handler,
     normalize_process_request,
     run_case,
@@ -123,9 +128,13 @@ def run_study(
     process_budget: str | int = "auto",
     file_handler: str = "auto",
     solver_identity: dict[str, object] | None = None,
+    cancellation_controller: SolverRunController | None = None,
 ) -> dict[str, object]:
-    """Run independent study members without exceeding one shared resource plan."""
-    selected_file_handler = normalize_file_handler(file_handler)
+    """Run study members under one shared cancellation and ownership scope."""
+    case_path = case_path.resolve()
+    controller = cancellation_controller or _current_run_controller()
+    if controller is not None:
+        controller.raise_if_cancelled()
     plan = plan_study_schedule(
         case_path,
         backend=backend,
@@ -133,12 +142,54 @@ def run_study(
         process_budget=process_budget,
         solver_identity=solver_identity,
     )
-    member_paths = [Path(str(value)) for value in plan["casePaths"]]
+    locked_members = [
+        Path(str(value)).resolve() for value in plan["casePaths"]
+    ]
+    with ExitStack() as lock_stack:
+        if controller is None or not controller.owns_case_paths(locked_members):
+            lock_stack.enter_context(_case_execution_locks(locked_members))
+        return _run_study_locked(
+            plan=plan,
+            timeout_seconds=timeout_seconds,
+            run_mode=run_mode,
+            reuse_mesh=reuse_mesh,
+            file_handler=file_handler,
+            solver_identity=solver_identity,
+            cancellation_controller=controller,
+            locked_members=locked_members,
+        )
+
+
+def _run_study_locked(
+    *,
+    plan: dict[str, object],
+    timeout_seconds: int,
+    run_mode: str,
+    reuse_mesh: bool,
+    file_handler: str,
+    solver_identity: dict[str, object] | None,
+    cancellation_controller: SolverRunController | None,
+    locked_members: list[Path],
+) -> dict[str, object]:
+    selected_file_handler = normalize_file_handler(file_handler)
+    member_paths = [Path(str(value)).resolve() for value in plan["casePaths"]]
+    if set(member_paths) != set(locked_members):
+        raise RuntimeError("Study membership changed while acquiring run ownership.")
+    if cancellation_controller is not None:
+        cancellation_controller.raise_if_cancelled()
     ranks_per_case = int(plan["processesPerCase"])
     max_workers = int(plan["maxConcurrentCases"])
     started_at = datetime.now(timezone.utc).isoformat()
+    attempt_id = (
+        cancellation_controller.attempt_id
+        if cancellation_controller is not None
+        else hashlib.sha256(
+            f"{plan['studyId']}\0{started_at}".encode()
+        ).hexdigest()
+    )
     running_record = {
         "status": "running",
+        "attemptId": attempt_id,
         "ok": None,
         "studyId": plan["studyId"],
         "kind": plan["kind"],
@@ -169,6 +220,8 @@ def run_study(
                 solver_identity=solver_identity,
                 processes=ranks_per_case,
                 file_handler=selected_file_handler,
+                cancellation_controller=cancellation_controller,
+                _case_lock_held=True,
             ): (index, member_path)
             for index, member_path in enumerate(member_paths)
         }
@@ -176,9 +229,22 @@ def run_study(
             index, member_path = futures[future]
             try:
                 result = future.result()
+            except SolverRunCancelled as exc:
+                indexed_results[index] = {
+                    "casePath": str(member_path),
+                    "status": "stopped",
+                    "ok": False,
+                    "trusted": False,
+                    "cancelled": True,
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                }
             except Exception as exc:
                 indexed_results[index] = {
                     "casePath": str(member_path),
+                    "status": "failed",
                     "ok": False,
                     "trusted": False,
                     "error": {
@@ -189,6 +255,7 @@ def run_study(
             else:
                 indexed_results[index] = {
                     "casePath": str(member_path),
+                    "status": "complete" if result.ok else "failed",
                     "ok": result.ok,
                     "trusted": result.trusted,
                     "returncode": result.returncode,
@@ -210,41 +277,70 @@ def run_study(
                 indexed_results[result_index]
                 for result_index in sorted(indexed_results)
             ]
-            completed_cases = len(partial_results)
+            completed_cases = sum(
+                result.get("status") != "stopped" for result in partial_results
+            )
+            stopping = bool(
+                cancellation_controller is not None
+                and cancellation_controller.cancellation_requested
+            )
             _write_study_run_record(
                 member_paths,
                 {
                     **running_record,
+                    "status": "stopping" if stopping else "running",
                     "completedCases": completed_cases,
-                    "percent": round(completed_cases / len(member_paths) * 100),
+                    "percent": round(len(partial_results) / len(member_paths) * 100),
                     "results": partial_results,
-                    "budgetRecommendation": _study_budget_recommendation(
-                        plan,
-                        partial_results,
+                    "budgetRecommendation": (
+                        None
+                        if stopping
+                        else _study_budget_recommendation(plan, partial_results)
                     ),
                 },
             )
 
     results = [indexed_results[index] for index in range(len(member_paths))]
-    ok = bool(results and all(result.get("ok") for result in results))
-    trusted = bool(results and all(result.get("trusted") for result in results))
+    stopped = bool(
+        (
+            cancellation_controller is not None
+            and cancellation_controller.cancellation_requested
+        )
+        or any(result.get("status") == "stopped" for result in results)
+    )
+    ok = bool(not stopped and results and all(result.get("ok") for result in results))
+    trusted = bool(
+        not stopped and results and all(result.get("trusted") for result in results)
+    )
     finished_at = datetime.now(timezone.utc).isoformat()
+    completed_cases = sum(result.get("status") != "stopped" for result in results)
     final_record = {
-        "status": "complete" if ok else "partial_failure",
+        "status": "stopped" if stopped else "complete" if ok else "partial_failure",
+        "attemptId": attempt_id,
         "ok": ok,
         "trusted": trusted,
+        "cancelled": stopped,
         "studyId": plan["studyId"],
         "kind": plan["kind"],
         "startedAt": started_at,
         "finishedAt": finished_at,
-        "completedCases": len(member_paths),
+        "completedCases": completed_cases,
         "totalCases": len(member_paths),
         "percent": 100,
         "plan": plan,
         "results": results,
-        "budgetRecommendation": _study_budget_recommendation(plan, results),
+        "budgetRecommendation": (
+            None if stopped else _study_budget_recommendation(plan, results)
+        ),
     }
-    _write_study_run_record(member_paths, final_record)
+    if cancellation_controller is not None and stopped:
+        cancellation_controller.wait_for_stop_completion()
+        _write_study_run_record(member_paths, final_record)
+    elif cancellation_controller is not None:
+        with cancellation_controller.terminal_commit():
+            _write_study_run_record(member_paths, final_record)
+    else:
+        _write_study_run_record(member_paths, final_record)
     return final_record
 
 

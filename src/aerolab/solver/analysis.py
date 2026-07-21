@@ -51,7 +51,13 @@ def case_run_progress(case_path: Path) -> dict[str, object]:
 
     returncode = run_payload.get("returncode")
     trusted = bool(run_payload.get("trusted"))
-    running = case_status in {"solver_running", "mesh_running"} or run_status == "running"
+    stopped = run_status == "stopped" or case_status in {
+        "solver_stopped",
+        "mesh_stopped",
+    }
+    running = not stopped and (
+        case_status in {"solver_running", "mesh_running"} or run_status == "running"
+    )
     completed = run_mode != "mesh" and (
         case_status in {"solver_verified", "solver_unverified"}
         or (isinstance(returncode, int) and returncode == 0 and not running)
@@ -69,6 +75,15 @@ def case_run_progress(case_path: Path) -> dict[str, object]:
         tone = "running"
         label = f"{phase} - {percent}%"
         detail = "Live OpenFOAM progress from the current run log."
+    elif stopped:
+        state = "stopped"
+        tone = "review"
+        phase = "Stopped"
+        label = "Stopped by user"
+        detail = str(
+            run_payload.get("stopReason")
+            or "The OpenFOAM process tree was stopped safely. Case setup and reusable mesh remain available."
+        )
     elif completed:
         state = "complete"
         tone = "verified" if trusted or case_status == "solver_verified" else "review"
@@ -132,6 +147,9 @@ def case_run_progress(case_path: Path) -> dict[str, object]:
         "isRunning": state == "running",
         "isComplete": state == "complete",
         "isMeshComplete": state == "mesh_complete",
+        "isStopped": state == "stopped",
+        "attemptId": run_payload.get("attemptId"),
+        "executionId": run_payload.get("executionId"),
         "runMode": run_mode,
         "solverTime": solver_time,
         "solverEndTime": end_time if solver_time is not None else None,
@@ -306,8 +324,9 @@ def case_report(
         try:
             stored_run = json.loads(run_json_path.read_text(encoding="utf-8"))
             run_payload = {key: stored_run.get(key) for key in (
-                "status", "ok", "trusted", "numericallyQualified", "mode", "reusedMesh",
-                "backend", "requestedProcesses", "processes", "fileHandler", "resumed",
+                "status", "attemptId", "executionId", "ok", "trusted",
+                "numericallyQualified", "mode", "reusedMesh", "backend",
+                "requestedProcesses", "processes", "fileHandler", "resumed",
                 "resumeFromTime", "solverInputFingerprint", "convergencePolicy",
                 "processSelection", "returncode", "logPath", "startedAt", "finishedAt"
             )}
@@ -618,12 +637,20 @@ def _surface_geometry_metrics(
     silhouette_axis: int | None = None,
 ) -> dict[str, tuple[float, float, float]]:
     vertices = [point for triangle in triangles for point in triangle]
-    minimum = tuple(min(point[axis] for point in vertices) for axis in range(3))
-    maximum = tuple(max(point[axis] for point in vertices) for axis in range(3))
+    minimum = (
+        min(point[0] for point in vertices),
+        min(point[1] for point in vertices),
+        min(point[2] for point in vertices),
+    )
+    maximum = (
+        max(point[0] for point in vertices),
+        max(point[1] for point in vertices),
+        max(point[2] for point in vertices),
+    )
     projected = [0.0, 0.0, 0.0]
     for a, b, c in triangles:
-        ab = tuple(b[axis] - a[axis] for axis in range(3))
-        ac = tuple(c[axis] - a[axis] for axis in range(3))
+        ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
         cross = (
             ab[1] * ac[2] - ab[2] * ac[1],
             ab[2] * ac[0] - ab[0] * ac[2],
@@ -640,10 +667,18 @@ def _surface_geometry_metrics(
             triangles,
             silhouette_axis,
         )
-        silhouette_values = tuple(silhouette_values_list)
+        silhouette_values = (
+            silhouette_values_list[0],
+            silhouette_values_list[1],
+            silhouette_values_list[2],
+        )
     return {
-        "dimensions": tuple(maximum[axis] - minimum[axis] for axis in range(3)),
-        "projectedAreas": tuple(projected),
+        "dimensions": (
+            maximum[0] - minimum[0],
+            maximum[1] - minimum[1],
+            maximum[2] - minimum[2],
+        ),
+        "projectedAreas": (projected[0], projected[1], projected[2]),
         "silhouetteAreas": silhouette_values,
     }
 
@@ -769,9 +804,9 @@ def grid_convergence_report(case_path: Path) -> dict[str, object] | None:
     ]
 
     cell_counts = [_finite_number(record.get("cells")) for record in records]
+    draft_cells, standard_cells, fine_cells = cell_counts
     mesh_growth: bool | None = None
-    if all(value is not None for value in cell_counts):
-        draft_cells, standard_cells, fine_cells = (float(value) for value in cell_counts)
+    if draft_cells is not None and standard_cells is not None and fine_cells is not None:
         mesh_growth = bool(
             draft_cells < standard_cells < fine_cells
             and standard_cells / draft_cells >= 1.15
@@ -788,10 +823,16 @@ def grid_convergence_report(case_path: Path) -> dict[str, object] | None:
 
     cd_values = [_finite_number(record.get("meanCd")) for record in records]
     cl_values = [_finite_number(record.get("meanCl")) for record in records]
+    draft_cd, standard_cd, fine_cd = cd_values
     cd_metrics: dict[str, object] | None = None
     cd_converged: bool | None = None
-    if all_trusted and mesh_growth and all(value is not None for value in cd_values):
-        draft_cd, standard_cd, fine_cd = (float(value) for value in cd_values)
+    if (
+        all_trusted
+        and mesh_growth
+        and draft_cd is not None
+        and standard_cd is not None
+        and fine_cd is not None
+    ):
         coarse_change = abs(standard_cd - draft_cd)
         fine_change = abs(fine_cd - standard_cd)
         fine_change_percent = fine_change / max(abs(fine_cd), 0.05) * 100.0
@@ -814,11 +855,10 @@ def grid_convergence_report(case_path: Path) -> dict[str, object] | None:
         )
     )
 
+    _, standard_cl, fine_cl = cl_values
     cl_metrics: dict[str, object] | None = None
     cl_converged: bool | None = None
-    if all_trusted and mesh_growth and all(value is not None for value in cl_values):
-        standard_cl = float(cl_values[1])
-        fine_cl = float(cl_values[2])
+    if all_trusted and mesh_growth and standard_cl is not None and fine_cl is not None:
         fine_change = abs(fine_cl - standard_cl)
         cl_converged = fine_change <= 0.02
         cl_metrics = {"standardToFineAbsolute": fine_change}
@@ -915,16 +955,18 @@ def _aerodynamic_force_summary(
     drag_n = coefficients["Cd"] * force_scale if coefficients["Cd"] is not None else None
     side_n = coefficients["Cs"] * force_scale if coefficients["Cs"] is not None else None
     lift_n = coefficients["Cl"] * force_scale if coefficients["Cl"] is not None else None
-    moments = {
-        name: coefficients[key] * moment_scale
-        if coefficients[key] is not None and moment_scale is not None
-        else None
-        for name, key in (
-            ("rollMomentNm", "CmRoll"),
-            ("pitchMomentNm", "CmPitch"),
-            ("yawMomentNm", "CmYaw"),
+    moments: dict[str, float | None] = {}
+    for name, key in (
+        ("rollMomentNm", "CmRoll"),
+        ("pitchMomentNm", "CmPitch"),
+        ("yawMomentNm", "CmYaw"),
+    ):
+        coefficient = coefficients[key]
+        moments[name] = (
+            coefficient * moment_scale
+            if coefficient is not None and moment_scale is not None
+            else None
         )
-    }
     newtons_per_lbf = 4.4482216152605
     newton_meters_per_lbf_ft = 1.3558179483314
     vertical_type = None

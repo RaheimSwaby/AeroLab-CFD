@@ -2391,6 +2391,18 @@ body[data-view-mode="basic"] #runCaseButton:hover:not(:disabled) {
   color: var(--accent-strong);
 }
 
+#stopRunButton:not(:disabled) {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+  font-weight: 700;
+}
+
+#deleteRunOutputsButton:not(:disabled) {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
+  color: var(--danger);
+}
+
 .run-progress {
   background: #f5f8f9;
   border: 1px solid var(--line);

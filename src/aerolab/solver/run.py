@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -7,13 +8,17 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
+import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import BinaryIO, TextIO
 
 from ..openfoam import QUALITY_PRESETS, configure_decomposition, ensure_case_postprocessing
 from .analysis import (
@@ -30,7 +35,7 @@ from .backends import (
     probe_backend_resources,
     solver_status,
 )
-from .util import _read_json_object
+from .util import _finite_number, _read_json_object
 
 MESH_INPUT_FILES = (
     "constant/geometry/body.stl",
@@ -46,6 +51,251 @@ AUTO_CELLS_PER_PROCESS = 250_000
 QUALITY_ESTIMATED_BYTES_PER_CELL = 2048
 QUALITY_FIXED_MEMORY_BYTES = 2 * 1024**3
 SAFE_CELL_BUDGET_ROUNDING = 50_000
+
+
+class SolverRunCancelled(RuntimeError):
+    """Raised after an explicitly requested run cancellation is made safe."""
+
+
+@dataclass(frozen=True)
+class _RegisteredSolverProcess:
+    process: subprocess.Popen[str]
+    case_path: Path
+    backend: str
+    execution_id: str
+
+
+class SolverRunController:
+    """Coordinate cancellation and ownership for one accepted run attempt."""
+
+    def __init__(self, attempt_id: str | None = None) -> None:
+        self.attempt_id = attempt_id or uuid.uuid4().hex
+        self._cancelled = threading.Event()
+        self._stop_complete = threading.Event()
+        self._stop_complete.set()
+        self._lock = threading.Lock()
+        self._termination_lock = threading.Lock()
+        self._transition_lock = threading.Lock()
+        self._terminal = False
+        self._processes: dict[subprocess.Popen[str], _RegisteredSolverProcess] = {}
+        self._owned_case_paths: frozenset[Path] = frozenset()
+
+    @property
+    def cancellation_requested(self) -> bool:
+        return self._cancelled.is_set()
+
+    def set_owned_case_paths(self, case_paths: list[Path]) -> None:
+        """Record case locks acquired by the accepting server thread."""
+        resolved = frozenset(path.resolve() for path in case_paths)
+        with self._lock:
+            if self._owned_case_paths and self._owned_case_paths != resolved:
+                raise RuntimeError("Run ownership paths cannot change after acceptance.")
+            self._owned_case_paths = resolved
+
+    def owns_case_paths(self, case_paths: list[Path]) -> bool:
+        expected = frozenset(path.resolve() for path in case_paths)
+        with self._lock:
+            return bool(expected) and expected.issubset(self._owned_case_paths)
+
+    @property
+    def owns_multiple_cases(self) -> bool:
+        with self._lock:
+            return len(self._owned_case_paths) > 1
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancellation_requested:
+            raise SolverRunCancelled("OpenFOAM run stopped by user request.")
+
+    def wait_for_stop_completion(self) -> None:
+        """Keep case ownership until synchronous termination verification finishes."""
+        if self.cancellation_requested:
+            self._stop_complete.wait()
+
+    def register_process(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        case_path: Path,
+        backend: str,
+        execution_id: str,
+    ) -> None:
+        registration = _RegisteredSolverProcess(
+            process=process,
+            case_path=case_path.resolve(),
+            backend=backend,
+            execution_id=execution_id,
+        )
+        with self._lock:
+            self._processes[process] = registration
+            cancelled = self._cancelled.is_set()
+        if cancelled:
+            self.request_stop()
+            self.raise_if_cancelled()
+
+    def unregister_process(self, process: subprocess.Popen[str]) -> None:
+        with self._lock:
+            self._processes.pop(process, None)
+
+    @contextmanager
+    def terminal_commit(self, *, mark_terminal: bool = True) -> Iterator[None]:
+        """Make completion and cancellation mutually exclusive terminal transitions."""
+        with self._transition_lock:
+            self.raise_if_cancelled()
+            if mark_terminal and self._terminal:
+                raise RuntimeError("This run already reached a terminal state.")
+            yield
+            if mark_terminal:
+                self._terminal = True
+
+    def request_stop(self) -> int:
+        """Request cancellation and synchronously clean up every owned process tree."""
+        with self._transition_lock:
+            if self._terminal:
+                raise ValueError("The OpenFOAM run already finished.")
+            self._stop_complete.clear()
+            self._cancelled.set()
+        try:
+            return self._terminate_registered_processes()
+        finally:
+            self._stop_complete.set()
+
+    def _terminate_registered_processes(self) -> int:
+        with self._termination_lock:
+            with self._lock:
+                registrations = list(self._processes.values())
+                self._processes.clear()
+            errors: list[str] = []
+            for registration in registrations:
+                try:
+                    _terminate_process_tree(registration.process)
+                except Exception as exc:
+                    errors.append(
+                        f"{registration.case_path.name} process-tree termination failed: {exc}"
+                    )
+            for registration in registrations:
+                try:
+                    _confirm_backend_cleanup(
+                        registration.case_path,
+                        registration.backend,
+                        registration.execution_id,
+                    )
+                except Exception as exc:
+                    errors.append(
+                        f"{registration.case_path.name} backend cleanup failed: {exc}"
+                    )
+            if errors:
+                raise RuntimeError("; ".join(errors))
+            return len(registrations)
+
+
+class _RunControllerContext(threading.local):
+    controller: SolverRunController | None
+
+    def __init__(self) -> None:
+        self.controller = None
+
+
+_RUN_CONTROLLER_CONTEXT = _RunControllerContext()
+
+
+@contextmanager
+def run_cancellation_context(
+    controller: SolverRunController,
+) -> Iterator[SolverRunController]:
+    """Bind a controller to the current worker without changing public call sites."""
+    previous = _RUN_CONTROLLER_CONTEXT.controller
+    _RUN_CONTROLLER_CONTEXT.controller = controller
+    try:
+        yield controller
+    finally:
+        _RUN_CONTROLLER_CONTEXT.controller = previous
+
+
+def _current_run_controller() -> SolverRunController | None:
+    return _RUN_CONTROLLER_CONTEXT.controller
+
+
+@contextmanager
+def _case_execution_lock(case_path: Path) -> Iterator[None]:
+    """Hold a cross-process lock while a case is running or being cleaned."""
+    case_path = case_path.resolve()
+    if not case_path.is_dir():
+        raise FileNotFoundError(case_path)
+    lock_path = case_path / ".aerolab-run.lock"
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"Could not open the case run lock: {exc}") from exc
+    handle: BinaryIO | None = None
+    acquired = False
+    try:
+        lock_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(lock_stat.st_mode):
+            raise RuntimeError("The case run lock must be a regular file.")
+        handle = os.fdopen(descriptor, "r+b", buffering=0)
+        descriptor = -1
+        try:
+            if os.name == "posix":
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif os.name == "nt":
+                import msvcrt
+
+                if lock_stat.st_size == 0:
+                    handle.write(b"\0")
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                raise RuntimeError(
+                    f"Case run locking is unsupported on operating system {os.name!r}."
+                )
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise RuntimeError(
+                    "This case is active in another AeroLab process; stop that run before deleting or starting it again."
+                ) from exc
+            raise
+        acquired = True
+        yield
+    finally:
+        if handle is not None:
+            if acquired:
+                try:
+                    if os.name == "posix":
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    elif os.name == "nt":
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            handle.close()
+        elif descriptor >= 0:
+            os.close(descriptor)
+
+
+def _case_execution_locks(case_paths: list[Path]) -> ExitStack:
+    stack = ExitStack()
+    try:
+        for case_path in sorted(
+            {path.resolve() for path in case_paths},
+            key=lambda path: str(path),
+        ):
+            stack.enter_context(_case_execution_lock(case_path))
+    except Exception:
+        stack.close()
+        raise
+    return stack
 
 
 def _safe_cell_budget(resources: dict[str, object]) -> int | None:
@@ -486,7 +736,9 @@ def _resolve_processes(
     selection["detectedResources"] = resources
     selection["qualityRecommendation"] = _quality_recommendation(case_path, resources)
     if not resources.get("parallelAvailable"):
-        missing = ", ".join(str(item) for item in resources.get("missingParallelTools", []))
+        missing_value = resources.get("missingParallelTools")
+        missing_tools = missing_value if isinstance(missing_value, list) else []
+        missing = ", ".join(str(item) for item in missing_tools)
         if requested == "auto":
             selection["selectionReason"] = (
                 "MPI tools are incomplete; using serial execution"
@@ -608,9 +860,16 @@ class SolverRunResult:
         }
 
 
-def _run_record(result: SolverRunResult) -> dict[str, object]:
+def _run_record(
+    result: SolverRunResult,
+    *,
+    attempt_id: str,
+    execution_id: str,
+) -> dict[str, object]:
     return {
         "status": "complete" if result.ok else "failed",
+        "attemptId": attempt_id,
+        "executionId": execution_id,
         "ok": result.ok,
         "trusted": result.trusted,
         "numericallyQualified": result.numerically_qualified,
@@ -635,6 +894,52 @@ def _run_record(result: SolverRunResult) -> dict[str, object]:
     }
 
 
+def _record_stopped_run(
+    case_path: Path,
+    run_mode: str,
+    backend: str,
+    reason: str,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    run_path = case_path / "aerolab-run.json"
+    existing = _read_json_object(run_path)
+    was_stopped = existing.get("status") == "stopped"
+    started_at = (
+        existing.get("startedAt")
+        if existing.get("status") in {"running", "stopping", "stopped"}
+        else now
+    )
+    record = {
+        **existing,
+        "status": "stopped",
+        "ok": False,
+        "cancelled": True,
+        "trusted": False,
+        "numericallyQualified": False,
+        "mode": run_mode,
+        "backend": existing.get("backend") or backend,
+        "returncode": None,
+        "budgetRecommendation": None,
+        "startedAt": started_at,
+        "finishedAt": now,
+        "stopReason": reason,
+    }
+    run_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    _update_case_status(
+        case_path,
+        "mesh_stopped" if str(run_mode).lower() == "mesh" else "solver_stopped",
+    )
+    if not was_stopped:
+        try:
+            with (case_path / "aerolab-run.log").open(
+                "a",
+                encoding="utf-8",
+            ) as stream:
+                stream.write(f"\nAeroLab stopped this run: {reason}\n")
+        except OSError:
+            pass
+
+
 def run_case(
     case_path: Path,
     backend: str = "auto",
@@ -645,6 +950,65 @@ def run_case(
     processes: str | int = 1,
     file_handler: str = "auto",
     resume: bool = False,
+    *,
+    cancellation_controller: SolverRunController | None = None,
+    _case_lock_held: bool = False,
+) -> SolverRunResult:
+    """Run one case while holding its cross-process ownership lock."""
+    resolved_path = case_path.resolve()
+    controller = cancellation_controller or _current_run_controller()
+    try:
+        if controller is not None:
+            controller.raise_if_cancelled()
+        lock_already_owned = bool(
+            _case_lock_held
+            or (controller is not None and controller.owns_case_paths([resolved_path]))
+        )
+        if lock_already_owned:
+            return _run_case_locked(
+                resolved_path,
+                backend=backend,
+                timeout_seconds=timeout_seconds,
+                run_mode=run_mode,
+                reuse_mesh=reuse_mesh,
+                solver_identity=solver_identity,
+                processes=processes,
+                file_handler=file_handler,
+                resume=resume,
+                cancellation_controller=controller,
+            )
+        with _case_execution_lock(resolved_path):
+            return _run_case_locked(
+                resolved_path,
+                backend=backend,
+                timeout_seconds=timeout_seconds,
+                run_mode=run_mode,
+                reuse_mesh=reuse_mesh,
+                solver_identity=solver_identity,
+                processes=processes,
+                file_handler=file_handler,
+                resume=resume,
+                cancellation_controller=controller,
+            )
+    except SolverRunCancelled as exc:
+        if controller is not None:
+            controller.wait_for_stop_completion()
+        _record_stopped_run(resolved_path, run_mode, backend, str(exc))
+        raise
+
+
+def _run_case_locked(
+    case_path: Path,
+    backend: str = "auto",
+    timeout_seconds: int = 3600,
+    run_mode: str = "full",
+    reuse_mesh: bool = True,
+    solver_identity: dict[str, object] | None = None,
+    processes: str | int = 1,
+    file_handler: str = "auto",
+    resume: bool = False,
+    *,
+    cancellation_controller: SolverRunController | None = None,
 ) -> SolverRunResult:
     case_path = case_path.resolve()
     requested_processes = normalize_process_request(processes)
@@ -662,6 +1026,8 @@ def run_case(
         raise FileNotFoundError(case_path)
     if not (case_path / "Allrun").exists():
         raise FileNotFoundError(case_path / "Allrun")
+    if cancellation_controller is not None:
+        cancellation_controller.raise_if_cancelled()
 
     ensure_case_postprocessing(case_path)
     solver_input_fingerprint = _solver_input_fingerprint(case_path)
@@ -671,13 +1037,15 @@ def run_case(
         if resume
         else None
     )
-    resume_from_time = (
-        float(resume_state["latestTime"])
-        if isinstance(resume_state, dict)
-        else None
-    )
+    resume_from_time = None
+    if isinstance(resume_state, dict):
+        resume_from_time = _finite_number(resume_state.get("latestTime"))
+        if resume_from_time is None:
+            raise RuntimeError("Resume compatibility returned an invalid latest time.")
     status = solver_status()
     selected = _select_backend(status, backend)
+    if cancellation_controller is not None:
+        cancellation_controller.raise_if_cancelled()
     reused_mesh = bool(
         resume
         or (
@@ -706,14 +1074,23 @@ def run_case(
     stage_cache = _stage_cache_plan(case_path)
     process_selection["stageCache"] = stage_cache
     configure_decomposition(case_path, resolved_processes)
+    if cancellation_controller is not None:
+        cancellation_controller.raise_if_cancelled()
     started_at = datetime.now(timezone.utc).isoformat()
     log_path = case_path / "aerolab-run.log"
     run_path = case_path / "aerolab-run.json"
 
+    if cancellation_controller is not None:
+        cancellation_controller.raise_if_cancelled()
     _clear_previous_solver_outputs(
         case_path,
         preserve_mesh=reused_mesh,
         preserve_solver_state=resume,
+    )
+    attempt_id = (
+        cancellation_controller.attempt_id
+        if cancellation_controller is not None
+        else uuid.uuid4().hex
     )
     execution_id = uuid.uuid4().hex
     command = _run_command(
@@ -735,6 +1112,8 @@ def run_case(
         json.dumps(
             {
                 "status": "running",
+                "attemptId": attempt_id,
+                "executionId": execution_id,
                 "ok": None,
                 "trusted": False,
                 "numericallyQualified": False,
@@ -773,6 +1152,8 @@ def run_case(
             f"AeroLab convergence policy: {convergence_policy.get('controller', 'unknown')}\n"
         )
         log_file.flush()
+        if cancellation_controller is not None:
+            cancellation_controller.raise_if_cancelled()
         returncode, outer_timeout = _run_solver_process(
             command,
             case_path=case_path,
@@ -780,6 +1161,7 @@ def run_case(
             execution_id=execution_id,
             process_timeout=process_timeout,
             log_file=log_file,
+            cancellation_controller=cancellation_controller,
         )
         if outer_timeout:
             log_file.write(
@@ -791,6 +1173,8 @@ def run_case(
                 f"\nAeroLab stopped OpenFOAM after {timeout_seconds} seconds; "
                 "staged partial results were copied back.\n"
             )
+    if cancellation_controller is not None:
+        cancellation_controller.raise_if_cancelled()
     finished_at = datetime.now(timezone.utc).isoformat()
     budget_recommendation = (
         _failure_budget_recommendation(
@@ -842,40 +1226,58 @@ def run_case(
         process_selection=process_selection,
         budget_recommendation=budget_recommendation,
     )
-    run_path.write_text(json.dumps(_run_record(result), indent=2) + "\n", encoding="utf-8")
-    if mesh_returncode is not None and not reused_mesh:
-        _write_mesh_record(
-            case_path,
-            backend=selected,
-            returncode=mesh_returncode,
-            started_at=started_at,
-            finished_at=finished_at,
-            report=report,
-            log_path=log_path,
-            preserve_log=run_mode == "mesh",
-            processes=resolved_processes,
-            file_handler=selected_file_handler,
-            process_selection=process_selection,
+    with ExitStack() as terminal_stack:
+        if cancellation_controller is not None:
+            terminal_stack.enter_context(
+                cancellation_controller.terminal_commit(
+                    mark_terminal=not cancellation_controller.owns_multiple_cases
+                )
+            )
+        run_path.write_text(
+            json.dumps(
+                _run_record(
+                    result,
+                    attempt_id=attempt_id,
+                    execution_id=execution_id,
+                ),
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
         )
-    if run_mode == "mesh":
-        if result.trusted:
-            case_status = "mesh_validated"
+        if mesh_returncode is not None and not reused_mesh:
+            _write_mesh_record(
+                case_path,
+                backend=selected,
+                returncode=mesh_returncode,
+                started_at=started_at,
+                finished_at=finished_at,
+                report=report,
+                log_path=log_path,
+                preserve_log=run_mode == "mesh",
+                processes=resolved_processes,
+                file_handler=selected_file_handler,
+                process_selection=process_selection,
+            )
+        if run_mode == "mesh":
+            if result.trusted:
+                case_status = "mesh_validated"
+            elif result.ok:
+                case_status = "mesh_unverified"
+            else:
+                case_status = "mesh_failed"
+        elif result.trusted:
+            case_status = "solver_verified"
         elif result.ok:
-            case_status = "mesh_unverified"
+            case_status = "solver_unverified"
         else:
-            case_status = "mesh_failed"
-    elif result.trusted:
-        case_status = "solver_verified"
-    elif result.ok:
-        case_status = "solver_unverified"
-    else:
-        case_status = "solver_failed"
-    _update_case_status(case_path, case_status)
-    final_report = case_report(
-        case_path,
-        solver_returncode=returncode if run_mode == "full" else None,
-        mesh_returncode=mesh_returncode,
-    )
+            case_status = "solver_failed"
+        _update_case_status(case_path, case_status)
+        final_report = case_report(
+            case_path,
+            solver_returncode=returncode if run_mode == "full" else None,
+            mesh_returncode=mesh_returncode,
+        )
     return SolverRunResult(
         backend=selected,
         returncode=returncode,
@@ -906,6 +1308,7 @@ def _run_solver_process(
     process_timeout: int,
     log_file: TextIO,
     termination_grace_seconds: float = 30.0,
+    cancellation_controller: SolverRunController | None = None,
 ) -> tuple[int, bool]:
     process_options: dict[str, object] = {}
     if os.name == "posix":
@@ -925,27 +1328,47 @@ def _run_solver_process(
         **process_options,
     )
     try:
-        return process.wait(timeout=process_timeout), False
-    except subprocess.TimeoutExpired:
-        cleanup_errors: list[str] = []
-        try:
-            _terminate_process_tree(
+        if cancellation_controller is not None:
+            cancellation_controller.register_process(
                 process,
-                grace_seconds=termination_grace_seconds,
+                case_path=case_path,
+                backend=backend,
+                execution_id=execution_id,
             )
-        except Exception as exc:
-            cleanup_errors.append(f"process-tree termination failed: {exc}")
         try:
-            _confirm_backend_cleanup(case_path, backend, execution_id)
-        except Exception as exc:
-            cleanup_errors.append(f"backend cleanup failed: {exc}")
-        if cleanup_errors:
-            detail = "; ".join(cleanup_errors)
-            log_file.write(f"\nAeroLab could not confirm timeout cleanup: {detail}\n")
-            raise RuntimeError(
-                f"Solver timeout cleanup could not be confirmed: {detail}"
-            )
-        return 124, True
+            returncode = process.wait(timeout=process_timeout)
+        except subprocess.TimeoutExpired:
+            if (
+                cancellation_controller is not None
+                and cancellation_controller.cancellation_requested
+            ):
+                cancellation_controller.request_stop()
+                cancellation_controller.raise_if_cancelled()
+            cleanup_errors: list[str] = []
+            try:
+                _terminate_process_tree(
+                    process,
+                    grace_seconds=termination_grace_seconds,
+                )
+            except Exception as exc:
+                cleanup_errors.append(f"process-tree termination failed: {exc}")
+            try:
+                _confirm_backend_cleanup(case_path, backend, execution_id)
+            except Exception as exc:
+                cleanup_errors.append(f"backend cleanup failed: {exc}")
+            if cleanup_errors:
+                detail = "; ".join(cleanup_errors)
+                log_file.write(f"\nAeroLab could not confirm timeout cleanup: {detail}\n")
+                raise RuntimeError(
+                    f"Solver timeout cleanup could not be confirmed: {detail}"
+                )
+            return 124, True
+        if cancellation_controller is not None:
+            cancellation_controller.raise_if_cancelled()
+        return returncode, False
+    finally:
+        if cancellation_controller is not None:
+            cancellation_controller.unregister_process(process)
 
 
 def _confirm_backend_cleanup(
@@ -964,6 +1387,12 @@ def _confirm_backend_cleanup(
     if cleanup_command is None or verification_command is None:
         raise RuntimeError("Backend cleanup commands are incomplete.")
 
+    verification_label = (
+        "container-absence verification"
+        if backend == "docker"
+        else f"{backend} cleanup verification"
+    )
+    resource_label = "container" if backend == "docker" else f"{backend} run resource"
     cleanup_detail = ""
     try:
         cleanup = subprocess.run(
@@ -985,18 +1414,18 @@ def _confirm_backend_cleanup(
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"container-absence verification failed: {exc}") from exc
+        raise RuntimeError(f"{verification_label} failed: {exc}") from exc
     if verification.returncode != 0:
         detail = (verification.stderr or verification.stdout).strip()
         raise RuntimeError(
-            "container-absence verification failed"
+            f"{verification_label} failed"
             + (f": {detail}" if detail else "")
             + (f"; cleanup reported: {cleanup_detail}" if cleanup_detail else "")
         )
-    remaining_container_ids = verification.stdout.strip()
-    if remaining_container_ids:
+    remaining_resources = verification.stdout.strip()
+    if remaining_resources:
         raise RuntimeError(
-            f"container still exists after forced removal: {remaining_container_ids}"
+            f"{resource_label} still exists after forced removal: {remaining_resources}"
             + (f"; cleanup reported: {cleanup_detail}" if cleanup_detail else "")
         )
 
@@ -1006,8 +1435,20 @@ def _terminate_process_tree(
     *,
     grace_seconds: float = 30.0,
 ) -> None:
+    if process.poll() is not None:
+        return
     if os.name == "posix":
-        process_group_id = process.pid
+        try:
+            process_group_id = os.getpgid(process.pid)
+        except ProcessLookupError:
+            process.poll()
+            return
+        if process.poll() is not None:
+            return
+        if process_group_id != process.pid:
+            raise RuntimeError(
+                "Refusing to signal a process that no longer leads its owned session."
+            )
         if process_group_id == os.getpgrp():
             raise RuntimeError("Refusing to signal AeroLab's own process group.")
         try:
@@ -1086,19 +1527,56 @@ def _process_group_exists(process_group_id: int) -> bool:
     return True
 
 
+def _remove_case_generated_path(case_path: Path, target: Path) -> None:
+    """Remove one case-local generated path without following any symlink."""
+    case_path = case_path.resolve()
+    try:
+        relative = target.relative_to(case_path)
+    except ValueError as exc:
+        raise RuntimeError(f"Refusing to remove a path outside the case: {target}") from exc
+    parent = case_path
+    for part in relative.parts[:-1]:
+        parent = parent / part
+        try:
+            parent_stat = parent.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(parent_stat.st_mode):
+            return
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            return
+    try:
+        target_stat = target.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(target_stat.st_mode):
+        target.unlink()
+    elif stat.S_ISDIR(target_stat.st_mode):
+        shutil.rmtree(target)
+
+
 def _clear_previous_solver_outputs(
     case_path: Path,
     preserve_mesh: bool = False,
     preserve_solver_state: bool = False,
 ) -> None:
-    """Remove generated products unless an explicitly validated resume needs them."""
+    """Remove generated products without following case-local symlinks."""
     if preserve_solver_state and not preserve_mesh:
         raise ValueError("Preserving solver state also requires preserving the mesh.")
     case_path = case_path.resolve()
     directory_targets: list[Path] = []
     post_processing = case_path / "postProcessing"
+    try:
+        post_processing_stat = post_processing.lstat()
+    except FileNotFoundError:
+        post_processing_stat = None
     if not preserve_solver_state:
-        if preserve_mesh and post_processing.is_dir():
+        if (
+            preserve_mesh
+            and post_processing_stat is not None
+            and stat.S_ISDIR(post_processing_stat.st_mode)
+            and not stat.S_ISLNK(post_processing_stat.st_mode)
+        ):
             directory_targets.extend(
                 child for child in post_processing.iterdir() if child.name != "meshSurface"
             )
@@ -1106,11 +1584,20 @@ def _clear_previous_solver_outputs(
             directory_targets.append(post_processing)
     if not preserve_mesh:
         directory_targets.append(case_path / "constant" / "polyMesh")
+    processor_pattern = re.compile(r"(?:processor\d+|processors\d+(?:_\d+-\d+)?)\Z")
     for child in case_path.iterdir():
-        if not child.is_dir() or child.name == "0":
+        if child.name == "0":
             continue
-        processor_suffix = child.name.removeprefix("processor")
-        if child.name.startswith("processor") and processor_suffix.isdigit():
+        try:
+            child_stat = child.lstat()
+        except FileNotFoundError:
+            continue
+        removable_kind = stat.S_ISDIR(child_stat.st_mode) or stat.S_ISLNK(
+            child_stat.st_mode
+        )
+        if not removable_kind:
+            continue
+        if processor_pattern.fullmatch(child.name):
             directory_targets.append(child)
             continue
         if preserve_solver_state:
@@ -1122,10 +1609,8 @@ def _clear_previous_solver_outputs(
         if math.isfinite(numeric_time):
             directory_targets.append(child)
 
-    for target in directory_targets:
-        resolved = target.resolve()
-        if resolved != case_path and case_path in resolved.parents and resolved.exists():
-            shutil.rmtree(resolved)
+    for target in dict.fromkeys(directory_targets):
+        _remove_case_generated_path(case_path, target)
 
     if not preserve_mesh:
         for filename in (
@@ -1134,14 +1619,141 @@ def _clear_previous_solver_outputs(
             "aerolab-mesh.log",
         ):
             target = case_path / filename
-            if target.exists():
+            if target.exists() or target.is_symlink():
                 target.unlink()
 
 
+def clear_case_run_outputs(
+    case_path: Path,
+    *,
+    related_case_paths: list[Path] | None = None,
+) -> dict[str, object]:
+    """Delete generated run products while retaining setup, geometry, and mesh."""
+    case_path = case_path.resolve()
+    related_paths = [path.resolve() for path in (related_case_paths or [])]
+    locked_paths = list({case_path, *related_paths})
+    for path in locked_paths:
+        if not path.is_dir() or not (path / "case.json").is_file():
+            raise ValueError(f"{path} is not an AeroLab case.")
+
+    deleted: list[str] = []
+    cleared_study_records: list[str] = []
+    with _case_execution_locks(locked_paths):
+        preserve_mesh = _mesh_record_reusable(case_path)
+        mesh_record = _read_json_object(case_path / "aerolab-mesh.json")
+        _clear_previous_solver_outputs(case_path, preserve_mesh=preserve_mesh)
+        for filename in ("aerolab-run.json", "aerolab-run.log"):
+            target = case_path / filename
+            if target.exists() or target.is_symlink():
+                target.unlink()
+                deleted.append(filename)
+        for related_path in locked_paths:
+            removed = False
+            for filename in (
+                "aerolab-study-run.json",
+                ".aerolab-study-run.json.tmp",
+            ):
+                target = related_path / filename
+                if target.exists() or target.is_symlink():
+                    target.unlink()
+                    removed = True
+            if removed:
+                cleared_study_records.append(str(related_path))
+
+        if preserve_mesh:
+            reset_status = (
+                "mesh_validated" if mesh_record.get("trusted") else "mesh_unverified"
+            )
+        else:
+            reset_status = "openfoam_case_generated"
+        _update_case_status(case_path, reset_status)
+
+    return {
+        "casePath": str(case_path),
+        "deletedFiles": deleted,
+        "preservedMesh": preserve_mesh,
+        "resetStatus": reset_status,
+        "clearedStudyRecordCasePaths": cleared_study_records,
+    }
+
+
+def _case_local_regular_file(case_path: Path, path: Path) -> bool:
+    try:
+        relative = path.relative_to(case_path)
+    except ValueError:
+        return False
+    current = case_path
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        try:
+            current_stat = current.lstat()
+        except OSError:
+            return False
+        if stat.S_ISLNK(current_stat.st_mode):
+            return False
+        if index < len(relative.parts) - 1 and not stat.S_ISDIR(current_stat.st_mode):
+            return False
+    return stat.S_ISREG(current_stat.st_mode)
+
+
+def reconcile_interrupted_case_run(case_path: Path) -> str | None:
+    """Safely reconcile a durable running record left by a previous server."""
+    case_path = case_path.resolve()
+    run_path = case_path / "aerolab-run.json"
+    existing = _read_json_object(run_path)
+    if existing.get("status") not in {"running", "stopping"}:
+        return None
+    with _case_execution_lock(case_path):
+        existing = _read_json_object(run_path)
+        if existing.get("status") not in {"running", "stopping"}:
+            return None
+        backend = str(existing.get("backend") or "")
+        execution_id = existing.get("executionId")
+        mode = str(existing.get("mode") or "full")
+        if backend in {"docker", "wsl"} and isinstance(execution_id, str):
+            _confirm_backend_cleanup(case_path, backend, execution_id)
+            _record_stopped_run(
+                case_path,
+                mode,
+                backend,
+                "AeroLab safely cleaned up this interrupted backend run during server startup.",
+            )
+            return "stopped"
+        now = datetime.now(timezone.utc).isoformat()
+        run_path.write_text(
+            json.dumps(
+                {
+                    **existing,
+                    "status": "orphaned",
+                    "ok": False,
+                    "trusted": False,
+                    "numericallyQualified": False,
+                    "finishedAt": now,
+                    "error": (
+                        "The previous AeroLab server ended without a durable backend "
+                        "cleanup identity. Verify that no native OpenFOAM process remains "
+                        "before removing this record."
+                    ),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _update_case_status(
+            case_path,
+            "mesh_failed" if mode == "mesh" else "solver_failed",
+        )
+        return "orphaned"
+
+
 def _mesh_outputs_present(case_path: Path) -> bool:
+    points_path = case_path / "constant" / "polyMesh" / "points"
+    surface_path = _latest_body_surface_vtk(case_path)
     return bool(
-        (case_path / "constant" / "polyMesh" / "points").is_file()
-        and _latest_body_surface_vtk(case_path) is not None
+        surface_path is not None
+        and _case_local_regular_file(case_path, points_path)
+        and _case_local_regular_file(case_path, surface_path)
     )
 
 
@@ -1207,8 +1819,8 @@ def _solver_input_fingerprint(case_path: Path) -> str | None:
 
     digest = hashlib.sha256()
     for path in sorted(input_files, key=lambda value: value.relative_to(case_path).as_posix()):
-        relative_path = path.relative_to(case_path).as_posix()
-        digest.update(relative_path.encode("utf-8"))
+        relative_name = path.relative_to(case_path).as_posix()
+        digest.update(relative_name.encode("utf-8"))
         digest.update(b"\0")
         with path.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):

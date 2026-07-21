@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import threading
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,13 +17,19 @@ from .case import create_case
 from .repair import repair_fidelity_for_model, repair_stl
 from .solver import (
     SENSITIVITY_PARAMETERS,
+    SolverRunCancelled,
+    SolverRunController,
+    _case_execution_locks,
     case_report,
     case_run_progress,
+    clear_case_run_outputs,
     compare_cases,
     create_sensitivity_study,
     normalize_file_handler,
     normalize_process_request,
     normalize_study_process_budget,
+    reconcile_interrupted_case_run,
+    run_cancellation_context,
     run_case,
     run_study,
     solver_status,
@@ -37,7 +44,49 @@ class AeroLabServer(ThreadingHTTPServer):
         self.root = root.resolve()
         self.web_root = Path(__file__).parent / "web"
         self.active_runs: dict[Path, threading.Thread] = {}
+        self.active_run_controllers: dict[threading.Thread, SolverRunController] = {}
+        self.active_run_locks: dict[threading.Thread, ExitStack] = {}
         self.active_runs_lock = threading.Lock()
+        self._reconcile_interrupted_runs()
+
+    def _reconcile_interrupted_runs(self) -> None:
+        cases_root = self.root / "cases"
+        if not cases_root.is_dir():
+            return
+        for case_path in cases_root.iterdir():
+            case_json = case_path / "case.json"
+            try:
+                case_stat = case_path.lstat()
+                case_json_stat = case_json.lstat()
+            except OSError:
+                continue
+            if (
+                stat.S_ISLNK(case_stat.st_mode)
+                or not stat.S_ISDIR(case_stat.st_mode)
+                or stat.S_ISLNK(case_json_stat.st_mode)
+                or not stat.S_ISREG(case_json_stat.st_mode)
+            ):
+                continue
+            try:
+                reconcile_interrupted_case_run(case_path)
+            except RuntimeError:
+                # Another AeroLab process may still own this case, or exact cleanup
+                # verification may need user attention. Preserve the record unchanged.
+                continue
+
+    def _ensure_case_not_orphaned(self, case_path: Path) -> None:
+        try:
+            run_record = json.loads(
+                (case_path / "aerolab-run.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return
+        if run_record.get("status") in {"running", "stopping", "orphaned"}:
+            raise RuntimeError(
+                "This case has an unreconciled run from another server session. "
+                "Verify that no native OpenFOAM process remains before removing "
+                "aerolab-run.json."
+            )
 
     def start_case_run(
         self,
@@ -49,29 +98,45 @@ class AeroLabServer(ThreadingHTTPServer):
         processes: str | int,
         file_handler: str,
         resume: bool,
-    ) -> None:
+    ) -> str:
         case_path = case_path.resolve()
         with self.active_runs_lock:
             existing = self.active_runs.get(case_path)
             if existing is not None and existing.is_alive():
                 raise ValueError("This case already has an active OpenFOAM run.")
-            worker = threading.Thread(
-                target=self._run_case_worker,
-                args=(
-                    case_path,
-                    backend,
-                    timeout_seconds,
-                    run_mode,
-                    reuse_mesh,
-                    processes,
-                    file_handler,
-                    resume,
-                ),
-                name=f"aerolab-{run_mode}-{case_path.name}",
-                daemon=True,
-            )
-            self.active_runs[case_path] = worker
-            worker.start()
+        self._ensure_case_not_orphaned(case_path)
+        lock_stack = _case_execution_locks([case_path])
+        try:
+            with self.active_runs_lock:
+                existing = self.active_runs.get(case_path)
+                if existing is not None and existing.is_alive():
+                    raise ValueError("This case already has an active OpenFOAM run.")
+                controller = SolverRunController()
+                controller.set_owned_case_paths([case_path])
+                worker = threading.Thread(
+                    target=self._run_case_worker,
+                    args=(
+                        case_path,
+                        backend,
+                        timeout_seconds,
+                        run_mode,
+                        reuse_mesh,
+                        processes,
+                        file_handler,
+                        resume,
+                        controller,
+                    ),
+                    name=f"aerolab-{run_mode}-{case_path.name}",
+                    daemon=True,
+                )
+                self.active_runs[case_path] = worker
+                self.active_run_controllers[worker] = controller
+                self.active_run_locks[worker] = lock_stack
+                worker.start()
+        except Exception:
+            lock_stack.close()
+            raise
+        return controller.attempt_id
 
     def _run_case_worker(
         self,
@@ -83,24 +148,41 @@ class AeroLabServer(ThreadingHTTPServer):
         processes: str | int,
         file_handler: str,
         resume: bool,
+        controller: SolverRunController,
     ) -> None:
         try:
-            run_case(
-                case_path,
-                backend=backend,
-                timeout_seconds=timeout_seconds,
-                run_mode=run_mode,
-                reuse_mesh=reuse_mesh,
-                processes=processes,
-                file_handler=file_handler,
-                resume=resume,
-            )
+            with run_cancellation_context(controller):
+                run_case(
+                    case_path,
+                    backend=backend,
+                    timeout_seconds=timeout_seconds,
+                    run_mode=run_mode,
+                    reuse_mesh=reuse_mesh,
+                    processes=processes,
+                    file_handler=file_handler,
+                    resume=resume,
+                )
+        except SolverRunCancelled:
+            pass
         except Exception as exc:
-            _record_background_run_failure(case_path, run_mode, backend, exc)
+            _record_background_run_failure(
+                case_path,
+                run_mode,
+                backend,
+                exc,
+                attempt_id=controller.attempt_id,
+            )
         finally:
+            controller.wait_for_stop_completion()
+            lock_stack: ExitStack | None = None
             with self.active_runs_lock:
-                if self.active_runs.get(case_path) is threading.current_thread():
+                current = threading.current_thread()
+                if self.active_runs.get(case_path) is current:
                     self.active_runs.pop(case_path, None)
+                self.active_run_controllers.pop(current, None)
+                lock_stack = self.active_run_locks.pop(current, None)
+            if lock_stack is not None:
+                lock_stack.close()
 
     def start_study_run(
         self,
@@ -125,25 +207,48 @@ class AeroLabServer(ThreadingHTTPServer):
                 raise ValueError(
                     "Study members already running: " + ", ".join(conflicts)
                 )
-            worker = threading.Thread(
-                target=self._run_study_worker,
-                args=(
-                    case_path.resolve(),
-                    member_paths,
-                    backend,
-                    timeout_seconds,
-                    run_mode,
-                    reuse_mesh,
-                    processes,
-                    process_budget,
-                    file_handler,
-                ),
-                name=f"aerolab-study-{descriptor['studyId']}",
-                daemon=True,
-            )
-            for path in member_paths:
-                self.active_runs[path] = worker
-            worker.start()
+        for member_path in member_paths:
+            self._ensure_case_not_orphaned(member_path)
+        lock_stack = _case_execution_locks(member_paths)
+        try:
+            with self.active_runs_lock:
+                conflicts = [
+                    path.name
+                    for path in member_paths
+                    if (worker := self.active_runs.get(path)) is not None
+                    and worker.is_alive()
+                ]
+                if conflicts:
+                    raise ValueError(
+                        "Study members already running: " + ", ".join(conflicts)
+                    )
+                controller = SolverRunController()
+                controller.set_owned_case_paths(member_paths)
+                worker = threading.Thread(
+                    target=self._run_study_worker,
+                    args=(
+                        case_path.resolve(),
+                        member_paths,
+                        backend,
+                        timeout_seconds,
+                        run_mode,
+                        reuse_mesh,
+                        processes,
+                        process_budget,
+                        file_handler,
+                        controller,
+                    ),
+                    name=f"aerolab-study-{descriptor['studyId']}",
+                    daemon=True,
+                )
+                for path in member_paths:
+                    self.active_runs[path] = worker
+                self.active_run_controllers[worker] = controller
+                self.active_run_locks[worker] = lock_stack
+                worker.start()
+        except Exception:
+            lock_stack.close()
+            raise
         return descriptor
 
     def _run_study_worker(
@@ -157,26 +262,114 @@ class AeroLabServer(ThreadingHTTPServer):
         processes: str | int,
         process_budget: str | int,
         file_handler: str,
+        controller: SolverRunController,
     ) -> None:
         try:
-            run_study(
-                case_path,
-                backend=backend,
-                timeout_seconds=timeout_seconds,
-                run_mode=run_mode,
-                reuse_mesh=reuse_mesh,
-                processes=processes,
-                process_budget=process_budget,
-                file_handler=file_handler,
+            with run_cancellation_context(controller):
+                run_study(
+                    case_path,
+                    backend=backend,
+                    timeout_seconds=timeout_seconds,
+                    run_mode=run_mode,
+                    reuse_mesh=reuse_mesh,
+                    processes=processes,
+                    process_budget=process_budget,
+                    file_handler=file_handler,
+                )
+        except SolverRunCancelled as exc:
+            controller.wait_for_stop_completion()
+            _record_background_study_stopped(
+                member_paths,
+                backend,
+                str(exc),
+                attempt_id=controller.attempt_id,
             )
         except Exception as exc:
-            _record_background_study_failure(member_paths, backend, exc)
+            _record_background_study_failure(
+                member_paths,
+                backend,
+                exc,
+                attempt_id=controller.attempt_id,
+            )
         finally:
+            controller.wait_for_stop_completion()
+            lock_stack: ExitStack | None = None
             with self.active_runs_lock:
                 current = threading.current_thread()
                 for path in member_paths:
                     if self.active_runs.get(path) is current:
                         self.active_runs.pop(path, None)
+                self.active_run_controllers.pop(current, None)
+                lock_stack = self.active_run_locks.pop(current, None)
+            if lock_stack is not None:
+                lock_stack.close()
+
+    def active_case_paths(self) -> set[Path]:
+        with self.active_runs_lock:
+            return {
+                path
+                for path, worker in self.active_runs.items()
+                if worker.is_alive()
+            }
+
+    def attempt_id_for_case(self, case_path: Path) -> str | None:
+        with self.active_runs_lock:
+            worker = self.active_runs.get(case_path.resolve())
+            if worker is None:
+                return None
+            controller = self.active_run_controllers.get(worker)
+            return controller.attempt_id if controller is not None else None
+
+    def stop_case_run(self, case_path: Path) -> dict[str, object]:
+        case_path = case_path.resolve()
+        with self.active_runs_lock:
+            worker = self.active_runs.get(case_path)
+            if worker is None or not worker.is_alive():
+                raise ValueError(
+                    "The selected case has no active run owned by this AeroLab server."
+                )
+            controller = self.active_run_controllers.get(worker)
+            if controller is None:
+                raise RuntimeError("The active run has no cancellation controller.")
+            member_paths = sorted(
+                (
+                    path
+                    for path, active_worker in self.active_runs.items()
+                    if active_worker is worker
+                ),
+                key=lambda path: str(path),
+            )
+        process_count = controller.request_stop()
+        return {
+            "casePath": str(case_path),
+            "casePaths": [str(path) for path in member_paths],
+            "attemptId": controller.attempt_id,
+            "kind": "study" if len(member_paths) > 1 else "case",
+            "registeredProcesses": process_count,
+            "status": "stopping",
+        }
+
+    def delete_case_run_outputs(self, case_path: Path) -> dict[str, object]:
+        case_path = case_path.resolve()
+        related_paths = _related_case_paths(case_path)
+        for related_path in related_paths:
+            self._ensure_case_not_orphaned(related_path)
+        with self.active_runs_lock:
+            conflicts = [
+                path.name
+                for path in related_paths
+                if (worker := self.active_runs.get(path)) is not None
+                and worker.is_alive()
+            ]
+            if conflicts:
+                raise ValueError(
+                    "Stop the active run before deleting outputs: "
+                    + ", ".join(conflicts)
+                )
+            return clear_case_run_outputs(
+                case_path,
+                related_case_paths=related_paths,
+            )
 
 
 class AeroLabHandler(BaseHTTPRequestHandler):
@@ -253,14 +446,42 @@ class AeroLabHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/run-study":
                 self._handle_run_study()
                 return
+            if parsed.path == "/api/stop-run":
+                self._handle_stop_run()
+                return
+            if parsed.path == "/api/delete-run-outputs":
+                self._handle_delete_run_outputs()
+                return
             if parsed.path == "/api/compare-cases":
                 self._handle_compare_cases()
                 return
             if parsed.path == "/api/case-report":
                 self._handle_case_report()
                 return
+        except FileNotFoundError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=404)
+            return
+        except ValueError as exc:
+            message = str(exc)
+            conflict = any(
+                token in message.lower()
+                for token in ("active", "already running", "already finished")
+            )
+            self._send_json(
+                {"ok": False, "error": message},
+                status=409 if conflict else 400,
+            )
+            return
+        except RuntimeError as exc:
+            message = str(exc)
+            conflict = "active in another aerolab process" in message.lower()
+            self._send_json(
+                {"ok": False, "error": message},
+                status=409 if conflict else 500,
+            )
+            return
         except Exception as exc:
-            self._send_json({"ok": False, "error": str(exc)}, status=400)
+            self._send_json({"ok": False, "error": str(exc)}, status=500)
             return
         self.send_error(404)
 
@@ -714,7 +935,7 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         resume_value = payload.get("resume", False)
         if not isinstance(resume_value, bool):
             raise ValueError("Resume must be true or false.")
-        self.server.start_case_run(
+        attempt_id = self.server.start_case_run(
             case_path,
             backend,
             timeout_seconds,
@@ -728,6 +949,7 @@ class AeroLabHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "accepted": True,
+                "attemptId": attempt_id if isinstance(attempt_id, str) else None,
                 "casePath": str(case_path),
                 "mode": run_mode,
                 "timeoutSeconds": timeout_seconds,
@@ -761,10 +983,12 @@ class AeroLabHandler(BaseHTTPRequestHandler):
             process_budget,
             file_handler,
         )
+        attempt_id = self.server.attempt_id_for_case(case_path)
         self._send_json(
             {
                 "ok": True,
                 "accepted": True,
+                "attemptId": attempt_id,
                 "casePath": str(case_path),
                 "study": descriptor,
                 "mode": run_mode,
@@ -774,6 +998,33 @@ class AeroLabHandler(BaseHTTPRequestHandler):
                 "fileHandler": file_handler,
             },
             status=202,
+        )
+
+    def _handle_stop_run(self) -> None:
+        payload = self._json_body()
+        case_path = self._resolve_case_path(str(payload["casePath"]))
+        result = self.server.stop_case_run(case_path)
+        self._send_json(
+            {
+                "ok": True,
+                "accepted": True,
+                **result,
+            },
+            status=202,
+        )
+
+    def _handle_delete_run_outputs(self) -> None:
+        payload = self._json_body()
+        case_path = self._resolve_case_path(str(payload["casePath"]))
+        result = self.server.delete_case_run_outputs(case_path)
+        self._send_json(
+            {
+                "ok": True,
+                "deleted": True,
+                "cleanup": result,
+                "report": case_report(case_path, include_visualization=True),
+                "state": self._state(),
+            }
         )
 
     def _handle_compare_cases(self) -> None:
@@ -794,11 +1045,18 @@ class AeroLabHandler(BaseHTTPRequestHandler):
 
     def _state(self) -> dict[str, object]:
         sample = self.server.root / "models" / "sample_box.stl"
+        active_paths = self.server.active_case_paths()
+        cases = _list_cases(self.server.root / "cases")
+        for case in cases:
+            path = case.get("path")
+            case["runActive"] = bool(
+                isinstance(path, str) and Path(path).resolve() in active_paths
+            )
         return {
             "ok": True,
             "root": str(self.server.root),
             "sampleModel": str(sample) if sample.exists() else None,
-            "cases": _list_cases(self.server.root / "cases"),
+            "cases": cases,
             "sensitivityParameters": SENSITIVITY_PARAMETERS,
         }
 
@@ -818,6 +1076,24 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         if not path.exists():
             raise FileNotFoundError(path)
         return path
+
+    def _resolve_case_path(self, value: str) -> Path:
+        case_path = self._resolve_project_path(value)
+        cases_root = (self.server.root / "cases").resolve()
+        if not case_path.is_dir() or not case_path.is_relative_to(cases_root):
+            raise ValueError(
+                "The selected folder must be an AeroLab case inside the cases directory."
+            )
+        case_json_path = case_path / "case.json"
+        try:
+            case_json_stat = case_json_path.lstat()
+        except OSError as exc:
+            raise ValueError("The selected folder is not an AeroLab case.") from exc
+        if stat.S_ISLNK(case_json_stat.st_mode) or not stat.S_ISREG(
+            case_json_stat.st_mode
+        ):
+            raise ValueError("The selected case.json must be a regular case-local file.")
+        return case_path
 
     def _send_file(self, path: Path, content_type: str | None = None) -> None:
         path = path.resolve()
@@ -844,11 +1120,41 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _related_case_paths(case_path: Path) -> list[Path]:
+    """Resolve every member that shares a copied study-run record."""
+    case_path = case_path.resolve()
+    try:
+        payload = json.loads((case_path / "case.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("The selected case metadata is not readable JSON.") from exc
+    study_values = (payload.get("validation_study"), payload.get("sensitivity_study"))
+    if not any(isinstance(value, dict) and value.get("id") for value in study_values):
+        return [case_path]
+    descriptor = study_members(case_path)
+    related_paths = [Path(str(value)).resolve() for value in descriptor["casePaths"]]
+    cases_root = case_path.parent.resolve()
+    for related_path in related_paths:
+        case_json_path = related_path / "case.json"
+        try:
+            case_json_stat = case_json_path.lstat()
+        except OSError as exc:
+            raise ValueError("A related study member is missing case.json.") from exc
+        if (
+            related_path.parent.resolve() != cases_root
+            or stat.S_ISLNK(case_json_stat.st_mode)
+            or not stat.S_ISREG(case_json_stat.st_mode)
+        ):
+            raise ValueError("A related study member is not a regular case-local folder.")
+    return related_paths
+
+
 def _record_background_run_failure(
     case_path: Path,
     run_mode: str,
     backend: str,
     error: Exception,
+    *,
+    attempt_id: str,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     run_path = case_path / "aerolab-run.json"
@@ -857,9 +1163,17 @@ def _record_background_run_failure(
         existing = json.loads(run_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         pass
+    existing_attempt = existing.get("attemptId")
+    if (
+        existing.get("status") in {"running", "stopping"}
+        and isinstance(existing_attempt, str)
+        and existing_attempt != attempt_id
+    ):
+        return
     record = {
         **existing,
         "status": "failed",
+        "attemptId": attempt_id,
         "ok": False,
         "trusted": False,
         "numericallyQualified": False,
@@ -886,10 +1200,42 @@ def _record_background_run_failure(
         pass
 
 
+def _record_background_study_stopped(
+    member_paths: list[Path],
+    backend: str,
+    reason: str,
+    *,
+    attempt_id: str,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    for member_path in member_paths:
+        record_path = member_path / "aerolab-study-run.json"
+        existing: dict[str, object] = {}
+        try:
+            existing = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+        record = {
+            **existing,
+            "status": "stopped",
+            "attemptId": attempt_id,
+            "ok": False,
+            "cancelled": True,
+            "backend": existing.get("backend") or backend,
+            "budgetRecommendation": None,
+            "startedAt": existing.get("startedAt") or now,
+            "finishedAt": now,
+            "stopReason": reason,
+        }
+        record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+
 def _record_background_study_failure(
     member_paths: list[Path],
     backend: str,
     error: Exception,
+    *,
+    attempt_id: str,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     for member_path in member_paths:
@@ -902,6 +1248,7 @@ def _record_background_study_failure(
         record = {
             **existing,
             "status": "failed",
+            "attemptId": attempt_id,
             "ok": False,
             "backend": backend,
             "budgetRecommendation": None,
