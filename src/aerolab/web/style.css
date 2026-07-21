@@ -470,6 +470,10 @@ select {
   padding: 6px 8px 6px 9px;
 }
 
+.solver-particle-appearance-settings {
+  flex-wrap: wrap;
+}
+
 .solver-particle-settings button,
 .solver-particle-settings select {
   background: rgba(15, 24, 34, 0.5);
@@ -496,7 +500,8 @@ select {
   cursor: not-allowed;
 }
 
-.solver-particle-rate {
+.solver-particle-rate,
+.solver-particle-option {
   align-items: center;
   display: flex;
   gap: 6px;
@@ -504,13 +509,15 @@ select {
   width: auto;
 }
 
-.solver-particle-rate span {
+.solver-particle-rate span,
+.solver-particle-option span {
   color: #aebfc8;
   font-size: 10px;
   font-weight: 700;
 }
 
-.solver-particle-rate select {
+.solver-particle-rate select,
+.solver-particle-option select {
   padding: 3px 6px;
   width: auto;
 }
@@ -1260,6 +1267,10 @@ dd {
 
   .solver-particle-settings {
     margin-left: 0;
+  }
+
+  .solver-particle-appearance-settings {
+    justify-content: flex-start;
   }
 
   .case-item {

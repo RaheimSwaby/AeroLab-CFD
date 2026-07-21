@@ -154,6 +154,8 @@ class AccuracyStudyApiTests(unittest.TestCase):
             "solverParticleSettings",
             "solverParticleMotionButton",
             "solverParticleRateSelect",
+            "solverParticleSizeSelect",
+            "solverParticleOpacitySelect",
         ):
             with self.subTest(control_id=control_id):
                 self.assertIn(f'id="{control_id}"', index)
@@ -169,6 +171,9 @@ class AccuracyStudyApiTests(unittest.TestCase):
             "saveSolverParticleSettings",
             "setSolverParticlePaused",
             "setSolverParticleRate",
+            "applySolverParticleAppearance",
+            "setSolverParticlePointSize",
+            "setSolverParticleOpacity",
         ):
             with self.subTest(function_name=function_name):
                 self.assertIn(f"function {function_name}(", app)
@@ -189,9 +194,19 @@ class AccuracyStudyApiTests(unittest.TestCase):
         self.assertIn('"(prefers-reduced-motion: reduce)"', app)
         self.assertIn("SOLVER_PARTICLE_ANIMATION_RATE * settings.rateMultiplier", app)
         self.assertIn("particleAvailable && state.viewer.solverFlowMode !== \"lines\"", app)
+        self.assertIn("material.size = settings.pointSize", app)
+        self.assertIn("material.opacity = settings.opacity", app)
+        self.assertIn('href="/assets/style.css?v=35"', index)
+        self.assertIn('src="/assets/app.js?v=73"', index)
         for rate_value in ("0.5", "1", "2"):
             with self.subTest(rate_value=rate_value):
                 self.assertIn(f'<option value="{rate_value}"', index)
+        for size_value in ("0.04", "0.052", "0.07"):
+            with self.subTest(size_value=size_value):
+                self.assertIn(f'<option value="{size_value}"', index)
+        for opacity_value in ("0.55", "0.75", "0.92"):
+            with self.subTest(opacity_value=opacity_value):
+                self.assertIn(f'<option value="{opacity_value}"', index)
 
     def test_creates_thermal_case_with_heat_zone_through_api(self) -> None:
         project = Path(__file__).resolve().parents[1]
@@ -272,7 +287,7 @@ class AccuracyStudyApiTests(unittest.TestCase):
         ):
             with self.subTest(control_id=control_id):
                 self.assertIn(f'id="{control_id}"', index)
-        self.assertIn('src="/assets/app.js?v=72"', index)
+        self.assertIn('src="/assets/app.js?v=73"', index)
         self.assertIn("options.processes ?? els.solverProcesses.value", app)
         self.assertIn('fileHandler: els.solverFileHandler.value', app)
         self.assertIn('resume: attempt === 0 ? originalResume : false', app)

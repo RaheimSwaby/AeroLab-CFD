@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#102433" />
     <title>AeroLab CFD — Local Aerodynamics</title>
-    <link rel="stylesheet" href="/assets/style.css?v=34" />
+    <link rel="stylesheet" href="/assets/style.css?v=35" />
   </head>
   <body data-view-mode="basic">
     <a class="skip-link" href="#mainContent">Skip to analysis</a>
@@ -574,9 +574,9 @@
                       </div>
                       <div
                         id="solverParticleSettings"
-                        class="solver-particle-settings unavailable"
+                        class="solver-particle-settings solver-particle-appearance-settings unavailable"
                         role="group"
-                        aria-label="Particle animation settings"
+                        aria-label="Particle appearance and animation settings"
                         aria-disabled="true"
                       >
                         <button
@@ -591,6 +591,22 @@
                             <option value="0.5">0.5×</option>
                             <option value="1" selected>1×</option>
                             <option value="2">2×</option>
+                          </select>
+                        </label>
+                        <label class="solver-particle-option" for="solverParticleSizeSelect">
+                          <span>Size</span>
+                          <select id="solverParticleSizeSelect" disabled>
+                            <option value="0.04">Small</option>
+                            <option value="0.052" selected>Standard</option>
+                            <option value="0.07">Large</option>
+                          </select>
+                        </label>
+                        <label class="solver-particle-option" for="solverParticleOpacitySelect">
+                          <span>Opacity</span>
+                          <select id="solverParticleOpacitySelect" disabled>
+                            <option value="0.55">Soft</option>
+                            <option value="0.75">Medium</option>
+                            <option value="0.92" selected>Strong</option>
                           </select>
                         </label>
                       </div>
@@ -769,6 +785,6 @@
       </main>
     </div>
 
-    <script type="module" src="/assets/app.js?v=72"></script>
+    <script type="module" src="/assets/app.js?v=73"></script>
   </body>
 </html>

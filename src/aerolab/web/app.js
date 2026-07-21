@@ -264,6 +264,8 @@ const els = {
   solverParticleSettings: document.querySelector("#solverParticleSettings"),
   solverParticleMotionButton: document.querySelector("#solverParticleMotionButton"),
   solverParticleRateSelect: document.querySelector("#solverParticleRateSelect"),
+  solverParticleSizeSelect: document.querySelector("#solverParticleSizeSelect"),
+  solverParticleOpacitySelect: document.querySelector("#solverParticleOpacitySelect"),
   windCropControl: document.querySelector("#windCropControl"),
   windCropSummary: document.querySelector("#windCropControl > summary"),
   windCropStatus: document.querySelector("#windCropStatus"),
@@ -1326,6 +1328,12 @@ els.solverParticleMotionButton.addEventListener("click", () => {
 els.solverParticleRateSelect.addEventListener("change", () => {
   setSolverParticleRate(Number(els.solverParticleRateSelect.value));
 });
+els.solverParticleSizeSelect.addEventListener("change", () => {
+  setSolverParticlePointSize(Number(els.solverParticleSizeSelect.value));
+});
+els.solverParticleOpacitySelect.addEventListener("change", () => {
+  setSolverParticleOpacity(Number(els.solverParticleOpacitySelect.value));
+});
 els.airflowVisualizationTab.addEventListener("click", () => setVisualizationTab("airflow"));
 els.oilFlowVisualizationTab.addEventListener("click", () => setVisualizationTab("oilflow"));
 for (const tabButton of [els.airflowVisualizationTab, els.oilFlowVisualizationTab]) {
@@ -1925,6 +1933,10 @@ function syncSolverFlowControls() {
   els.solverParticleMotionButton.classList.toggle("active", particlePlaying);
   els.solverParticleRateSelect.disabled = !particleControlsEnabled;
   els.solverParticleRateSelect.value = String(particleSettings.rateMultiplier);
+  els.solverParticleSizeSelect.disabled = !particleControlsEnabled;
+  els.solverParticleSizeSelect.value = String(particleSettings.pointSize);
+  els.solverParticleOpacitySelect.disabled = !particleControlsEnabled;
+  els.solverParticleOpacitySelect.value = String(particleSettings.opacity);
 
   let status = "Run the solver to generate solved flow";
   let detail = status;
@@ -2246,6 +2258,36 @@ function setSolverParticleRate(rateMultiplier) {
     rateMultiplier,
   };
   saveSolverParticleSettings();
+  syncSolverFlowControls();
+  drawFlow();
+}
+
+function applySolverParticleAppearance() {
+  const material = state.viewer.solverParticles?.points?.material;
+  if (!material) return;
+  const settings = state.viewer.solverParticleSettings;
+  material.size = settings.pointSize;
+  material.opacity = settings.opacity;
+}
+
+function setSolverParticlePointSize(pointSize) {
+  state.viewer.solverParticleSettings = {
+    ...state.viewer.solverParticleSettings,
+    pointSize,
+  };
+  saveSolverParticleSettings();
+  applySolverParticleAppearance();
+  syncSolverFlowControls();
+  drawFlow();
+}
+
+function setSolverParticleOpacity(opacity) {
+  state.viewer.solverParticleSettings = {
+    ...state.viewer.solverParticleSettings,
+    opacity,
+  };
+  saveSolverParticleSettings();
+  applySolverParticleAppearance();
   syncSolverFlowControls();
   drawFlow();
 }
@@ -5325,14 +5367,15 @@ function ensureSolverParticlePoints(view, particles) {
   colors.setUsage(THREE.DynamicDrawUsage);
   geometry.setAttribute("position", positions);
   geometry.setAttribute("color", colors);
+  const settings = state.viewer.solverParticleSettings;
   const material = new THREE.PointsMaterial({
     alphaTest: 0.02,
     blending: THREE.AdditiveBlending,
     depthTest: true,
     depthWrite: false,
     map: createSolverParticleTexture(),
-    opacity: 0.92,
-    size: 0.052,
+    opacity: settings.opacity,
+    size: settings.pointSize,
     sizeAttenuation: true,
     toneMapped: false,
     transparent: true,

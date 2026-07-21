@@ -3,7 +3,8 @@
 Status: **Version 1 implemented; post-Version 1 work in progress.** Commit
 `70ae6ce` shipped the browser-only Phase 7 feature "Add particle traces from
 OpenFOAM velocity fields." Stage A is complete, Stage C retains the
-seeded-streamline architecture, and Stage B1 adds persisted motion controls.
+seeded-streamline architecture, and Stages B1–B2 add persisted motion and
+appearance controls.
 
 ## Summary
 
@@ -248,7 +249,7 @@ The implementation order remains **A → C → B1 → B2 → B3 → D**:
 - [x] A2: manual browser baseline on a lower-powered test device.
 - [x] C: seeded-streamline particles accepted as the current product boundary.
 - [x] B1: persisted Play/Pause and `0.5× | 1× | 2×` motion controls.
-- [ ] B2: particle size and opacity presets.
+- [x] B2: particle size and opacity presets.
 - [ ] B3: density presets and safe buffer rebuilds.
 - [ ] D: optional pure JavaScript module and Node tests.
 
@@ -268,11 +269,12 @@ baseline is:
 
 ### Current implementation constraints
 
-Version 1 shipped with the following hardcoded values in
+Version 1 shipped with the following defaults in
 `src/aerolab/web/app.js`. B1 exposes pause and a multiplier around the base
-animation rate; appearance and density remain fixed until B2/B3:
+animation rate, B2 exposes bounded appearance presets, and density remains
+fixed until B3:
 
-| Setting | Current value |
+| Setting | Default value |
 | --- | ---: |
 | Target particles per line | `24` |
 | Maximum total particles | `5_200` |
@@ -508,7 +510,7 @@ Repeat the A2 motion, lifecycle, accessibility, responsive, and fallback rows.
 one slice to restore the current constant rate; no stored setting is required by
 older code, so the versioned key can remain harmlessly unused.
 
-### Stage B2 — size and opacity presets
+### Stage B2 — complete: size and opacity presets
 
 **Files and touch points**
 
