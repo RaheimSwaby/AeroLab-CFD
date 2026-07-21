@@ -6,7 +6,7 @@ import math
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import SupportsFloat, SupportsIndex, TypeGuard, TypedDict
+from typing import SupportsFloat, SupportsIndex, TypedDict, TypeGuard
 
 from .openfoam import (
     estimate_reference_area,
