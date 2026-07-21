@@ -8,10 +8,19 @@ interrupted record and must never mark a finished run as failed.
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
-from aerolab.solver import clear_case_run_outputs, reconcile_interrupted_case_run
+from aerolab.solver import (
+    SolverRunCancelled,
+    SolverRunController,
+    clear_case_run_outputs,
+    reconcile_interrupted_case_run,
+)
+from aerolab.webapp import AeroLabServer
 
 
 def _write(path: Path, text: str = "x") -> None:
@@ -117,6 +126,88 @@ class ReconcileInterruptedRunTests(unittest.TestCase):
             record = json.loads((case / "aerolab-run.json").read_text(encoding="utf-8"))
             self.assertEqual(record["status"], "orphaned")
             self.assertFalse(record["ok"])
+
+
+class DestructiveEndpointConfinementTests(unittest.TestCase):
+    """The stop and delete endpoints must refuse any path outside cases/."""
+
+    @staticmethod
+    def _post(server: AeroLabServer, path: str, case_path: Path):
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}{path}",
+            data=json.dumps({"casePath": str(case_path)}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        return urlopen(request, timeout=10)
+
+    def _assert_rejected_outside_cases(self, endpoint: str) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "cases").mkdir()
+            # A case-shaped directory that lives OUTSIDE cases/.
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "case.json").write_text(
+                json.dumps({"name": "x", "status": "complete"}), encoding="utf-8"
+            )
+            server = AeroLabServer(("127.0.0.1", 0), root)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with self.assertRaises(HTTPError) as context:
+                    self._post(server, endpoint, outside)
+                self.assertEqual(context.exception.code, 400)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+            # A rejected request must not have touched the out-of-bounds case.
+            self.assertTrue((outside / "case.json").exists())
+
+    def test_delete_endpoint_rejects_path_outside_cases(self) -> None:
+        self._assert_rejected_outside_cases("/api/delete-run-outputs")
+
+    def test_stop_endpoint_rejects_path_outside_cases(self) -> None:
+        self._assert_rejected_outside_cases("/api/stop-run")
+
+
+class SolverRunControllerTests(unittest.TestCase):
+    """The cancellation state machine and its ownership authorization."""
+
+    def test_fresh_controller_is_not_cancelled(self) -> None:
+        controller = SolverRunController()
+        self.assertFalse(controller.cancellation_requested)
+        controller.raise_if_cancelled()  # must not raise
+        self.assertTrue(controller.attempt_id)
+
+    def test_attempt_ids_are_unique(self) -> None:
+        self.assertNotEqual(
+            SolverRunController().attempt_id, SolverRunController().attempt_id
+        )
+
+    def test_request_stop_cancels_and_blocks_further_progress(self) -> None:
+        controller = SolverRunController()
+        # No processes were registered, so nothing is terminated.
+        self.assertEqual(controller.request_stop(), 0)
+        self.assertTrue(controller.cancellation_requested)
+        with self.assertRaises(SolverRunCancelled):
+            controller.raise_if_cancelled()
+
+    def test_ownership_cannot_change_after_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case_a = Path(tmp) / "a"
+            case_b = Path(tmp) / "b"
+            case_a.mkdir()
+            case_b.mkdir()
+            controller = SolverRunController()
+            controller.set_owned_case_paths([case_a])
+            controller.set_owned_case_paths([case_a])  # same set is idempotent
+            self.assertTrue(controller.owns_case_paths([case_a]))
+            self.assertFalse(controller.owns_case_paths([case_b]))
+            self.assertFalse(controller.owns_case_paths([]))  # empty is never owned
+            with self.assertRaises(RuntimeError):
+                controller.set_owned_case_paths([case_b])  # reassignment is refused
 
 
 if __name__ == "__main__":
