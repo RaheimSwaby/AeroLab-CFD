@@ -3,8 +3,8 @@
 Status: **Version 1 implemented; post-Version 1 work in progress.** Commit
 `70ae6ce` shipped the browser-only Phase 7 feature "Add particle traces from
 OpenFOAM velocity fields." Stage A is complete, Stage C retains the
-seeded-streamline architecture, and Stages B1–B2 add persisted motion and
-appearance controls.
+seeded-streamline architecture, and Stages B1–B3 add persisted motion,
+appearance, and density controls.
 
 ## Summary
 
@@ -250,7 +250,7 @@ The implementation order remains **A → C → B1 → B2 → B3 → D**:
 - [x] C: seeded-streamline particles accepted as the current product boundary.
 - [x] B1: persisted Play/Pause and `0.5× | 1× | 2×` motion controls.
 - [x] B2: particle size and opacity presets.
-- [ ] B3: density presets and safe buffer rebuilds.
+- [x] B3: density presets and safe buffer rebuilds.
 - [ ] D: optional pure JavaScript module and Node tests.
 
 ## Version 1 baseline validation
@@ -271,8 +271,8 @@ baseline is:
 
 Version 1 shipped with the following defaults in
 `src/aerolab/web/app.js`. B1 exposes pause and a multiplier around the base
-animation rate, B2 exposes bounded appearance presets, and density remains
-fixed until B3:
+animation rate, B2 exposes bounded appearance presets, and B3 exposes bounded
+density presets while retaining the fixed total-particle cap:
 
 | Setting | Default value |
 | --- | ---: |
@@ -333,7 +333,7 @@ Recommended initial presets and safety bounds:
 | Rate multiplier | `0.5×`, `1×`, `2×` | `1×` | `0.25–2` |
 | Point size | Small `0.040`, Standard `0.052`, Large `0.070` | `0.052` | `0.030–0.090` |
 | Opacity | Soft `0.55`, Medium `0.75`, Strong `0.92` | `0.92` | `0.25–1` |
-| Particles per line | Low `12`, Standard `24`, High `36` | `24` | `1–48`, then total cap |
+| Particles per line | Low `12`, Medium `24`, High `36` | `24` | `1–48`, then total cap |
 
 Use buttons and selects rather than unrestricted sliders in the first polish
 release. This avoids continuous density rebuilds, gives keyboard users discrete
@@ -545,7 +545,7 @@ lifecycle rows.
 which is why values are presets with hard bounds. Revert B2 independently while
 retaining the B1 fields in the same versioned record.
 
-### Stage B3 — density presets and safe rebuilds
+### Stage B3 — complete: density presets and safe rebuilds
 
 **Files and touch points**
 
@@ -570,13 +570,15 @@ Density is the only polish setting that rebuilds buffers. The lifecycle is:
 6. restore the current flow mode, pause state, appearance, and rate without
    clearing preferences.
 
-The High preset may converge on the same 5,200 total as Standard for reports
+The High preset may converge on the same 5,200 total as Medium for reports
 with many usable lines. That is expected safety-cap behavior, not a reason to
-raise the cap.
+raise the cap. Low is recommended for older or lower-powered devices; the
+control labels High for capable devices and keeps its performance warning
+visible.
 
 **Acceptance criteria**
 
-- Low, Standard, and High produce bounded deterministic counts for the same
+- Low, Medium, and High produce bounded deterministic counts for the same
   report, never exceeding 5,200.
 - One user selection produces at most one rebuild after the debounce window.
 - Repeated selections, rapid case switches, and reset during a pending timer do

@@ -100,6 +100,7 @@ const state = {
     airflowSurfaceMode: "material",
     solverFlowMode: "both",
     solverParticleSettings: { ...SOLVER_PARTICLE_SETTINGS_DEFAULTS },
+    solverParticleRebuildTimer: null,
     solverParticles: null,
     oilFlowSettings: { ...OIL_FLOW_SETTINGS_DEFAULTS },
     surfaceOilFlow: null,
@@ -266,6 +267,7 @@ const els = {
   solverParticleRateSelect: document.querySelector("#solverParticleRateSelect"),
   solverParticleSizeSelect: document.querySelector("#solverParticleSizeSelect"),
   solverParticleOpacitySelect: document.querySelector("#solverParticleOpacitySelect"),
+  solverParticleDensitySelect: document.querySelector("#solverParticleDensitySelect"),
   windCropControl: document.querySelector("#windCropControl"),
   windCropSummary: document.querySelector("#windCropControl > summary"),
   windCropStatus: document.querySelector("#windCropStatus"),
@@ -1334,6 +1336,9 @@ els.solverParticleSizeSelect.addEventListener("change", () => {
 els.solverParticleOpacitySelect.addEventListener("change", () => {
   setSolverParticleOpacity(Number(els.solverParticleOpacitySelect.value));
 });
+els.solverParticleDensitySelect.addEventListener("change", () => {
+  setSolverParticleDensity(Number(els.solverParticleDensitySelect.value));
+});
 els.airflowVisualizationTab.addEventListener("click", () => setVisualizationTab("airflow"));
 els.oilFlowVisualizationTab.addEventListener("click", () => setVisualizationTab("oilflow"));
 for (const tabButton of [els.airflowVisualizationTab, els.oilFlowVisualizationTab]) {
@@ -1937,6 +1942,8 @@ function syncSolverFlowControls() {
   els.solverParticleSizeSelect.value = String(particleSettings.pointSize);
   els.solverParticleOpacitySelect.disabled = !particleControlsEnabled;
   els.solverParticleOpacitySelect.value = String(particleSettings.opacity);
+  els.solverParticleDensitySelect.disabled = !particleControlsEnabled;
+  els.solverParticleDensitySelect.value = String(particleSettings.particlesPerLine);
 
   let status = "Run the solver to generate solved flow";
   let detail = status;
@@ -2290,6 +2297,37 @@ function setSolverParticleOpacity(opacity) {
   applySolverParticleAppearance();
   syncSolverFlowControls();
   drawFlow();
+}
+
+function cancelSolverParticleRebuild() {
+  if (state.viewer.solverParticleRebuildTimer == null) return;
+  window.clearTimeout(state.viewer.solverParticleRebuildTimer);
+  state.viewer.solverParticleRebuildTimer = null;
+}
+
+function scheduleSolverParticleRebuild() {
+  cancelSolverParticleRebuild();
+  const flow = state.caseReport?.solverStreamlines;
+  if (!flow || state.viewer.solverParticles?.source !== flow) return;
+  state.viewer.solverParticleRebuildTimer = window.setTimeout(() => {
+    state.viewer.solverParticleRebuildTimer = null;
+    if (state.caseReport?.solverStreamlines !== flow) return;
+    prepareSolverParticles(flow, state.viewer.solverParticleSettings.particlesPerLine);
+    drawFlow();
+  }, 150);
+}
+
+function setSolverParticleDensity(particlesPerLine) {
+  const previousDensity = state.viewer.solverParticleSettings.particlesPerLine;
+  state.viewer.solverParticleSettings = {
+    ...state.viewer.solverParticleSettings,
+    particlesPerLine,
+  };
+  saveSolverParticleSettings();
+  syncSolverFlowControls();
+  if (state.viewer.solverParticleSettings.particlesPerLine !== previousDensity) {
+    scheduleSolverParticleRebuild();
+  }
 }
 
 function saveViewerPreferences() {
@@ -5230,7 +5268,17 @@ function drawModel(ctx, camera, dt = 0) {
   drawPreviewVehicle(ctx, camera);
 }
 
-function prepareSolverParticles(flow) {
+function prepareSolverParticles(
+  flow,
+  particlesPerLine = state.viewer.solverParticleSettings.particlesPerLine,
+) {
+  const normalizedDensity = normalizeSolverParticlePreset(
+    particlesPerLine,
+    SOLVER_PARTICLE_DENSITIES,
+    1,
+    48,
+    SOLVER_PARTICLE_SETTINGS_DEFAULTS.particlesPerLine,
+  );
   resetSolverParticles();
   const speedMin = Number(flow.speedRange?.[0] ?? 0);
   const speedMax = Number(flow.speedRange?.[1] ?? speedMin);
@@ -5289,10 +5337,18 @@ function prepareSolverParticles(flow) {
   }
 
   if (!lines.length) {
-    state.viewer.solverParticles = { source: flow, lines: [], points: null };
+    state.viewer.solverParticles = {
+      source: flow,
+      particlesPerLine: normalizedDensity,
+      lines: [],
+      points: null,
+    };
     return;
   }
-  const targetCount = Math.min(SOLVER_PARTICLE_MAX_COUNT, lines.length * SOLVER_PARTICLE_TARGET_PER_LINE);
+  const targetCount = Math.min(
+    SOLVER_PARTICLE_MAX_COUNT,
+    lines.length * normalizedDensity,
+  );
   const totalTravelTime = lines.reduce((sum, line) => sum + line.totalTravelTime, 0);
   const counts = [];
   let allocated = 0;
@@ -5329,6 +5385,7 @@ function prepareSolverParticles(flow) {
 
   state.viewer.solverParticles = {
     source: flow,
+    particlesPerLine: normalizedDensity,
     lines,
     lineIndices,
     travelPositions,
@@ -5418,6 +5475,10 @@ function updateSolverParticles(view, dt) {
     : SOLVER_PARTICLE_ANIMATION_RATE * settings.rateMultiplier;
   const advance = Math.max(0, Number(dt) || 0) * effectiveRate;
   const zOffset = meshGroundOffset();
+  const pausedRenderKey = settings.paused
+    ? `${windCropCacheKey()}:${zOffset}`
+    : null;
+  if (pausedRenderKey != null && particles.pausedRenderKey === pausedRenderKey) return;
   const cropBounds = activeWindCropBounds();
   let visibleCount = 0;
   for (let particleIndex = 0; particleIndex < particles.lineIndices.length; particleIndex += 1) {
@@ -5458,9 +5519,11 @@ function updateSolverParticles(view, dt) {
   particles.points.geometry.setDrawRange(0, visibleCount);
   particles.points.geometry.getAttribute("position").needsUpdate = true;
   particles.points.geometry.getAttribute("color").needsUpdate = true;
+  particles.pausedRenderKey = pausedRenderKey;
 }
 
 function resetSolverParticles() {
+  cancelSolverParticleRebuild();
   const particles = state.viewer.solverParticles;
   if (particles?.points) {
     particles.points.parent?.remove(particles.points);

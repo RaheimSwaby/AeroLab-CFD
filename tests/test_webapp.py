@@ -156,6 +156,8 @@ class AccuracyStudyApiTests(unittest.TestCase):
             "solverParticleRateSelect",
             "solverParticleSizeSelect",
             "solverParticleOpacitySelect",
+            "solverParticleDensitySelect",
+            "solverParticleDensityNote",
         ):
             with self.subTest(control_id=control_id):
                 self.assertIn(f'id="{control_id}"', index)
@@ -174,6 +176,9 @@ class AccuracyStudyApiTests(unittest.TestCase):
             "applySolverParticleAppearance",
             "setSolverParticlePointSize",
             "setSolverParticleOpacity",
+            "cancelSolverParticleRebuild",
+            "scheduleSolverParticleRebuild",
+            "setSolverParticleDensity",
         ):
             with self.subTest(function_name=function_name):
                 self.assertIn(f"function {function_name}(", app)
@@ -196,8 +201,15 @@ class AccuracyStudyApiTests(unittest.TestCase):
         self.assertIn("particleAvailable && state.viewer.solverFlowMode !== \"lines\"", app)
         self.assertIn("material.size = settings.pointSize", app)
         self.assertIn("material.opacity = settings.opacity", app)
-        self.assertIn('href="/assets/style.css?v=35"', index)
-        self.assertIn('src="/assets/app.js?v=73"', index)
+        self.assertIn("solverParticleRebuildTimer: null", app)
+        self.assertIn("state.viewer.solverParticleRebuildTimer = window.setTimeout", app)
+        self.assertIn("lines.length * normalizedDensity", app)
+        self.assertIn("SOLVER_PARTICLE_MAX_COUNT = 5_200", app)
+        self.assertIn("cancelSolverParticleRebuild();\n  const particles", app)
+        self.assertIn("particles.pausedRenderKey === pausedRenderKey", app)
+        self.assertIn('aria-describedby="solverParticleDensityNote"', index)
+        self.assertIn('href="/assets/style.css?v=36"', index)
+        self.assertIn('src="/assets/app.js?v=74"', index)
         for rate_value in ("0.5", "1", "2"):
             with self.subTest(rate_value=rate_value):
                 self.assertIn(f'<option value="{rate_value}"', index)
@@ -207,6 +219,9 @@ class AccuracyStudyApiTests(unittest.TestCase):
         for opacity_value in ("0.55", "0.75", "0.92"):
             with self.subTest(opacity_value=opacity_value):
                 self.assertIn(f'<option value="{opacity_value}"', index)
+        for density_value in ("12", "24", "36"):
+            with self.subTest(density_value=density_value):
+                self.assertIn(f'<option value="{density_value}"', index)
 
     def test_creates_thermal_case_with_heat_zone_through_api(self) -> None:
         project = Path(__file__).resolve().parents[1]
@@ -287,7 +302,7 @@ class AccuracyStudyApiTests(unittest.TestCase):
         ):
             with self.subTest(control_id=control_id):
                 self.assertIn(f'id="{control_id}"', index)
-        self.assertIn('src="/assets/app.js?v=73"', index)
+        self.assertIn('src="/assets/app.js?v=74"', index)
         self.assertIn("options.processes ?? els.solverProcesses.value", app)
         self.assertIn('fileHandler: els.solverFileHandler.value', app)
         self.assertIn('resume: attempt === 0 ? originalResume : false', app)

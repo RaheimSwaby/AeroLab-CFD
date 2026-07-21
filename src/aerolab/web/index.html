@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#102433" />
     <title>AeroLab CFD — Local Aerodynamics</title>
-    <link rel="stylesheet" href="/assets/style.css?v=35" />
+    <link rel="stylesheet" href="/assets/style.css?v=36" />
   </head>
   <body data-view-mode="basic">
     <a class="skip-link" href="#mainContent">Skip to analysis</a>
@@ -576,7 +576,7 @@
                         id="solverParticleSettings"
                         class="solver-particle-settings solver-particle-appearance-settings unavailable"
                         role="group"
-                        aria-label="Particle appearance and animation settings"
+                        aria-label="Particle appearance, density, and animation settings"
                         aria-disabled="true"
                       >
                         <button
@@ -609,6 +609,21 @@
                             <option value="0.92" selected>Strong</option>
                           </select>
                         </label>
+                        <label class="solver-particle-option" for="solverParticleDensitySelect">
+                          <span>Density</span>
+                          <select
+                            id="solverParticleDensitySelect"
+                            aria-describedby="solverParticleDensityNote"
+                            disabled
+                          >
+                            <option value="12">Low</option>
+                            <option value="24" selected>Medium</option>
+                            <option value="36">High</option>
+                          </select>
+                        </label>
+                        <small id="solverParticleDensityNote" class="solver-particle-performance-note">
+                          High is for capable devices and may be slower on older hardware.
+                        </small>
                       </div>
                     </div>
                     <details id="windCropControl" class="wind-crop-control unavailable" aria-disabled="true">
@@ -785,6 +800,6 @@
       </main>
     </div>
 
-    <script type="module" src="/assets/app.js?v=73"></script>
+    <script type="module" src="/assets/app.js?v=74"></script>
   </body>
 </html>

@@ -522,6 +522,15 @@ select {
   width: auto;
 }
 
+.solver-particle-performance-note {
+  color: rgba(174, 191, 200, 0.78);
+  flex: 1 0 100%;
+  font-size: 9px;
+  line-height: 1.3;
+  margin: -2px 0 0;
+  text-align: right;
+}
+
 .wind-crop-control {
   background: rgba(15, 24, 34, 0.82);
   border: 1px solid rgba(191, 211, 220, 0.2);
@@ -1271,6 +1280,10 @@ dd {
 
   .solver-particle-appearance-settings {
     justify-content: flex-start;
+  }
+
+  .solver-particle-performance-note {
+    text-align: left;
   }
 
   .case-item {
