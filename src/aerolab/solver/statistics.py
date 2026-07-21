@@ -8,7 +8,9 @@ proof that a finite history is stationary.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from statistics import NormalDist
+from typing import SupportsFloat, SupportsIndex, TypeGuard
 
 import numpy as np
 
@@ -145,23 +147,30 @@ def analyze_transient_history(
     }
 
 
+def _is_object_iterable(value: object) -> TypeGuard[Iterable[object]]:
+    return isinstance(value, Iterable)
+
+
 def _normalize_rows(rows: object) -> list[object]:
-    if isinstance(rows, list):
-        return list(rows)
+    if not _is_object_iterable(rows):
+        return []
     try:
-        return list(rows)  # type: ignore[arg-type]
+        return list(rows)
     except TypeError:
         return []
 
 
 def _normalize_channels(channels: object) -> tuple[str, ...]:
+    candidates: tuple[object, ...]
     if isinstance(channels, str):
         candidates = (channels,)
-    else:
+    elif _is_object_iterable(channels):
         try:
-            candidates = tuple(channels)  # type: ignore[arg-type]
+            candidates = tuple(channels)
         except TypeError:
             candidates = ()
+    else:
+        candidates = ()
     normalized: list[str] = []
     seen: set[str] = set()
     for channel in candidates:
@@ -870,8 +879,17 @@ def _positive_float(value: object) -> float | None:
     return number if number is not None and number > 0.0 else None
 
 
+def _is_float_compatible(
+    value: object,
+) -> TypeGuard[str | bytes | bytearray | memoryview | SupportsFloat | SupportsIndex]:
+    return isinstance(
+        value,
+        (str, bytes, bytearray, memoryview, SupportsFloat, SupportsIndex),
+    )
+
+
 def _finite_float(value: object) -> float | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not _is_float_compatible(value):
         return None
     try:
         number = float(value)

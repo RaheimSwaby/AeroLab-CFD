@@ -6,9 +6,33 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import SupportsFloat, SupportsIndex, TypedDict
 
 Vector = tuple[float, float, float]
 Triangle = tuple[Vector, Vector, Vector]
+
+
+class _AeroFeatureCandidate(TypedDict):
+    type: str
+    label: str
+    confidence: str
+    angle_degrees: float
+    length_m: float
+    width_m: float
+    rise_m: float
+    length_fraction_percent: float
+    width_fraction_percent: float
+    surface_area_m2: float
+    triangle_count: int
+    bounds_m: dict[str, list[float]]
+
+
+class _ReadinessResult(TypedDict):
+    score: int
+    status: str
+    failed: int
+    warnings: int
+    items: list[dict[str, str]]
 
 SIGNED_AXES: dict[str, Vector] = {
     "x": (1.0, 0.0, 0.0),
@@ -156,7 +180,8 @@ class StlReport:
             f"Open edges: {self.open_edge_count}",
             f"Non-manifold edges: {self.non_manifold_edge_count}",
             f"Degenerate triangles: {self.degenerate_triangle_count}",
-            f"Readiness score: {self.to_dict()['readiness']['score']}/100",
+            "Readiness score: "
+            f"{_readiness(self.bounds, self.triangle_count, self.open_edge_count, self.non_manifold_edge_count, self.degenerate_triangle_count)['score']}/100",
         ]
         if self.warnings:
             lines.append("")
@@ -264,7 +289,7 @@ def detect_aero_features_for_triangles(triangles: list[Triangle]) -> dict[str, o
             stack.extend(neighbors)
         components.append(component)
 
-    candidates: list[dict[str, object]] = []
+    candidates: list[_AeroFeatureCandidate] = []
     for component in components:
         component_bounds = _bounds([triangles[index] for index in component])
         x_span, y_span, z_span = component_bounds.dimensions
@@ -313,14 +338,14 @@ def detect_aero_features_for_triangles(triangles: list[Triangle]) -> dict[str, o
     candidates.sort(
         key=lambda item: (
             item["confidence"] == "high",
-            float(item["surface_area_m2"]),
+            item["surface_area_m2"],
         ),
         reverse=True,
     )
     return _aero_feature_result(candidates[:4])
 
 
-def _aero_feature_result(candidates: list[dict[str, object]]) -> dict[str, object]:
+def _aero_feature_result(candidates: list[_AeroFeatureCandidate]) -> dict[str, object]:
     return {
         "method": "rear-lower-surface-ramp-heuristic-v1",
         "canonical_frame": "+X airflow, +Z up",
@@ -390,7 +415,11 @@ def _principal_axis_alignment(
                     vertex_sum[row] * vertex_sum[column] + diagonal_sum
                 ) / 12.0
 
-    center = tuple(value / total_area for value in first)
+    center: Vector = (
+        first[0] / total_area,
+        first[1] / total_area,
+        first[2] / total_area,
+    )
     covariance = [
         [
             second[row][column] / total_area - center[row] * center[column]
@@ -405,9 +434,9 @@ def _principal_axis_alignment(
     length_axis = eigenpairs[0][1]
     up_axis = eigenpairs[2][1]
     if _dot(length_axis, (1.0, 0.0, 0.0)) < 0.0:
-        length_axis = tuple(-value for value in length_axis)  # type: ignore[assignment]
+        length_axis = (-length_axis[0], -length_axis[1], -length_axis[2])
     if _dot(up_axis, (0.0, 0.0, 1.0)) < 0.0:
-        up_axis = tuple(-value for value in up_axis)  # type: ignore[assignment]
+        up_axis = (-up_axis[0], -up_axis[1], -up_axis[2])
     width_axis = _normalize(_cross(up_axis, length_axis))
     up_axis = _normalize(_cross(length_axis, width_axis))
 
@@ -417,12 +446,20 @@ def _principal_axis_alignment(
     aligned_max = [-math.inf, -math.inf, -math.inf]
     for triangle in triangles:
         for vertex in triangle:
-            relative = tuple(vertex[axis] - center[axis] for axis in range(3))
+            relative: Vector = (
+                vertex[0] - center[0],
+                vertex[1] - center[1],
+                vertex[2] - center[2],
+            )
             for axis, basis_axis in enumerate(rotation):
                 coordinate = _dot(relative, basis_axis)
                 aligned_min[axis] = min(aligned_min[axis], coordinate)
                 aligned_max[axis] = max(aligned_max[axis], coordinate)
-    aligned_dimensions = tuple(aligned_max[axis] - aligned_min[axis] for axis in range(3))
+    aligned_dimensions: Vector = (
+        aligned_max[0] - aligned_min[0],
+        aligned_max[1] - aligned_min[1],
+        aligned_max[2] - aligned_min[2],
+    )
 
     eigenvalues = [max(pair[0], 1e-16) for pair in eigenpairs]
     length_to_width = math.sqrt(eigenvalues[0] / eigenvalues[1])
@@ -499,7 +536,13 @@ def _symmetric_eigenpairs(matrix: list[list[float]]) -> list[tuple[float, Vector
     pairs = [
         (
             values[index][index],
-            _normalize(tuple(vectors[row][index] for row in range(3))),
+            _normalize(
+                (
+                    vectors[0][index],
+                    vectors[1][index],
+                    vectors[2][index],
+                )
+            ),
         )
         for index in range(3)
     ]
@@ -515,14 +558,22 @@ def _rotation_matrix_to_euler_degrees(rotation: tuple[Vector, Vector, Vector]) -
     else:
         roll = 0.0
         yaw = math.atan2(-rotation[0][1], rotation[1][1])
-    return tuple(math.degrees(value) for value in (roll, pitch, yaw))  # type: ignore[return-value]
+    return (
+        math.degrees(roll),
+        math.degrees(pitch),
+        math.degrees(yaw),
+    )
 
 
 def _normalize(vector: Vector) -> Vector:
     magnitude = math.sqrt(_dot(vector, vector))
     if magnitude <= 1e-16:
         return (0.0, 0.0, 0.0)
-    return tuple(value / magnitude for value in vector)  # type: ignore[return-value]
+    return (
+        vector[0] / magnitude,
+        vector[1] / magnitude,
+        vector[2] / magnitude,
+    )
 
 
 def scaled_report(report: StlReport, scale: float) -> StlReport:
@@ -711,14 +762,23 @@ def transform_point(
     factor = float(scale)
     if not math.isfinite(factor) or factor <= 0:
         raise ValueError("Geometry scale must be a finite positive value.")
-    rotation_radians = tuple(math.radians(value) for value in _finite_vector(rotation_degrees, "Rotation"))
+    rotation = _finite_vector(rotation_degrees, "Rotation")
+    rotation_radians: Vector = (
+        math.radians(rotation[0]),
+        math.radians(rotation[1]),
+        math.radians(rotation[2]),
+    )
     basis = _orientation_basis(source_flow_direction, source_up_direction, target_flow_axis)
     transformed = _transform_vertex(
         _rotate_vertex(source_point, center, rotation_radians),
         basis,
         factor,
     )
-    return tuple(transformed[index] + offset[index] for index in range(3))  # type: ignore[return-value]
+    return (
+        transformed[0] + offset[0],
+        transformed[1] + offset[1],
+        transformed[2] + offset[2],
+    )
 
 
 def transform_direction(
@@ -731,28 +791,50 @@ def transform_direction(
 ) -> Vector:
     """Rotate and orient a source-frame direction without translating or scaling it."""
     source_direction = _normalize(_finite_vector(direction, "Direction"))
-    rotation_radians = tuple(math.radians(value) for value in _finite_vector(rotation_degrees, "Rotation"))
+    rotation = _finite_vector(rotation_degrees, "Rotation")
+    rotation_radians: Vector = (
+        math.radians(rotation[0]),
+        math.radians(rotation[1]),
+        math.radians(rotation[2]),
+    )
     rotated = _rotate_vertex(source_direction, (0.0, 0.0, 0.0), rotation_radians)
     basis = _orientation_basis(source_flow_direction, source_up_direction, target_flow_axis)
     return _normalize(_transform_vertex(rotated, basis, 1.0))
 
 
+def _coerce_float(value: object) -> float:
+    if isinstance(value, (str, bytes, bytearray, memoryview, SupportsFloat, SupportsIndex)):
+        return float(value)
+    raise TypeError
+
+
 def _finite_vector(value: object, label: str) -> Vector:
     if isinstance(value, dict):
         try:
-            values = (float(value["x"]), float(value["y"]), float(value["z"]))
-        except (KeyError, TypeError, ValueError) as exc:
+            components = (value["x"], value["y"], value["z"])
+        except KeyError as exc:
             raise ValueError(f"{label} requires finite X, Y, and Z values.") from exc
     else:
+        if not isinstance(value, Iterable):
+            raise ValueError(f"{label} requires finite X, Y, and Z values.")
         try:
-            values = tuple(float(component) for component in value)  # type: ignore[union-attr]
+            sequence = tuple(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{label} requires finite X, Y, and Z values.") from exc
-        if len(values) != 3:
+        if len(sequence) != 3:
             raise ValueError(f"{label} requires finite X, Y, and Z values.")
+        components = (sequence[0], sequence[1], sequence[2])
+    try:
+        values: Vector = (
+            _coerce_float(components[0]),
+            _coerce_float(components[1]),
+            _coerce_float(components[2]),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} requires finite X, Y, and Z values.") from exc
     if not all(math.isfinite(component) for component in values):
         raise ValueError(f"{label} requires finite X, Y, and Z values.")
-    return values  # type: ignore[return-value]
+    return values
 
 
 def translated_report(report: StlReport, translation: Vector) -> StlReport:
@@ -1098,14 +1180,14 @@ def _projected_triangle_union_area(
             coordinate = second_min + (row_index + 0.5) * step
             crossings: list[float] = []
             for edge_index in range(3):
-                start = triangle[edge_index]
-                end = triangle[(edge_index + 1) % 3]
-                edge_low = min(start[1], end[1])
-                edge_high = max(start[1], end[1])
+                edge_start = triangle[edge_index]
+                edge_end = triangle[(edge_index + 1) % 3]
+                edge_low = min(edge_start[1], edge_end[1])
+                edge_high = max(edge_start[1], edge_end[1])
                 if edge_high - edge_low <= epsilon or not (edge_low <= coordinate < edge_high):
                     continue
-                fraction = (coordinate - start[1]) / (end[1] - start[1])
-                crossings.append(start[0] + fraction * (end[0] - start[0]))
+                fraction = (coordinate - edge_start[1]) / (edge_end[1] - edge_start[1])
+                crossings.append(edge_start[0] + fraction * (edge_end[0] - edge_start[0]))
             if len(crossings) >= 2:
                 interval = (min(crossings), max(crossings))
                 if interval[1] - interval[0] > epsilon:
@@ -1117,12 +1199,12 @@ def _projected_triangle_union_area(
             continue
         intervals.sort()
         current_start, current_end = intervals[0]
-        for start, end in intervals[1:]:
-            if start <= current_end + epsilon:
-                current_end = max(current_end, end)
+        for interval_start, interval_end in intervals[1:]:
+            if interval_start <= current_end + epsilon:
+                current_end = max(current_end, interval_end)
             else:
                 integrated_width += current_end - current_start
-                current_start, current_end = start, end
+                current_start, current_end = interval_start, interval_end
         integrated_width += current_end - current_start
     return integrated_width * step
 
@@ -1147,7 +1229,7 @@ def _readiness(
     open_edges: int,
     non_manifold_edges: int,
     degenerate_count: int,
-) -> dict[str, object]:
+) -> _ReadinessResult:
     items: list[dict[str, str]] = []
     score = 100
 

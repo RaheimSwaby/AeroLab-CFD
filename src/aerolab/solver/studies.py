@@ -10,6 +10,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import NormalDist
+from typing import TypedDict
 
 from ..case import create_case
 from .backends import _select_backend, probe_backend_resources, solver_status
@@ -25,6 +26,7 @@ from .run import (
     _case_cell_budget,
     _case_execution_locks,
     _current_run_controller,
+    _integer_value,
     normalize_file_handler,
     normalize_process_request,
     run_case,
@@ -59,6 +61,61 @@ SENSITIVITY_PARAMETERS: dict[str, dict[str, object]] = {
 }
 
 _COEFFICIENT_CHANNELS = ("Cd", "Cl", "Cs", "CmRoll", "CmPitch", "CmYaw")
+
+
+class _CaseOptions(TypedDict):
+    model_path: Path
+    speed_mph: float
+    flow_axis: str
+    include_ground: bool
+    moving_ground: bool
+    ground_clearance_m: float
+    unit_scale: float
+    unit_label: str
+    reference_area_m2: float | None
+    reference_length_m: float | None
+    measured_length_m: float | None
+    measured_width_m: float | None
+    measured_height_m: float | None
+    smallest_aero_feature_m: float | None
+    quality: str
+    source_flow_direction: str
+    source_up_direction: str
+    model_rotation_degrees: tuple[float, float, float]
+    simulation_mode: str
+    air_temperature_c: float | None
+    air_pressure_pa: float | None
+    air_density_kg_m3: float | None
+    kinematic_viscosity_m2_s: float | None
+    turbulence_intensity_percent: float | None
+    turbulence_length_scale_m: float | None
+    center_of_gravity_m: tuple[float, float, float] | None
+    front_axle_station_m: float | None
+    rear_axle_station_m: float | None
+    yaw_degrees: float | None
+    crosswind_mps: float | None
+    roughness_height_m: float
+    roughness_constant: float
+    closed_tunnel: dict[str, object] | None
+    backflow_safe_outlet: bool
+    wheel_setup: list[dict[str, object]] | None
+    second_order_transient: bool
+    fluid_profile: str
+    turbulence_model: str
+    porous_zones: list[dict[str, object]] | None
+    fan_zones: list[dict[str, object]] | None
+    heat_zones: list[dict[str, object]] | None
+
+
+def _string_list(value: object, label: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list of strings.")
+    strings: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{label} must be a list of strings.")
+        strings.append(item)
+    return strings
 
 
 def normalize_study_process_budget(value: object) -> str | int:
@@ -143,7 +200,8 @@ def run_study(
         solver_identity=solver_identity,
     )
     locked_members = [
-        Path(str(value)).resolve() for value in plan["casePaths"]
+        Path(value).resolve()
+        for value in _string_list(plan.get("casePaths"), "Study case paths")
     ]
     with ExitStack() as lock_stack:
         if controller is None or not controller.owns_case_paths(locked_members):
@@ -172,13 +230,22 @@ def _run_study_locked(
     locked_members: list[Path],
 ) -> dict[str, object]:
     selected_file_handler = normalize_file_handler(file_handler)
-    member_paths = [Path(str(value)).resolve() for value in plan["casePaths"]]
+    member_paths = [
+        Path(value).resolve()
+        for value in _string_list(plan.get("casePaths"), "Study case paths")
+    ]
     if set(member_paths) != set(locked_members):
         raise RuntimeError("Study membership changed while acquiring run ownership.")
     if cancellation_controller is not None:
         cancellation_controller.raise_if_cancelled()
-    ranks_per_case = int(plan["processesPerCase"])
-    max_workers = int(plan["maxConcurrentCases"])
+    ranks_per_case = _integer_value(
+        plan.get("processesPerCase"),
+        "Study processes per case",
+    )
+    max_workers = _integer_value(
+        plan.get("maxConcurrentCases"),
+        "Maximum concurrent study cases",
+    )
     started_at = datetime.now(timezone.utc).isoformat()
     attempt_id = (
         cancellation_controller.attempt_id

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ..stl import mesh_preview
 from .parsing import _vtk_field, _vtk_header, _vtk_values
-from .util import _percentile, _read_json_object
+from .util import _finite_number, _percentile, _read_json_object
 
 CASE_PREVIEW_TRIANGLE_LIMIT = 30_000
 
@@ -26,9 +26,9 @@ def _case_visualization(case_path: Path, case_payload: dict[str, object]) -> dic
     if isinstance(flow, dict) and str(flow.get("axis") or "").lower() in {"x", "y", "z"}:
         flow_axis = str(flow["axis"]).lower()
     elif isinstance(orientation, dict):
-        candidate = str(orientation.get("target_flow_axis") or "x").lower()
-        if candidate in {"x", "y", "z"}:
-            flow_axis = candidate
+        candidate_axis = str(orientation.get("target_flow_axis") or "x").lower()
+        if candidate_axis in {"x", "y", "z"}:
+            flow_axis = candidate_axis
     source_up = "+z" if flow_axis != "z" else "+y"
     preview = _cached_case_mesh_preview(case_path, body_path, flow_axis, source_up)
     streamlines = parse_streamlines(case_path, preview, flow_axis)
@@ -39,16 +39,19 @@ def _case_visualization(case_path: Path, case_payload: dict[str, object]) -> dic
         raw_wind_vector = flow.get("flow_vector_mps")
         raw_components: tuple[object, object, object] | None = None
         if isinstance(raw_wind_vector, dict):
-            raw_components = tuple(raw_wind_vector.get(axis) for axis in ("x", "y", "z"))
+            raw_components = (
+                raw_wind_vector.get("x"),
+                raw_wind_vector.get("y"),
+                raw_wind_vector.get("z"),
+            )
         elif isinstance(raw_wind_vector, list | tuple) and len(raw_wind_vector) == 3:
-            raw_components = tuple(raw_wind_vector)
+            raw_components = (raw_wind_vector[0], raw_wind_vector[1], raw_wind_vector[2])
         if raw_components is not None:
-            try:
-                candidate = tuple(float(value) for value in raw_components)
-                if all(math.isfinite(value) for value in candidate):
-                    wind_vector_mps = candidate  # type: ignore[assignment]
-            except (TypeError, ValueError):
-                wind_vector_mps = None
+            wind_x = _finite_number(raw_components[0])
+            wind_y = _finite_number(raw_components[1])
+            wind_z = _finite_number(raw_components[2])
+            if wind_x is not None and wind_y is not None and wind_z is not None:
+                wind_vector_mps = (wind_x, wind_y, wind_z)
     reference = case_payload.get("aerodynamic_reference")
     reference_area = None
     if isinstance(reference, dict):
@@ -343,25 +346,33 @@ def parse_surface_pressure(
     wall_shear_time_averaged = False
     if point_shear is not None and len(point_shear) == point_count * 3:
         wall_shear = [
-            tuple(float(value) for value in point_shear[index : index + 3])
+            (
+                float(point_shear[index]),
+                float(point_shear[index + 1]),
+                float(point_shear[index + 2]),
+            )
             for index in range(0, len(point_shear), 3)
-        ]  # type: ignore[list-item]
+        ]
         wall_shear_location = "point"
         wall_shear_time_averaged = point_shear_mean is not None
     elif cell_shear is not None and len(cell_shear) == polygon_count * 3:
-        sums = [[0.0, 0.0, 0.0] for _ in range(point_count)]
-        counts = [0] * point_count
+        shear_sums = [[0.0, 0.0, 0.0] for _ in range(point_count)]
+        shear_counts = [0] * point_count
         for polygon_index, indices in enumerate(polygons):
             source_index = polygon_source_indices[polygon_index]
             vector = cell_shear[source_index * 3 : source_index * 3 + 3]
             for index in indices:
                 for component in range(3):
-                    sums[index][component] += float(vector[component])
-                counts[index] += 1
+                    shear_sums[index][component] += float(vector[component])
+                shear_counts[index] += 1
         wall_shear = [
-            tuple(value / counts[index] if counts[index] else 0.0 for value in sums[index])
+            (
+                shear_sums[index][0] / shear_counts[index] if shear_counts[index] else 0.0,
+                shear_sums[index][1] / shear_counts[index] if shear_counts[index] else 0.0,
+                shear_sums[index][2] / shear_counts[index] if shear_counts[index] else 0.0,
+            )
             for index in range(point_count)
-        ]  # type: ignore[list-item]
+        ]
         wall_shear_location = "cell-averaged-to-point"
         wall_shear_time_averaged = cell_shear_mean is not None
 
@@ -370,12 +381,18 @@ def parse_surface_pressure(
     center = center_obj if isinstance(center_obj, list) and len(center_obj) == 3 else [0.0, 0.0, 0.0]
     scale = float(scale_obj) if isinstance(scale_obj, int | float) else 1.0
     canonical_points = [_canonical_solver_point(point, flow_axis) for point in raw_points]
-    points = []
+    points: list[tuple[float, float, float]] = []
     for canonical in canonical_points:
-        points.append(tuple((canonical[index] - float(center[index])) * scale for index in range(3)))
+        points.append(
+            (
+                (canonical[0] - float(center[0])) * scale,
+                (canonical[1] - float(center[1])) * scale,
+                (canonical[2] - float(center[2])) * scale,
+            )
+        )
 
     absolute_pressure = absolute_pressure_reference_pa is not None
-    if absolute_pressure:
+    if absolute_pressure_reference_pa is not None:
         reference_pressure = float(absolute_pressure_reference_pa)
         coefficient_pressure = [float(value) - reference_pressure for value in pressure]
         coefficient_point_pressure = (
@@ -495,8 +512,18 @@ def parse_surface_pressure(
         triangle_pressure_drag_values[index] + triangle_skin_drag_values[index]
         for index in range(len(triangles))
     ]
-    skin_drag_coefficient = raw_drag_summary.get("skinFrictionDragCoefficient") if has_wall_shear else None
-    total_drag_coefficient = raw_drag_summary.get("totalDragCoefficient") if has_wall_shear else None
+    skin_drag_coefficient_obj = raw_drag_summary.get("skinFrictionDragCoefficient")
+    skin_drag_coefficient = (
+        float(skin_drag_coefficient_obj)
+        if has_wall_shear and isinstance(skin_drag_coefficient_obj, int | float)
+        else None
+    )
+    total_drag_coefficient_obj = raw_drag_summary.get("totalDragCoefficient")
+    total_drag_coefficient = (
+        float(total_drag_coefficient_obj)
+        if has_wall_shear and isinstance(total_drag_coefficient_obj, int | float)
+        else None
+    )
     total_drag_min = min(triangle_total_drag_values, default=0.0)
     total_drag_max = max(triangle_total_drag_values, default=0.0)
     total_drag_limit = max(
@@ -609,7 +636,11 @@ def _surface_oil_flow(
     canonical_wind = _canonical_solver_point(raw_wind, flow_axis)
     wind_length = _oil_vector_length(canonical_wind)
     wind_direction = (
-        tuple(value / wind_length for value in canonical_wind)
+        (
+            canonical_wind[0] / wind_length,
+            canonical_wind[1] / wind_length,
+            canonical_wind[2] / wind_length,
+        )
         if wind_length > 1e-12
         else (1.0, 0.0, 0.0)
     )
@@ -669,7 +700,11 @@ def _surface_oil_flow(
         cleaned: list[tuple[float, float, float, float, float]] = []
         for sample in combined:
             if cleaned and _oil_vector_length(
-                tuple(sample[index] - cleaned[-1][index] for index in range(3))
+                (
+                    sample[0] - cleaned[-1][0],
+                    sample[1] - cleaned[-1][1],
+                    sample[2] - cleaned[-1][2],
+                )
             ) <= 1e-7:
                 continue
             cleaned.append(sample)
@@ -732,7 +767,11 @@ def _oil_flow_topology(
 ]:
     minimum = [min(point[axis] for point in points) for axis in range(3)]
     maximum = [max(point[axis] for point in points) for axis in range(3)]
-    center = tuple((minimum[axis] + maximum[axis]) * 0.5 for axis in range(3))
+    center = (
+        (minimum[0] + maximum[0]) * 0.5,
+        (minimum[1] + maximum[1]) * 0.5,
+        (minimum[2] + maximum[2]) * 0.5,
+    )
     diagonal = math.sqrt(sum((maximum[axis] - minimum[axis]) ** 2 for axis in range(3)))
     normals: list[tuple[float, float, float]] = []
     areas: list[float] = []
@@ -749,18 +788,26 @@ def _oil_flow_topology(
         if cross_length <= 1e-16:
             normal = (0.0, 0.0, 1.0)
         else:
-            normal = tuple(value / cross_length for value in cross)
-            centroid = tuple((a[axis] + b[axis] + c[axis]) / 3.0 for axis in range(3))
+            normal = (
+                cross[0] / cross_length,
+                cross[1] / cross_length,
+                cross[2] / cross_length,
+            )
+            centroid = (
+                (a[0] + b[0] + c[0]) / 3.0,
+                (a[1] + b[1] + c[1]) / 3.0,
+                (a[2] + b[2] + c[2]) / 3.0,
+            )
             radial = _oil_vector_subtract(centroid, center)
             if _oil_vector_dot(normal, radial) < 0:
-                normal = tuple(-value for value in normal)
+                normal = (-normal[0], -normal[1], -normal[2])
         normals.append(normal)
         areas.append(area)
         if area > 1e-16:
             characteristic_lengths.append(math.sqrt(2.0 * area))
         opposite_edges = ((triangle[1], triangle[2]), (triangle[2], triangle[0]), (triangle[0], triangle[1]))
         for opposite_index, edge in enumerate(opposite_edges):
-            key = tuple(sorted(edge))
+            key = (min(edge), max(edge))
             owner = edge_owner.get(key)
             if owner is None:
                 edge_owner[key] = (triangle_index, opposite_index)
@@ -798,7 +845,11 @@ def _oil_flow_seeds(
         second = (seed_index * 0.41421356237 + 0.19) % 1.0
         root = math.sqrt(first)
         raw = (1.0 - root, root * (1.0 - second), root * second)
-        barycentric = tuple(0.1 + 0.7 * value for value in raw)
+        barycentric = (
+            0.1 + 0.7 * raw[0],
+            0.1 + 0.7 * raw[1],
+            0.1 + 0.7 * raw[2],
+        )
         seeds.append((valid[cursor][0], barycentric))
     return seeds
 

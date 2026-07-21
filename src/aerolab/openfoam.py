@@ -2,14 +2,159 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import SupportsFloat, SupportsIndex, TypedDict, TypeGuard
 
 from .stl import Bounds, StlReport, Vector, write_transformed_binary_stl
 
 AXES = {"x": 0, "y": 1, "z": 2}
 SIMULATION_MODES = {"steady", "transient"}
 
-QUALITY_PRESETS: dict[str, dict[str, object]] = {
+
+class QualityPreset(TypedDict):
+    name: str
+    description: str
+    tunnel_divisions: int
+    max_block_cells: int
+    max_local_cells: int
+    max_global_cells: int
+    adaptive_max_local_cells: int
+    adaptive_max_global_cells: int
+    max_supported_surface_level: int
+    n_cells_between_levels: int
+    feature_level: int
+    surface_min_level: int
+    surface_max_level: int
+    body_region_level: int
+    wake_region_level: int
+    surface_layers: int
+    target_y_plus: int
+    layer_expansion_ratio: float
+    snap_solve_iter: int
+    feature_snap_iter: int
+    end_time: int | float
+    write_interval: int
+    force_write_interval: int
+    pressure_residual_control: float
+    velocity_residual_control: float
+    turbulence_residual_control: float
+    velocity_relaxation: float
+
+
+class SimulationQualityMetadata(QualityPreset, total=False):
+    simulation_mode: str
+    flow_through_time_s: float
+    warmup_flow_lengths: float
+    averaging_flow_lengths: float
+    warmup_time_s: float
+    averaging_window_s: float
+    initial_delta_t_s: float
+    maximum_delta_t_s: float
+    maximum_courant_number: float
+    write_interval_s: float
+    minimum_force_samples: int
+    transient_residual_ceiling: float
+    pimple_outer_correctors: int
+    pimple_pressure_correctors: int
+    estimated_initial_time_steps: int
+
+
+class MeshResolutionMetadata(TypedDict):
+    quality: str
+    base_cell_dimensions_m: Vector
+    baseline_surface_max_level: int
+    required_surface_level: int | None
+    configured_surface_min_level: int
+    configured_surface_max_level: int
+    configured_feature_level: int
+    configured_body_region_level: int
+    configured_wake_region_level: int
+    configured_n_cells_between_levels: int
+    maximum_supported_surface_level: int
+    configured_max_local_cells: int
+    configured_max_global_cells: int
+    cell_budget_multiplier: int
+    adaptive_refinement: bool
+    estimated_surface_cell_m: float
+    estimated_broad_surface_cell_m: float
+    requested_surface_cell_m: float | None
+    smallest_aero_feature_m: float | None
+    estimated_cells_across_feature: float | None
+    minimum_cells_across_feature: float
+    supported: bool
+    status: str
+    estimate_only: bool
+
+
+class WallLayerMetadata(TypedDict):
+    mode: str
+    target_y_plus: float
+    estimated_y_plus: float
+    flat_plate_estimated_y_plus: float
+    reynolds_number: float
+    estimated_skin_friction_coefficient: float
+    estimated_friction_velocity_mps: float
+    flat_plate_first_layer_thickness_m: float
+    first_layer_calibration_factor: float
+    first_layer_thickness_m: float
+    total_layer_thickness_m: float
+    surface_layers: int
+    expansion_ratio: float
+
+
+class WindTunnel(TypedDict):
+    min: Vector
+    max: Vector
+    cells: tuple[int, int, int]
+
+
+class OpenFoamValues(TypedDict):
+    speed_mps: float
+    flow_vector: Vector
+    drag_dir: Vector
+    lift_dir: Vector
+    pitch_axis: Vector
+    reference_area: float
+    reference_length: float
+    center: Vector
+    air_density_kg_m3: float
+    kinematic_viscosity_m2_s: float
+    turbulence_intensity: float
+    turbulence_length_scale_m: float
+    include_ground: bool
+    moving_ground: bool
+    ground_velocity: Vector
+    k: float
+    omega: float
+    location_in_mesh: Vector
+    refinement_boxes: dict[str, dict[str, Vector]]
+    wall_resolution: WallLayerMetadata
+    mesh_resolution: MeshResolutionMetadata
+    quality: SimulationQualityMetadata
+    simulation_mode: str
+    domain: dict[str, object]
+    backflow_safe_outlet: bool
+    roughness_height_m: float
+    roughness_constant: float
+    wheels: list[dict[str, object]]
+    patch_names: list[str]
+    yawed_inflow: bool
+    second_order_temporal: bool
+    fluid_profile: str
+    solver_module: str
+    turbulence_model: str
+    air_temperature_k: float
+    air_pressure_pa: float
+    dynamic_viscosity_pa_s: float
+    porous_zones: list[dict[str, object]]
+    fan_zones: list[dict[str, object]]
+    heat_zones: list[dict[str, object]]
+    volume_zones: list[dict[str, object]]
+    nu_tilda: float
+
+
+QUALITY_PRESETS: dict[str, SimulationQualityMetadata] = {
     "draft": {
         "name": "draft",
         "description": "Fast setup for orientation, scale, and case smoke tests.",
@@ -100,9 +245,9 @@ QUALITY_PRESETS: dict[str, dict[str, object]] = {
 }
 
 
-def quality_preset_metadata(quality: str = "standard") -> dict[str, object]:
+def quality_preset_metadata(quality: str = "standard") -> SimulationQualityMetadata:
     preset = _quality_preset(quality)
-    return dict(preset)
+    return preset.copy()
 
 
 def simulation_quality_metadata(
@@ -111,7 +256,7 @@ def simulation_quality_metadata(
     speed_mps: float,
     reference_length_m: float,
     surface_cell_m: float,
-) -> dict[str, object]:
+) -> SimulationQualityMetadata:
     mode = str(simulation_mode or "steady").lower()
     if mode not in SIMULATION_MODES:
         raise ValueError(f"Unsupported simulation mode: {simulation_mode}")
@@ -163,8 +308,8 @@ def mesh_resolution_metadata(
     include_ground: bool,
     quality: str = "standard",
     smallest_aero_feature_m: float | None = None,
-    domain: dict[str, object] | None = None,
-) -> dict[str, object]:
+    domain: Mapping[str, object] | None = None,
+) -> MeshResolutionMetadata:
     preset = _quality_preset(quality)
     tunnel = _wind_tunnel(bounds, flow_axis.lower(), include_ground, preset, domain)
     minimum = tunnel["min"]
@@ -173,9 +318,10 @@ def mesh_resolution_metadata(
     assert isinstance(minimum, tuple)
     assert isinstance(maximum, tuple)
     assert isinstance(cells, tuple)
-    base_cell_dimensions = tuple(
-        (maximum[index] - minimum[index]) / max(int(cells[index]), 1)
-        for index in range(3)
+    base_cell_dimensions: Vector = (
+        (maximum[0] - minimum[0]) / max(cells[0], 1),
+        (maximum[1] - minimum[1]) / max(cells[1], 1),
+        (maximum[2] - minimum[2]) / max(cells[2], 1),
     )
     conservative_base_cell = max(base_cell_dimensions)
     baseline_surface_level = int(preset["surface_max_level"])
@@ -259,7 +405,7 @@ def wall_layer_metadata(
     reference_length_m: float,
     quality: str = "standard",
     kinematic_viscosity_m2_s: float = 1.5e-5,
-) -> dict[str, object]:
+) -> WallLayerMetadata:
     preset = _quality_preset(quality)
     length = max(reference_length_m, 1e-6)
     speed = max(abs(speed_mps), 0.1)
@@ -322,7 +468,7 @@ def generate_openfoam_case(
     turbulence_intensity: float = 0.01,
     turbulence_length_scale_m: float | None = None,
     force_reference_m: Vector | None = None,
-    physical_model: dict[str, object] | None = None,
+    physical_model: Mapping[str, object] | None = None,
     body_rotation_center_source: Vector | None = None,
 ) -> list[Path]:
     flow_axis = flow_axis.lower()
@@ -451,7 +597,7 @@ def generate_openfoam_case(
     turbulent_length = turbulence_length_scale_m or 0.07 * reference_length
     patch_names = ["body", *(str(wheel["patch"]) for wheel in wheels)]
 
-    values = {
+    values: OpenFoamValues = {
         "speed_mps": speed_mps,
         "flow_vector": flow_vector,
         "drag_dir": drag_dir,
@@ -481,18 +627,18 @@ def generate_openfoam_case(
         "simulation_mode": simulation_mode,
         "domain": domain_settings,
         "backflow_safe_outlet": bool(outlet_settings.get("backflow_safe", False)),
-        "roughness_height_m": float(surface_settings.get("roughness_height_m", 0.0)),
-        "roughness_constant": float(surface_settings.get("roughness_constant", 0.5)),
+        "roughness_height_m": _float_value(surface_settings.get("roughness_height_m", 0.0)),
+        "roughness_constant": _float_value(surface_settings.get("roughness_constant", 0.5)),
         "wheels": wheels,
         "patch_names": patch_names,
-        "yawed_inflow": abs(float(inflow_settings.get("yaw_degrees", 0.0))) > 1e-12,
+        "yawed_inflow": abs(_float_value(inflow_settings.get("yaw_degrees", 0.0))) > 1e-12,
         "second_order_temporal": bool(transient_settings.get("second_order_temporal", False)),
         "fluid_profile": fluid_profile,
         "solver_module": solver_module,
         "turbulence_model": turbulence_model,
-        "air_temperature_k": float(fluid_settings.get("temperature_k", 288.15)),
-        "air_pressure_pa": float(fluid_settings.get("pressure_pa", 101325.0)),
-        "dynamic_viscosity_pa_s": float(
+        "air_temperature_k": _float_value(fluid_settings.get("temperature_k", 288.15)),
+        "air_pressure_pa": _float_value(fluid_settings.get("pressure_pa", 101325.0)),
+        "dynamic_viscosity_pa_s": _float_value(
             fluid_settings.get(
                 "dynamic_viscosity_pa_s",
                 air_density_kg_m3 * kinematic_viscosity_m2_s,
@@ -708,7 +854,7 @@ def ensure_case_postprocessing(case_path: Path) -> dict[str, bool]:
     }
 
 
-def _quality_preset(quality: str) -> dict[str, object]:
+def _quality_preset(quality: str) -> SimulationQualityMetadata:
     key = (quality or "standard").lower()
     if key not in QUALITY_PRESETS:
         raise ValueError(f"Unsupported CFD quality preset: {quality}")
@@ -719,9 +865,9 @@ def _wind_tunnel(
     bounds: Bounds,
     flow_axis: str,
     include_ground: bool,
-    preset: dict[str, object],
-    domain: dict[str, object] | None = None,
-) -> dict[str, object]:
+    preset: QualityPreset,
+    domain: Mapping[str, object] | None = None,
+) -> WindTunnel:
     domain = domain or {}
     closed = domain.get("closed_tunnel")
     if domain.get("mode") == "closed_tunnel" and isinstance(closed, dict):
@@ -749,12 +895,17 @@ def _wind_tunnel(
 
     size = [maximum[i] - minimum[i] for i in range(3)]
     target_divisions = float(preset["tunnel_divisions"])
-    max_cells = int(preset["max_block_cells"])
-    cells = tuple(max(12, min(max_cells, math.ceil(length / max(max(size) / target_divisions, 1e-6)))) for length in size)
+    max_cells = preset["max_block_cells"]
+    base_cell_size = max(max(size) / target_divisions, 1e-6)
+    cells = (
+        max(12, min(max_cells, math.ceil(size[0] / base_cell_size))),
+        max(12, min(max_cells, math.ceil(size[1] / base_cell_size))),
+        max(12, min(max_cells, math.ceil(size[2] / base_cell_size))),
+    )
 
     return {
-        "min": tuple(minimum),
-        "max": tuple(maximum),
+        "min": (minimum[0], minimum[1], minimum[2]),
+        "max": (maximum[0], maximum[1], maximum[2]),
         "cells": cells,
     }
 
@@ -783,13 +934,19 @@ def _refinement_boxes(bounds: Bounds, flow_axis: str) -> dict[str, dict[str, Vec
             wake_max[index] += wake_margin
 
     return {
-        "bodyRefinement": {"min": tuple(body_min), "max": tuple(body_max)},
-        "wakeRefinement": {"min": tuple(wake_min), "max": tuple(wake_max)},
+        "bodyRefinement": {
+            "min": (body_min[0], body_min[1], body_min[2]),
+            "max": (body_max[0], body_max[1], body_max[2]),
+        },
+        "wakeRefinement": {
+            "min": (wake_min[0], wake_min[1], wake_min[2]),
+            "max": (wake_max[0], wake_max[1], wake_max[2]),
+        },
     }
 
 
 def _block_mesh_dict(
-    tunnel: dict[str, object],
+    tunnel: WindTunnel,
     flow_axis: str,
     include_ground: bool,
     domain: dict[str, object] | None = None,
@@ -989,21 +1146,16 @@ mergePatchPairs
 
 
 def _snappy_hex_mesh_dict(
-    location_in_mesh: object,
-    refinement_boxes: object,
-    wall_resolution: object,
-    mesh_resolution: object,
-    preset: dict[str, object],
+    location_in_mesh: Vector,
+    refinement_boxes: dict[str, dict[str, Vector]],
+    wall_resolution: WallLayerMetadata,
+    mesh_resolution: MeshResolutionMetadata,
+    preset: QualityPreset,
     wheels: list[dict[str, object]] | None = None,
     volume_zones: list[dict[str, object]] | None = None,
 ) -> str:
-    assert isinstance(refinement_boxes, dict)
     body_box = refinement_boxes["bodyRefinement"]
     wake_box = refinement_boxes["wakeRefinement"]
-    assert isinstance(body_box, dict)
-    assert isinstance(wake_box, dict)
-    assert isinstance(wall_resolution, dict)
-    assert isinstance(mesh_resolution, dict)
     surface_min_level = int(mesh_resolution["configured_surface_min_level"])
     surface_max_level = int(mesh_resolution["configured_surface_max_level"])
     feature_level = int(mesh_resolution["configured_feature_level"])
@@ -1253,7 +1405,7 @@ subsetFeatures
 
 
 def _streamlines_dict(
-    tunnel: dict[str, object],
+    tunnel: WindTunnel,
     bounds: Bounds,
     flow_axis: str,
     include_ground: bool,
@@ -1298,7 +1450,7 @@ seedSampleSet
 
 
 def _streamline_seed_points(
-    tunnel: dict[str, object],
+    tunnel: WindTunnel,
     bounds: Bounds,
     flow_axis: str,
     include_ground: bool,
@@ -1352,7 +1504,7 @@ def _streamline_seed_points(
             point[flow_index] = seed_flow
             point[side_index] = side
             point[up_index] = up
-            points.append(tuple(point))  # type: ignore[arg-type]
+            points.append((point[0], point[1], point[2]))
     return points
 
 
@@ -1407,7 +1559,7 @@ surfaces
 """
 
 
-def _control_dict(values: dict[str, object]) -> str:
+def _control_dict(values: OpenFoamValues) -> str:
     solver_module = str(values.get("solver_module") or "incompressibleFluid")
     turbulence_model = str(values.get("turbulence_model") or "kOmegaSST")
     if solver_module != "incompressibleFluid" or turbulence_model != "kOmegaSST":
@@ -1502,7 +1654,7 @@ functions
 
 
 def _control_dict_advanced(
-    values: dict[str, object],
+    values: OpenFoamValues,
     solver_module: str,
     turbulence_model: str,
 ) -> str:
@@ -1762,7 +1914,7 @@ wallDist
 
 
 def _fv_solution(
-    quality: dict[str, object],
+    quality: SimulationQualityMetadata,
     simulation_mode: str = "steady",
     solver_module: str = "incompressibleFluid",
     turbulence_model: str = "kOmegaSST",
@@ -1961,7 +2113,7 @@ cache
 
 
 def _fv_solution_advanced(
-    quality: dict[str, object],
+    quality: SimulationQualityMetadata,
     simulation_mode: str,
     solver_module: str,
     turbulence_model: str,
@@ -2099,7 +2251,7 @@ nu [0 2 -1 0 0 0 0] {kinematic_viscosity_m2_s:.9g};
 """
 
 
-def _compressible_physical_properties(values: dict[str, object]) -> str:
+def _compressible_physical_properties(values: OpenFoamValues) -> str:
     energy = (
         "sensibleInternalEnergy"
         if values.get("simulation_mode") == "transient"
@@ -2215,9 +2367,9 @@ RAS
 """
 
 
-def _field_u(values: dict[str, object]) -> str:
-    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
-    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+def _field_u(values: OpenFoamValues) -> str:
+    domain = values["domain"]
+    wheels = values["wheels"]
     advanced = bool(
         values.get("backflow_safe_outlet")
         or values.get("yawed_inflow")
@@ -2274,9 +2426,9 @@ boundaryField
 
 
 def _field_u_advanced(
-    values: dict[str, object],
+    values: OpenFoamValues,
     domain: dict[str, object],
-    wheels: list[object],
+    wheels: list[dict[str, object]],
 ) -> str:
     flow = _foam_vec(values["flow_vector"])
     if values.get("backflow_safe_outlet"):
@@ -2332,7 +2484,7 @@ def _field_u_advanced(
         type rotatingWallVelocity;
         origin {_foam_vec(_vector_value(wheel_value["center_m"]))};
         axis {_foam_vec(_vector_value(wheel_value["axis"]))};
-        omega {float(wheel_value["omega_rad_s"]):.9g};
+        omega {_float_value(wheel_value["omega_rad_s"]):.9g};
     }}"""
     return f"""FoamFile
 {{
@@ -2367,11 +2519,11 @@ boundaryField
 
 def _field_p_compressible(
     include_ground: bool,
-    values: dict[str, object],
+    values: OpenFoamValues,
 ) -> str:
     pressure = float(values["air_pressure_pa"])
-    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
-    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    domain = values["domain"]
+    wheels = values["wheels"]
     if values.get("simulation_mode") == "transient":
         outlet_patch = f"""    outlet
     {{
@@ -2460,11 +2612,11 @@ boundaryField
 
 def _field_temperature(
     include_ground: bool,
-    values: dict[str, object],
+    values: OpenFoamValues,
 ) -> str:
     temperature = float(values["air_temperature_k"])
-    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
-    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    domain = values["domain"]
+    wheels = values["wheels"]
     outlet_patch = (
         f"""    outlet
     {{
@@ -2551,10 +2703,10 @@ boundaryField
 
 def _field_alphat(
     include_ground: bool,
-    values: dict[str, object],
+    values: OpenFoamValues,
 ) -> str:
-    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
-    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    domain = values["domain"]
+    wheels = values["wheels"]
     wall = """type compressible::alphatWallFunction;
         value uniform 0;"""
     if domain.get("mode") == "closed_tunnel":
@@ -2628,11 +2780,14 @@ boundaryField
 
 def _field_p(
     include_ground: bool,
-    values: dict[str, object] | None = None,
+    values: OpenFoamValues | None = None,
 ) -> str:
-    values = values or {}
-    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
-    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    if values is None:
+        domain: dict[str, object] = {}
+        wheels: list[dict[str, object]] = []
+    else:
+        domain = values["domain"]
+        wheels = values["wheels"]
     if domain.get("mode") == "closed_tunnel" or wheels:
         wall_names = ["sideWalls", "ceiling"] if domain.get("mode") == "closed_tunnel" else ["farfield"]
         domain_patches = "".join(
@@ -2743,19 +2898,27 @@ def _field_scalar(
     dimensions: str,
     value: float,
     include_ground: bool,
-    values: dict[str, object] | None = None,
+    values: OpenFoamValues | None = None,
 ) -> str:
-    settings = values or {}
-    domain = settings.get("domain") if isinstance(settings.get("domain"), dict) else {}
-    wheels = settings.get("wheels") if isinstance(settings.get("wheels"), list) else []
-    advanced = bool(
-        settings.get("backflow_safe_outlet")
-        or settings.get("yawed_inflow")
-        or domain.get("mode") == "closed_tunnel"
-        or wheels
-    )
-    if advanced:
-        return _field_scalar_advanced(name, dimensions, value, include_ground, settings, domain, wheels)
+    if values is not None:
+        domain = values["domain"]
+        wheels = values["wheels"]
+        advanced = bool(
+            values["backflow_safe_outlet"]
+            or values["yawed_inflow"]
+            or domain.get("mode") == "closed_tunnel"
+            or wheels
+        )
+        if advanced:
+            return _field_scalar_advanced(
+                name,
+                dimensions,
+                value,
+                include_ground,
+                values,
+                domain,
+                wheels,
+            )
 
     ground_patch = ""
     if include_ground:
@@ -2822,9 +2985,9 @@ def _field_scalar_advanced(
     dimensions: str,
     value: float,
     include_ground: bool,
-    settings: dict[str, object],
+    settings: OpenFoamValues,
     domain: dict[str, object],
-    wheels: list[object],
+    wheels: list[dict[str, object]],
 ) -> str:
     wall_type = "kqRWallFunction" if name == "k" else "omegaWallFunction"
     wall_value = 0.0 if name == "k" else value
@@ -2919,11 +3082,11 @@ boundaryField
 
 def _field_nu_tilda(
     include_ground: bool,
-    values: dict[str, object],
+    values: OpenFoamValues,
 ) -> str:
     value = float(values["nu_tilda"])
-    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
-    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    domain = values["domain"]
+    wheels = values["wheels"]
     outlet_patch = (
         f"""    outlet
     {{
@@ -3012,10 +3175,10 @@ boundaryField
 
 def _field_nut_spalart_allmaras(
     include_ground: bool,
-    values: dict[str, object],
+    values: OpenFoamValues,
 ) -> str:
-    domain = values.get("domain") if isinstance(values.get("domain"), dict) else {}
-    wheels = values.get("wheels") if isinstance(values.get("wheels"), list) else []
+    domain = values["domain"]
+    wheels = values["wheels"]
     wall = """type nutUSpaldingWallFunction;
         value uniform 0;"""
     if domain.get("mode") == "closed_tunnel":
@@ -3089,14 +3252,14 @@ boundaryField
 
 def _field_nut(
     include_ground: bool,
-    values: dict[str, object] | None = None,
+    values: OpenFoamValues | None = None,
 ) -> str:
-    settings = values or {}
-    domain = settings.get("domain") if isinstance(settings.get("domain"), dict) else {}
-    wheels = settings.get("wheels") if isinstance(settings.get("wheels"), list) else []
-    roughness = float(settings.get("roughness_height_m", 0.0))
-    if domain.get("mode") == "closed_tunnel" or wheels or roughness > 0:
-        return _field_nut_advanced(include_ground, settings, domain, wheels)
+    if values is not None:
+        domain = values["domain"]
+        wheels = values["wheels"]
+        roughness = values["roughness_height_m"]
+        if domain.get("mode") == "closed_tunnel" or wheels or roughness > 0:
+            return _field_nut_advanced(include_ground, values, domain, wheels)
 
     ground_patch = ""
     if include_ground:
@@ -3149,9 +3312,9 @@ boundaryField
 
 def _field_nut_advanced(
     include_ground: bool,
-    settings: dict[str, object],
+    settings: OpenFoamValues,
     domain: dict[str, object],
-    wheels: list[object],
+    wheels: list[dict[str, object]],
 ) -> str:
     roughness = float(settings.get("roughness_height_m", 0.0))
     roughness_constant = float(settings.get("roughness_constant", 0.5))
@@ -3274,9 +3437,9 @@ def _fv_models(
     type actuationDisk;
     cellZone {zone["cell_zone"]};
     diskDir {_foam_vec(_vector_value(zone["disk_direction"]))};
-    Cp {float(zone["power_coefficient"]):.9g};
-    Ct {float(zone["thrust_coefficient"]):.9g};
-    diskArea {float(zone["disk_area_m2"]):.9g};
+    Cp {_float_value(zone["power_coefficient"]):.9g};
+    Ct {_float_value(zone["thrust_coefficient"]):.9g};
+    diskArea {_float_value(zone["disk_area_m2"]):.9g};
     upstreamPoint {_foam_vec(_vector_value(zone["upstream_point_m"]))};
 }}"""
         )
@@ -3286,7 +3449,7 @@ def _fv_models(
 {{
     type heatSource;
     cellZone {zone["cell_zone"]};
-    Q {float(zone["power_w"]):.9g};
+    Q {_float_value(zone["power_w"]):.9g};
 }}"""
         )
     body = "\n\n".join(entries)
@@ -3528,11 +3691,14 @@ wsl bash -lc "cd \"$(wslpath -a '$PWD')\" && chmod +x Allrun && ./Allrun"
 def _case_readme(
     include_ground: bool,
     moving_ground: bool,
-    values: dict[str, object] | None = None,
+    values: OpenFoamValues | None = None,
 ) -> str:
     ground = "enabled" if include_ground else "disabled"
     moving = "enabled" if moving_ground else "disabled"
-    settings = values or {}
+    if values is None:
+        settings: Mapping[str, object] = {}
+    else:
+        settings = values
     solver_module = str(settings.get("solver_module") or "incompressibleFluid")
     base = f"""# AeroLab OpenFOAM Case
 
@@ -3558,13 +3724,14 @@ This case targets OpenFOAM Foundation v13 and uses `foamRun` with the
 finish successfully. AeroLab will keep the result unverified until mesh quality,
 residual, and force-coefficient stability checks pass.
 """
-    domain = settings.get("domain") if isinstance(settings.get("domain"), dict) else {}
-    wheels = settings.get("wheels") if isinstance(settings.get("wheels"), list) else []
-    volume_zones = (
-        settings.get("volume_zones")
-        if isinstance(settings.get("volume_zones"), list)
-        else []
-    )
+    if values is None:
+        domain: dict[str, object] = {}
+        wheels: list[dict[str, object]] = []
+        volume_zones: list[dict[str, object]] = []
+    else:
+        domain = values["domain"]
+        wheels = values["wheels"]
+        volume_zones = values["volume_zones"]
     advanced = bool(
         settings.get("yawed_inflow")
         or settings.get("backflow_safe_outlet")
@@ -3584,7 +3751,7 @@ residual, and force-coefficient stability checks pass.
 - Solver profile: {settings.get("fluid_profile", "incompressible")} / {settings.get("turbulence_model", "kOmegaSST")}
 - Domain: {domain.get("mode", "open_field")}
 - Backflow-safe outlet: {"enabled" if settings.get("backflow_safe_outlet") else "disabled"}
-- Surface roughness height: {float(settings.get("roughness_height_m", 0.0)):.9g} m
+- Surface roughness height: {_float_value(settings.get("roughness_height_m", 0.0)):.9g} m
 - Rotating wheel patches: {len(wheels)}
 - Porous/fan cell zones: {len(volume_zones)}
 - Temporal scheme: {"backward" if settings.get("second_order_temporal") else "legacy/default"}
@@ -3614,7 +3781,7 @@ def _center(bounds: Bounds) -> Vector:
     return tuple((bounds.minimum[i] + bounds.maximum[i]) / 2.0 for i in range(3))  # type: ignore[return-value]
 
 
-def _location_in_mesh(tunnel: dict[str, object]) -> Vector:
+def _location_in_mesh(tunnel: WindTunnel) -> Vector:
     minimum = tunnel["min"]
     maximum = tunnel["max"]
     assert isinstance(minimum, tuple)
@@ -3651,37 +3818,60 @@ def _specific_dissipation_rate(
     return math.sqrt(k) / ((c_mu**0.25) * turbulent_length)
 
 
-def _mapping_section(mapping: dict[str, object], key: str) -> dict[str, object]:
+def _mapping_section(mapping: Mapping[str, object], key: str) -> dict[str, object]:
     value = mapping.get(key)
     return value if isinstance(value, dict) else {}
+
+
+def _float_value(value: object) -> float:
+    if not isinstance(
+        value,
+        (str, bytes, bytearray, memoryview, SupportsFloat, SupportsIndex),
+    ):
+        raise TypeError(f"Expected a numeric value, got {type(value).__name__}.")
+    return float(value)
+
+
+def _is_object_iterable(value: object) -> TypeGuard[Iterable[object]]:
+    return isinstance(value, Iterable)
 
 
 def _vector_value(value: object) -> Vector:
     if isinstance(value, dict):
         try:
-            vector = (float(value["x"]), float(value["y"]), float(value["z"]))
+            vector: Vector = (
+                _float_value(value["x"]),
+                _float_value(value["y"]),
+                _float_value(value["z"]),
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("Expected a finite X, Y, Z vector.") from exc
     else:
+        if not _is_object_iterable(value):
+            raise ValueError("Expected a finite X, Y, Z vector.")
         try:
-            components = tuple(float(component) for component in value)  # type: ignore[union-attr]
+            components = tuple(_float_value(component) for component in value)
         except (TypeError, ValueError) as exc:
             raise ValueError("Expected a finite X, Y, Z vector.") from exc
         if len(components) != 3:
             raise ValueError("Expected a finite X, Y, Z vector.")
-        vector = components  # type: ignore[assignment]
+        vector = (components[0], components[1], components[2])
     if not all(math.isfinite(component) for component in vector):
         raise ValueError("Expected a finite X, Y, Z vector.")
-    return vector  # type: ignore[return-value]
+    return vector
 
 
 def _normalize_vector(vector: Vector) -> Vector:
     magnitude = math.sqrt(sum(component * component for component in vector))
     if magnitude <= 1e-12:
         raise ValueError("Flow direction must have non-zero length.")
-    return tuple(component / magnitude for component in vector)  # type: ignore[return-value]
+    return (
+        vector[0] / magnitude,
+        vector[1] / magnitude,
+        vector[2] / magnitude,
+    )
 
 
 def _foam_vec(vector: object) -> str:
-    x, y, z = vector  # type: ignore[misc]
+    x, y, z = _vector_value(vector)
     return f"({x:.9g} {y:.9g} {z:.9g})"

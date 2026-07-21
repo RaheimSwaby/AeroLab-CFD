@@ -1181,8 +1181,7 @@ def _mesh_quality_assessment(
             "The baseline OpenFOAM mesh checks did not pass.",
         ),
     ]
-    ground_enabled = isinstance(ground_setup, dict) and bool(ground_setup.get("enabled"))
-    if ground_enabled:
+    if isinstance(ground_setup, dict) and bool(ground_setup.get("enabled")):
         clearance = _finite_number(ground_setup.get("clearance_m"))
         road_elevation = _finite_number(ground_setup.get("road_elevation_m"))
         lowest_model = _finite_number(ground_setup.get("lowest_model_z_m"))
@@ -1365,8 +1364,7 @@ def _quality_assessment(
                 "The transient run has not produced complete mean velocity and pressure fields.",
             ),
         ))
-    ground_enabled = isinstance(ground_setup, dict) and bool(ground_setup.get("enabled"))
-    if ground_enabled:
+    if isinstance(ground_setup, dict) and bool(ground_setup.get("enabled")):
         clearance = _finite_number(ground_setup.get("clearance_m"))
         road_elevation = _finite_number(ground_setup.get("road_elevation_m"))
         lowest_model = _finite_number(ground_setup.get("lowest_model_z_m"))

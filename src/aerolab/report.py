@@ -63,7 +63,12 @@ def _summary_pairs(report: dict[str, object]) -> list[tuple[str, str]]:
     convergence = report.get("gridConvergence")
     temperature = report.get("temperatureResults")
     balance = _get(forces, "aeroBalance")
-    vertical_type = _get(forces, "verticalForceType") or "downforce/lift"
+    vertical_type_value = _get(forces, "verticalForceType")
+    vertical_type = (
+        vertical_type_value
+        if isinstance(vertical_type_value, str) and vertical_type_value
+        else "downforce/lift"
+    )
     pairs: list[tuple[str, str]] = [
         ("Numerically qualified", _yes_no(qualified) if qualified is not None else DASH),
         ("Mean Cd", _num(_get(force_coeffs, "meanCd", default=_get(force_coeffs, "Cd")))),
@@ -774,8 +779,10 @@ def _comparison_statistical_rows(
 
 
 def render_comparison_markdown(comparison: dict[str, object]) -> str:
-    baseline = comparison.get("baseline") if isinstance(comparison.get("baseline"), dict) else {}
-    variant = comparison.get("variant") if isinstance(comparison.get("variant"), dict) else {}
+    baseline_value = comparison.get("baseline")
+    baseline = baseline_value if isinstance(baseline_value, dict) else {}
+    variant_value = comparison.get("variant")
+    variant = variant_value if isinstance(variant_value, dict) else {}
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         "# AeroLab CFD Controlled A/B Comparison",
@@ -796,8 +803,8 @@ def render_comparison_markdown(comparison: dict[str, object]) -> str:
         "| Quantity | Baseline | Variant | Delta | Delta % |",
         "| --- | ---: | ---: | ---: | ---: |",
     ]
-    for row in _comparison_delta_rows(comparison):
-        lines.append(f"| {' | '.join(row)} |")
+    for delta_row in _comparison_delta_rows(comparison):
+        lines.append(f"| {' | '.join(delta_row)} |")
     statistical_rows = _comparison_statistical_rows(comparison)
     if statistical_rows:
         lines.extend(
@@ -809,8 +816,8 @@ def render_comparison_markdown(comparison: dict[str, object]) -> str:
                 "| --- | ---: | ---: | --- | ---: | ---: |",
             )
         )
-        for row in statistical_rows:
-            lines.append(f"| {' | '.join(row)} |")
+        for statistical_row in statistical_rows:
+            lines.append(f"| {' | '.join(statistical_row)} |")
         if not comparison.get("statisticalDecisionSafe"):
             lines.extend(("", "_Intervals are descriptive until the statistical decision-safe gate passes._"))
     differences = comparison.get("setupDifferences")
@@ -827,8 +834,10 @@ def render_comparison_markdown(comparison: dict[str, object]) -> str:
 
 
 def render_comparison_html(comparison: dict[str, object]) -> str:
-    baseline = comparison.get("baseline") if isinstance(comparison.get("baseline"), dict) else {}
-    variant = comparison.get("variant") if isinstance(comparison.get("variant"), dict) else {}
+    baseline_value = comparison.get("baseline")
+    baseline = baseline_value if isinstance(baseline_value, dict) else {}
+    variant_value = comparison.get("variant")
+    variant = variant_value if isinstance(variant_value, dict) else {}
     rows = "".join(
         "<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in row) + "</tr>"
         for row in _comparison_delta_rows(comparison)

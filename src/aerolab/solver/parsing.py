@@ -5,10 +5,14 @@ from __future__ import annotations
 import math
 import re
 import statistics
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from .statistics import analyze_transient_history
 from .util import _finite_number, _percentile, _read_json_object
+
+_VtkValue = TypeVar("_VtkValue")
 
 
 def parse_force_coeffs(case_path: Path) -> dict[str, object] | None:
@@ -64,11 +68,12 @@ def _parse_coeff_file(
     if not rows:
         return None
     latest = rows[-1]
-    transient = isinstance(quality, dict) and quality.get("simulation_mode") == "transient"
+    quality_settings: dict[str, object] | None = quality if isinstance(quality, dict) else None
+    transient = quality_settings is not None and quality_settings.get("simulation_mode") == "transient"
     averaging_rows = rows
     averaging_window = None
-    if transient:
-        averaging_window = _finite_number(quality.get("averaging_window_s"))
+    if transient and quality_settings is not None:
+        averaging_window = _finite_number(quality_settings.get("averaging_window_s"))
         latest_time = latest.get("Time")
         if averaging_window is not None and latest_time is not None:
             window_start = float(latest_time) - averaging_window
@@ -85,8 +90,9 @@ def _parse_coeff_file(
     }
     reasons: list[str] = []
     minimum_samples = 30
-    if transient and isinstance(quality, dict):
-        minimum_samples = int(quality.get("minimum_force_samples") or 100)
+    if transient and quality_settings is not None:
+        configured_minimum = _finite_number(quality_settings.get("minimum_force_samples"))
+        minimum_samples = int(configured_minimum or 100)
     available_samples = window_count if transient else len(rows)
     stable = available_samples >= minimum_samples
     if available_samples < minimum_samples:
@@ -171,12 +177,10 @@ def _transient_statistical_evidence(
     balance_samples = _add_aero_balance_history(history, case_payload)
     channels = channel_names + (("frontAeroBalancePercent",) if balance_samples else ())
     quality_settings = quality if isinstance(quality, dict) else {}
-    flow = case_payload.get("flow") if isinstance(case_payload.get("flow"), dict) else {}
-    reference = (
-        case_payload.get("aerodynamic_reference")
-        if isinstance(case_payload.get("aerodynamic_reference"), dict)
-        else {}
-    )
+    flow_value = case_payload.get("flow")
+    reference_value = case_payload.get("aerodynamic_reference")
+    flow: dict[str, object] = flow_value if isinstance(flow_value, dict) else {}
+    reference: dict[str, object] = reference_value if isinstance(reference_value, dict) else {}
     result = analyze_transient_history(
         history,
         channels=channels,
@@ -611,7 +615,8 @@ def parse_temperature_results(case_path: Path) -> dict[str, object] | None:
         "p95C": p95_k - 273.15,
     }
     case_payload = _read_json_object(case_path / "case.json")
-    flow = case_payload.get("flow") if isinstance(case_payload.get("flow"), dict) else {}
+    flow_value = case_payload.get("flow")
+    flow: dict[str, object] = flow_value if isinstance(flow_value, dict) else {}
     inlet_k = _finite_number(flow.get("air_temperature_k"))
     if inlet_k is not None:
         result.update(
@@ -745,12 +750,17 @@ def _vtk_header(lines: list[str], keyword: str) -> tuple[int, list[str]] | None:
     return None
 
 
-def _vtk_values(lines: list[str], start: int, count: int, cast: type) -> list:
-    values = []
+def _vtk_values(
+    lines: list[str],
+    start: int,
+    count: int,
+    convert: Callable[[str], _VtkValue],
+) -> list[_VtkValue]:
+    values: list[_VtkValue] = []
     for line in lines[start:]:
         for token in line.strip().split():
             try:
-                values.append(cast(token))
+                values.append(convert(token))
             except ValueError:
                 return values
             if len(values) == count:

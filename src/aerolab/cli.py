@@ -167,7 +167,7 @@ def _center_of_gravity(
     return (float(x), float(y), float(z))  # type: ignore[arg-type]
 
 
-def _closed_tunnel_from_args(args: argparse.Namespace) -> dict[str, float] | None:
+def _closed_tunnel_from_args(args: argparse.Namespace) -> dict[str, object] | None:
     values = {
         "width_m": args.tunnel_width_m,
         "height_m": args.tunnel_height_m,
@@ -182,7 +182,10 @@ def _closed_tunnel_from_args(args: argparse.Namespace) -> dict[str, float] | Non
             "Closed tunnel requires --tunnel-width-m, --tunnel-height-m, "
             "--tunnel-upstream-m, and --tunnel-downstream-m together."
         )
-    return {key: float(value) for key, value in values.items()}  # type: ignore[arg-type]
+    closed_tunnel: dict[str, object] = {
+        key: float(value) for key, value in values.items()
+    }
+    return closed_tunnel
 
 
 def _wheel_setup_from_file(path: Path | None) -> list[dict[str, object]] | None:
@@ -229,8 +232,10 @@ def _volume_zones_from_file(
 
 
 def _comparison_text(comparison: dict[str, object]) -> str:
-    baseline = comparison.get("baseline") if isinstance(comparison.get("baseline"), dict) else {}
-    variant = comparison.get("variant") if isinstance(comparison.get("variant"), dict) else {}
+    baseline_value = comparison.get("baseline")
+    baseline = baseline_value if isinstance(baseline_value, dict) else {}
+    variant_value = comparison.get("variant")
+    variant = variant_value if isinstance(variant_value, dict) else {}
     lines = [
         f"Status: {comparison.get('statusLabel')}",
         f"Decision-safe numerical comparison: {'yes' if comparison.get('decisionSafe') else 'no'}",
@@ -919,12 +924,12 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(parse_argv)
 
     if args.command == "check":
-        report = inspect_stl(args.model)
+        stl_report = inspect_stl(args.model)
         if args.json:
-            print(json.dumps(report.to_dict(), indent=2))
+            print(json.dumps(stl_report.to_dict(), indent=2))
         else:
-            print(report.to_text())
-        return 0 if report.is_cfd_candidate else 2
+            print(stl_report.to_text())
+        return 0 if stl_report.is_cfd_candidate else 2
 
     if args.command == "init-case":
         case_path = create_case(
@@ -1002,18 +1007,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "solver-status":
-        status = solver_status()
+        solver_status_payload = solver_status()
         if args.json:
-            print(json.dumps(status, indent=2))
+            print(json.dumps(solver_status_payload, indent=2))
         else:
-            print(f"Preferred backend: {status.get('preferredBackend') or 'none'}")
-            for name, backend in status["backends"].items():
-                available = "yes" if backend.get("available") else "no"
-                print(f"{name}: {available}")
-        return 0 if status.get("preferredBackend") else 2
+            print(
+                "Preferred backend: "
+                f"{solver_status_payload.get('preferredBackend') or 'none'}"
+            )
+            backends = solver_status_payload.get("backends")
+            if isinstance(backends, dict):
+                for name, backend in backends.items():
+                    if not isinstance(backend, dict):
+                        continue
+                    available = "yes" if backend.get("available") else "no"
+                    print(f"{name}: {available}")
+        return 0 if solver_status_payload.get("preferredBackend") else 2
 
     if args.command == "run-case":
-        result = run_case(
+        case_run_result = run_case(
             args.case,
             backend=args.backend,
             timeout_seconds=args.timeout_seconds,
@@ -1024,30 +1036,37 @@ def main(argv: list[str] | None = None) -> int:
             resume=args.resume,
         )
         if args.json:
-            print(json.dumps(result.to_dict(), indent=2))
+            print(json.dumps(case_run_result.to_dict(), indent=2))
         else:
-            print(f"Backend: {result.backend}")
-            print(f"Processes: {result.processes} (requested {result.requested_processes})")
-            print(f"File handler: {result.file_handler}")
-            print(f"Mode: {result.run_mode}")
-            print(f"Reused mesh: {'yes' if result.reused_mesh else 'no'}")
+            print(f"Backend: {case_run_result.backend}")
             print(
-                f"Resumed: {'yes, from time ' + _text_number(result.resume_from_time) if result.resumed else 'no'}"
+                f"Processes: {case_run_result.processes} "
+                f"(requested {case_run_result.requested_processes})"
             )
-            print(f"Return code: {result.returncode}")
-            print(f"Numerically qualified: {'yes' if result.trusted else 'no'}")
-            print(f"Log: {result.log_path}")
-            _print_budget_recommendation(result.budget_recommendation)
-            force_coeffs = result.report.get("forceCoeffs")
-            if force_coeffs:
+            print(f"File handler: {case_run_result.file_handler}")
+            print(f"Mode: {case_run_result.run_mode}")
+            print(f"Reused mesh: {'yes' if case_run_result.reused_mesh else 'no'}")
+            print(
+                "Resumed: "
+                f"{'yes, from time ' + _text_number(case_run_result.resume_from_time) if case_run_result.resumed else 'no'}"
+            )
+            print(f"Return code: {case_run_result.returncode}")
+            print(
+                "Numerically qualified: "
+                f"{'yes' if case_run_result.trusted else 'no'}"
+            )
+            print(f"Log: {case_run_result.log_path}")
+            _print_budget_recommendation(case_run_result.budget_recommendation)
+            force_coeffs = case_run_result.report.get("forceCoeffs")
+            if isinstance(force_coeffs, dict) and force_coeffs:
                 print(f"Mean Cd: {force_coeffs.get('meanCd')}")
                 print(f"Mean Cl: {force_coeffs.get('meanCl')}")
             else:
                 print("No force coefficient output found yet.")
-        return 0 if result.ok else 1
+        return 0 if case_run_result.ok else 1
 
     if args.command == "run-study":
-        result = run_study(
+        study_run_result = run_study(
             args.case,
             backend=args.backend,
             timeout_seconds=args.timeout_seconds,
@@ -1058,67 +1077,70 @@ def main(argv: list[str] | None = None) -> int:
             file_handler=args.file_handler,
         )
         if args.json:
-            print(json.dumps(result, indent=2))
+            print(json.dumps(study_run_result, indent=2))
         else:
-            plan = result.get("plan") if isinstance(result.get("plan"), dict) else {}
-            print(f"Study: {result.get('studyId')}")
-            print(f"Status: {result.get('status')}")
-            print(f"Backend: {plan.get('backend')}")
+            study_plan_value = study_run_result.get("plan")
+            study_plan = study_plan_value if isinstance(study_plan_value, dict) else {}
+            print(f"Study: {study_run_result.get('studyId')}")
+            print(f"Status: {study_run_result.get('status')}")
+            print(f"Backend: {study_plan.get('backend')}")
             print(
-                f"Allocation: {plan.get('maxConcurrentCases')} concurrent cases x "
-                f"{plan.get('processesPerCase')} processes "
-                f"(budget {plan.get('processBudget')})"
+                f"Allocation: {study_plan.get('maxConcurrentCases')} concurrent cases x "
+                f"{study_plan.get('processesPerCase')} processes "
+                f"(budget {study_plan.get('processBudget')})"
             )
-            if plan.get("memoryWarning"):
-                print(f"Memory warning: {plan.get('memoryWarning')}")
-            _print_budget_recommendation(result.get("budgetRecommendation"))
-            for member in result.get("results", []):
-                if isinstance(member, dict):
-                    status = "ok" if member.get("ok") else "failed"
-                    detail = member.get("error")
-                    print(
-                        f"- {member.get('casePath')}: {status}"
-                        + (f" ({detail})" if detail else "")
-                    )
-        return 0 if result.get("ok") else 1
+            if study_plan.get("memoryWarning"):
+                print(f"Memory warning: {study_plan.get('memoryWarning')}")
+            _print_budget_recommendation(study_run_result.get("budgetRecommendation"))
+            study_members = study_run_result.get("results")
+            if isinstance(study_members, list):
+                for study_member in study_members:
+                    if isinstance(study_member, dict):
+                        member_status = "ok" if study_member.get("ok") else "failed"
+                        member_detail = study_member.get("error")
+                        print(
+                            f"- {study_member.get('casePath')}: {member_status}"
+                            + (f" ({member_detail})" if member_detail else "")
+                        )
+        return 0 if study_run_result.get("ok") else 1
 
     if args.command == "report-case":
-        report = case_report(args.case)
+        case_report_payload = case_report(args.case)
         report_format = "json" if args.json else args.format
         if report_format == "json":
-            content = json.dumps(report, indent=2)
+            report_content = json.dumps(case_report_payload, indent=2)
         elif report_format == "markdown":
-            content = render_markdown(report)
+            report_content = render_markdown(case_report_payload)
         elif report_format == "html":
-            content = render_html(report)
+            report_content = render_html(case_report_payload)
         else:
-            content = _report_text(report)
+            report_content = _report_text(case_report_payload)
         if args.output:
-            args.output.write_text(content + "\n", encoding="utf-8")
+            args.output.write_text(report_content + "\n", encoding="utf-8")
             print(f"Report written to {args.output}")
         else:
-            print(content)
+            print(report_content)
         return 0
 
     if args.command == "compare-cases":
-        comparison = compare_cases(args.baseline, args.variant)
+        comparison_payload = compare_cases(args.baseline, args.variant)
         if args.format == "json":
-            content = json.dumps(comparison, indent=2)
+            comparison_content = json.dumps(comparison_payload, indent=2)
         elif args.format == "markdown":
-            content = render_comparison_markdown(comparison)
+            comparison_content = render_comparison_markdown(comparison_payload)
         elif args.format == "html":
-            content = render_comparison_html(comparison)
+            comparison_content = render_comparison_html(comparison_payload)
         else:
-            content = _comparison_text(comparison)
+            comparison_content = _comparison_text(comparison_payload)
         if args.output:
-            args.output.write_text(content + "\n", encoding="utf-8")
+            args.output.write_text(comparison_content + "\n", encoding="utf-8")
             print(f"Comparison written to {args.output}")
         else:
-            print(content)
-        return 0 if comparison.get("decisionSafe") else 2
+            print(comparison_content)
+        return 0 if comparison_payload.get("decisionSafe") else 2
 
     if args.command == "create-sensitivity-study":
-        study = create_sensitivity_study_from_case(
+        created_study = create_sensitivity_study_from_case(
             base_case_path=args.base_case,
             parameter=args.parameter,
             values=args.values,
@@ -1128,43 +1150,48 @@ def main(argv: list[str] | None = None) -> int:
             baseline_index=args.baseline_index,
         )
         if args.json:
-            print(json.dumps(study, indent=2))
+            print(json.dumps(created_study, indent=2))
         else:
-            print(f"Created sensitivity study: {study.get('studyId')}")
+            print(f"Created sensitivity study: {created_study.get('studyId')}")
             print(
-                f"Parameter: {study.get('parameterLabel')} ({study.get('unit')}) = "
-                f"{study.get('values')}"
+                f"Parameter: {created_study.get('parameterLabel')} "
+                f"({created_study.get('unit')}) = {created_study.get('values')}"
             )
-            for path in study.get("casePaths", []):
-                print(f"- {path}")
-            print(f"Selected baseline member: {study.get('selectedCasePath')}")
+            created_case_paths = created_study.get("casePaths")
+            if isinstance(created_case_paths, list):
+                for created_case_path in created_case_paths:
+                    print(f"- {created_case_path}")
+            print(
+                "Selected baseline member: "
+                f"{created_study.get('selectedCasePath')}"
+            )
         return 0
 
     if args.command == "report-sensitivity-study":
-        study = sensitivity_study_report(args.case)
-        if study is None:
+        sensitivity_report_payload = sensitivity_study_report(args.case)
+        if sensitivity_report_payload is None:
             print("The selected case is not part of a sensitivity study.", file=sys.stderr)
             return 2
         if args.format == "json":
-            content = json.dumps(study, indent=2)
+            sensitivity_content = json.dumps(sensitivity_report_payload, indent=2)
         elif args.format == "markdown":
-            content = render_sensitivity_markdown(study)
+            sensitivity_content = render_sensitivity_markdown(sensitivity_report_payload)
         elif args.format == "html":
-            content = render_sensitivity_html(study)
+            sensitivity_content = render_sensitivity_html(sensitivity_report_payload)
         else:
-            content = _sensitivity_text(study)
+            sensitivity_content = _sensitivity_text(sensitivity_report_payload)
         if args.output:
-            args.output.write_text(content + "\n", encoding="utf-8")
+            args.output.write_text(sensitivity_content + "\n", encoding="utf-8")
             print(f"Sensitivity report written to {args.output}")
         else:
-            print(content)
+            print(sensitivity_content)
         return 0
 
     if args.command == "benchmark":
         from .benchmarks import BENCHMARK_UNAVAILABLE_EXIT_CODE, run_benchmark
 
         try:
-            result = run_benchmark(
+            benchmark_result = run_benchmark(
                 args.benchmark_id,
                 output_dir=args.output_dir,
                 backend=args.backend,
@@ -1172,7 +1199,7 @@ def main(argv: list[str] | None = None) -> int:
                 prepare_only=args.prepare_only,
             )
         except Exception as exc:
-            result = {
+            benchmark_result = {
                 "benchmarkId": args.benchmark_id,
                 "status": "error",
                 "passed": False,
@@ -1180,34 +1207,43 @@ def main(argv: list[str] | None = None) -> int:
                 "error": {"type": type(exc).__name__, "message": str(exc)},
             }
             if args.json:
-                print(json.dumps(result, indent=2))
+                print(json.dumps(benchmark_result, indent=2))
             else:
                 print(f"Benchmark: {args.benchmark_id}", file=sys.stderr)
                 print("Status: error", file=sys.stderr)
                 print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
         if args.json:
-            print(json.dumps(result, indent=2))
+            print(json.dumps(benchmark_result, indent=2))
         else:
-            print(f"Benchmark: {result.get('benchmarkName')}")
-            print(f"Status: {result.get('status')}")
-            print(f"Real solver passed: {'yes' if result.get('passed') else 'no'}")
+            print(f"Benchmark: {benchmark_result.get('benchmarkName')}")
+            print(f"Status: {benchmark_result.get('status')}")
+            print(
+                "Real solver passed: "
+                f"{'yes' if benchmark_result.get('passed') else 'no'}"
+            )
             print(
                 "Absolute aerodynamic accuracy reference: "
-                f"{'yes' if result.get('absoluteAccuracyValidated') else 'no'}"
+                f"{'yes' if benchmark_result.get('absoluteAccuracyValidated') else 'no'}"
             )
-            print(f"Case: {result.get('casePath')}")
-            print(f"Result: {result.get('resultPath')}")
-            for check in result.get("checks", []):
-                if isinstance(check, dict):
-                    print(f"- {check.get('status')}: {check.get('label')} - {check.get('detail')}")
-        if result.get("status") == "prepared":
+            print(f"Case: {benchmark_result.get('casePath')}")
+            print(f"Result: {benchmark_result.get('resultPath')}")
+            benchmark_checks = benchmark_result.get("checks")
+            if isinstance(benchmark_checks, list):
+                for benchmark_check in benchmark_checks:
+                    if isinstance(benchmark_check, dict):
+                        print(
+                            f"- {benchmark_check.get('status')}: "
+                            f"{benchmark_check.get('label')} - "
+                            f"{benchmark_check.get('detail')}"
+                        )
+        if benchmark_result.get("status") == "prepared":
             return 0
-        if result.get("status") == "unavailable":
+        if benchmark_result.get("status") == "unavailable":
             return BENCHMARK_UNAVAILABLE_EXIT_CODE
-        if result.get("status") == "error":
+        if benchmark_result.get("status") == "error":
             return 2
-        return 0 if result.get("passed") else 1
+        return 0 if benchmark_result.get("passed") else 1
 
     parser.error(f"Unknown command: {args.command}")
     return 2

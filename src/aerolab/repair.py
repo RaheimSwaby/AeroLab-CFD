@@ -31,6 +31,9 @@ MAX_REPAIR_ADDED_SURFACE_DEVIATION_P95 = 0.004
 MAX_REPAIR_ADDED_SURFACE_FAR_FRACTION = 0.025
 REPAIR_ADDED_SURFACE_FAR_DISTANCE = 0.01
 
+_GridIndex = tuple[int, int, int]
+_FaceCorners = tuple[_GridIndex, _GridIndex, _GridIndex, _GridIndex]
+
 
 @dataclass(frozen=True)
 class RepairResult:
@@ -828,9 +831,12 @@ def repair_fidelity_for_model(model_path: Path) -> dict[str, object] | None:
 
 
 def _metadata_percent_at_most(payload: dict[str, object], key: str, relative_limit: float) -> bool:
+    value = payload.get(key)
+    if not isinstance(value, (int, float, str)):
+        return False
     try:
-        return float(payload[key]) <= relative_limit * 100.0 + 1e-12
-    except (KeyError, TypeError, ValueError):
+        return float(value) <= relative_limit * 100.0 + 1e-12
+    except ValueError:
         return False
 
 
@@ -1263,7 +1269,7 @@ def _remove_edge_contacts(solid: np.ndarray) -> np.ndarray:
 
 
 def _write_voxel_surface(path: Path, solid: np.ndarray, origin: np.ndarray, voxel_size: float) -> None:
-    face_specs = (
+    face_specs: tuple[tuple[int, int, _FaceCorners], ...] = (
         (0, -1, ((0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0))),
         (0, 1, ((1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1))),
         (1, -1, ((0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1))),
@@ -1271,8 +1277,8 @@ def _write_voxel_surface(path: Path, solid: np.ndarray, origin: np.ndarray, voxe
         (2, -1, ((0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0))),
         (2, 1, ((0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))),
     )
-    exposed_faces: list[tuple[np.ndarray, tuple[tuple[int, int, int], ...]]] = []
-    for axis, direction, corners in face_specs:
+    exposed_faces: list[tuple[np.ndarray, _FaceCorners]] = []
+    for axis, direction, face_corners in face_specs:
         neighbor = np.zeros_like(solid)
         current_slice = [slice(None), slice(None), slice(None)]
         neighbor_slice = [slice(None), slice(None), slice(None)]
@@ -1284,16 +1290,20 @@ def _write_voxel_surface(path: Path, solid: np.ndarray, origin: np.ndarray, voxe
             neighbor_slice[axis] = slice(1, None)
         neighbor[tuple(current_slice)] = solid[tuple(neighbor_slice)]
         indices = np.argwhere(solid & ~neighbor)
-        exposed_faces.append((indices, corners))
+        exposed_faces.append((indices, face_corners))
 
-    vertex_ids: dict[tuple[int, int, int], int] = {}
-    grid_vertices: list[tuple[int, int, int]] = []
+    vertex_ids: dict[_GridIndex, int] = {}
+    grid_vertices: list[_GridIndex] = []
     faces: list[tuple[int, int, int]] = []
-    for indices, corners in exposed_faces:
+    for indices, face_corners in exposed_faces:
         for index in indices:
             quad: list[int] = []
-            for corner in corners:
-                key = tuple(int(index[axis]) + corner[axis] for axis in range(3))
+            for corner in face_corners:
+                key: _GridIndex = (
+                    int(index[0]) + corner[0],
+                    int(index[1]) + corner[1],
+                    int(index[2]) + corner[2],
+                )
                 vertex_id = vertex_ids.get(key)
                 if vertex_id is None:
                     vertex_id = len(grid_vertices)
@@ -1310,9 +1320,25 @@ def _write_voxel_surface(path: Path, solid: np.ndarray, origin: np.ndarray, voxe
         header = b"AeroLab sealed voxel shell"[:80].ljust(80, b" ")
         stream.write(header)
         stream.write(struct.pack("<I", len(faces)))
-        for face in faces:
-            triangle = tuple(tuple(float(value) for value in vertices[index]) for index in face)
-            _write_binary_triangle(stream, triangle)  # type: ignore[arg-type]
+        for first, second, third in faces:
+            triangle: Triangle = (
+                (
+                    float(vertices[first, 0]),
+                    float(vertices[first, 1]),
+                    float(vertices[first, 2]),
+                ),
+                (
+                    float(vertices[second, 0]),
+                    float(vertices[second, 1]),
+                    float(vertices[second, 2]),
+                ),
+                (
+                    float(vertices[third, 0]),
+                    float(vertices[third, 1]),
+                    float(vertices[third, 2]),
+                ),
+            )
+            _write_binary_triangle(stream, triangle)
 
 
 def _taubin_smooth(

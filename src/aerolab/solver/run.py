@@ -10,6 +10,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -18,7 +19,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, TextIO
+from typing import BinaryIO, Literal, TextIO, TypedDict
 
 from ..openfoam import QUALITY_PRESETS, configure_decomposition, ensure_case_postprocessing
 from .analysis import (
@@ -51,6 +52,29 @@ AUTO_CELLS_PER_PROCESS = 250_000
 QUALITY_ESTIMATED_BYTES_PER_CELL = 2048
 QUALITY_FIXED_MEMORY_BYTES = 2 * 1024**3
 SAFE_CELL_BUDGET_ROUNDING = 50_000
+
+
+class _PopenOptions(TypedDict, total=False):
+    start_new_session: bool
+    creationflags: int
+
+
+def _integer_value(value: object, label: str) -> int:
+    """Return an integer from trusted numeric metadata after validating its shape."""
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be an integer.")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
+        raise ValueError(f"{label} must be an integer.")
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    raise ValueError(f"{label} must be an integer.")
 
 
 class SolverRunCancelled(RuntimeError):
@@ -241,17 +265,17 @@ def _case_execution_lock(case_path: Path) -> Iterator[None]:
         handle = os.fdopen(descriptor, "r+b", buffering=0)
         descriptor = -1
         try:
-            if os.name == "posix":
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            elif os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
 
                 if lock_stat.st_size == 0:
                     handle.write(b"\0")
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            elif os.name == "posix":
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             else:
                 raise RuntimeError(
                     f"Case run locking is unsupported on operating system {os.name!r}."
@@ -268,15 +292,15 @@ def _case_execution_lock(case_path: Path) -> Iterator[None]:
         if handle is not None:
             if acquired:
                 try:
-                    if os.name == "posix":
-                        import fcntl
-
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                    elif os.name == "nt":
+                    if sys.platform == "win32":
                         import msvcrt
 
                         handle.seek(0)
                         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    elif os.name == "posix":
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 except OSError:
                     pass
             handle.close()
@@ -321,8 +345,14 @@ def _suggested_quality(safe_cell_budget: int | None) -> str | None:
         (
             (
                 max(
-                    int(preset["max_global_cells"]),
-                    int(preset.get("adaptive_max_global_cells", 0)),
+                    _integer_value(
+                        preset["max_global_cells"],
+                        f"{name} maximum global cells",
+                    ),
+                    _integer_value(
+                        preset.get("adaptive_max_global_cells", 0),
+                        f"{name} adaptive maximum global cells",
+                    ),
                 ),
                 name,
             )
@@ -553,7 +583,7 @@ def _failure_budget_recommendation(
     return None
 
 
-def normalize_process_request(value: object) -> str | int:
+def normalize_process_request(value: object) -> Literal["auto"] | int:
     """Normalize an OpenFOAM process request to ``auto`` or a positive integer."""
     if isinstance(value, bool):
         raise ValueError("Processes must be 'auto' or a positive integer.")
@@ -750,7 +780,10 @@ def _resolve_processes(
             + (f"; missing: {missing}." if missing else ".")
         )
 
-    effective_cpus = max(1, int(resources.get("effectiveCpus") or 1))
+    effective_cpus = max(
+        1,
+        _integer_value(resources.get("effectiveCpus") or 1, "Effective CPU count"),
+    )
     memory_available_value = resources.get("memoryAvailableBytes")
     memory_available = (
         int(memory_available_value)
@@ -1310,7 +1343,7 @@ def _run_solver_process(
     termination_grace_seconds: float = 30.0,
     cancellation_controller: SolverRunController | None = None,
 ) -> tuple[int, bool]:
-    process_options: dict[str, object] = {}
+    process_options: _PopenOptions = {}
     if os.name == "posix":
         process_options["start_new_session"] = True
     elif os.name == "nt":

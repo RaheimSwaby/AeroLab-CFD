@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from .. import __version__
 from ..case import create_case
@@ -22,6 +22,12 @@ DEFAULT_BENCHMARK_ID = "cube-symmetry-v1"
 BENCHMARK_UNAVAILABLE_EXIT_CODE = 3
 _BENCHMARK_IDS = (DEFAULT_BENCHMARK_ID,)
 _INFRASTRUCTURE_RETURN_CODES = {90, 91, 92, 96, 97, 125, 126, 127}
+
+
+class BenchmarkEvaluation(TypedDict):
+    checks: list[dict[str, object]]
+    metrics: dict[str, float | None]
+    qualification: dict[str, object]
 
 
 def available_benchmarks() -> tuple[str, ...]:
@@ -259,7 +265,7 @@ def run_benchmark(
                     f"{'yes' if toolchain_verified else 'no'}, executable "
                     f"{identity.get('executable') or 'unknown'}, executable SHA-256 "
                     f"{executable_hash or 'unknown'}, and image ID "
-                    f"{identity.get('imageId') or 'not applicable/unavailable'}.",
+                    f"{identity.get('imageId') or 'not applicable/unavailable'}."
                 ),
             ),
         )
@@ -344,7 +350,7 @@ def run_benchmark(
 def evaluate_benchmark(
     manifest: dict[str, object],
     run_payload: dict[str, object],
-) -> dict[str, object]:
+) -> BenchmarkEvaluation:
     report = run_payload.get("report")
     if not isinstance(report, dict):
         report = {}
@@ -673,6 +679,13 @@ def _finite_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _metric_limit(specification: dict[str, object], key: str) -> float:
+    value = specification[key]
+    if not isinstance(value, str | int | float):
+        raise ValueError(f"Benchmark metric {key} must be numeric.")
+    return float(value)
+
+
 def _metric_passes(
     value: float | None,
     specification: dict[str, object],
@@ -680,15 +693,15 @@ def _metric_passes(
     expectations: list[str] = []
     passed = value is not None
     if "minimum" in specification:
-        minimum = float(specification["minimum"])
+        minimum = _metric_limit(specification, "minimum")
         expectations.append(f">= {minimum:.9g}")
         passed = passed and value is not None and value >= minimum
     if "maximum" in specification:
-        maximum = float(specification["maximum"])
+        maximum = _metric_limit(specification, "maximum")
         expectations.append(f"<= {maximum:.9g}")
         passed = passed and value is not None and value <= maximum
     if "absoluteMaximum" in specification:
-        maximum = float(specification["absoluteMaximum"])
+        maximum = _metric_limit(specification, "absoluteMaximum")
         expectations.append(f"absolute value <= {maximum:.9g}")
         passed = passed and value is not None and abs(value) <= maximum
     if not expectations:

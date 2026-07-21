@@ -11,6 +11,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TypedDict
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .case import create_case
@@ -36,6 +37,119 @@ from .solver import (
     study_members,
 )
 from .stl import detect_aero_features, inspect_stl, mesh_preview
+
+
+class _RequiredCaseOptions(TypedDict):
+    model_path: Path
+    speed_mph: float
+    air_temperature_c: float | None
+    air_pressure_pa: float | None
+    air_density_kg_m3: float | None
+    kinematic_viscosity_m2_s: float | None
+    turbulence_intensity_percent: float | None
+    turbulence_length_scale_m: float | None
+    yaw_degrees: float | None
+    crosswind_mps: float | None
+    roughness_height_m: float
+    roughness_constant: float
+    closed_tunnel: dict[str, object] | None
+    backflow_safe_outlet: bool
+    wheel_setup: list[dict[str, object]] | None
+    second_order_transient: bool
+    fluid_profile: str
+    turbulence_model: str
+    porous_zones: list[dict[str, object]] | None
+    fan_zones: list[dict[str, object]] | None
+    heat_zones: list[dict[str, object]] | None
+    flow_axis: str
+    include_ground: bool
+    moving_ground: bool
+    ground_clearance_m: float
+    unit_scale: float
+    unit_label: str
+    reference_area_m2: float | None
+    reference_length_m: float | None
+    center_of_gravity_m: tuple[float, float, float] | None
+    front_axle_station_m: float | None
+    rear_axle_station_m: float | None
+    measured_length_m: float | None
+    measured_width_m: float | None
+    measured_height_m: float | None
+    smallest_aero_feature_m: float | None
+    quality: str
+    simulation_mode: str
+    source_flow_direction: str
+    source_up_direction: str
+    model_rotation_degrees: tuple[float, float, float]
+
+
+class _CaseOptions(_RequiredCaseOptions, total=False):
+    validation_study: dict[str, object]
+
+
+def _object_mapping(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object.")
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise ValueError(f"{label} must use string keys.")
+        result[key] = item
+    return result
+
+
+def _float_value(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{label} must be a number.")
+    try:
+        number = float(value)
+    except ValueError:
+        raise ValueError(f"{label} must be a number.") from None
+    if not math.isfinite(number):
+        raise ValueError(f"{label} must be a finite number.")
+    return number
+
+
+def _int_value(value: object, label: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be an integer.")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
+        raise ValueError(f"{label} must be an integer.")
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    raise ValueError(f"{label} must be an integer.")
+
+
+def _study_member_paths(descriptor: dict[str, object]) -> list[Path]:
+    raw_paths = descriptor.get("casePaths")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raise ValueError("The study descriptor does not contain any case paths.")
+    paths: list[Path] = []
+    for value in raw_paths:
+        if not isinstance(value, str) or not value:
+            raise ValueError("The study descriptor contains an invalid case path.")
+        paths.append(Path(value).resolve())
+    return paths
+
+
+def _study_id(descriptor: dict[str, object]) -> str:
+    value = descriptor.get("studyId")
+    if not isinstance(value, str) or not value:
+        raise ValueError("The study descriptor does not contain a study ID.")
+    return value
+
+
+def _optional_object_mapping(value: object, label: str) -> dict[str, object] | None:
+    if value in (None, ""):
+        return None
+    return _object_mapping(value, label)
 
 
 class AeroLabServer(ThreadingHTTPServer):
@@ -76,11 +190,14 @@ class AeroLabServer(ThreadingHTTPServer):
 
     def _ensure_case_not_orphaned(self, case_path: Path) -> None:
         try:
-            run_record = json.loads(
+            loaded_record: object = json.loads(
                 (case_path / "aerolab-run.json").read_text(encoding="utf-8")
             )
         except (OSError, json.JSONDecodeError):
             return
+        if not isinstance(loaded_record, dict):
+            return
+        run_record = _object_mapping(loaded_record, "The case run record")
         if run_record.get("status") in {"running", "stopping", "orphaned"}:
             raise RuntimeError(
                 "This case has an unreconciled run from another server session. "
@@ -196,7 +313,8 @@ class AeroLabServer(ThreadingHTTPServer):
         file_handler: str,
     ) -> dict[str, object]:
         descriptor = study_members(case_path)
-        member_paths = [Path(str(value)).resolve() for value in descriptor["casePaths"]]
+        member_paths = _study_member_paths(descriptor)
+        study_id = _study_id(descriptor)
         with self.active_runs_lock:
             conflicts = [
                 path.name
@@ -238,7 +356,7 @@ class AeroLabServer(ThreadingHTTPServer):
                         file_handler,
                         controller,
                     ),
-                    name=f"aerolab-study-{descriptor['studyId']}",
+                    name=f"aerolab-study-{study_id}",
                     daemon=True,
                 )
                 for path in member_paths:
@@ -651,18 +769,21 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         if not (case_path / "case.json").is_file():
             raise ValueError("The selected folder is not an AeroLab case.")
         record_path = case_path / "aerolab-study-run.json"
+        record: dict[str, object] | None
         try:
-            record = json.loads(record_path.read_text(encoding="utf-8"))
+            loaded_record: object = json.loads(record_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             record = None
         except json.JSONDecodeError as exc:
             raise ValueError("The study run record is not valid JSON.") from exc
+        else:
+            record = _object_mapping(loaded_record, "The study run record")
         self._send_json({"ok": True, "exists": record is not None, "studyRun": record})
 
     def _handle_repair_model(self) -> None:
         payload = self._json_body()
         model_path = self._resolve_project_path(str(payload["modelPath"]))
-        resolution = int(payload.get("resolution") or 384)
+        resolution = _int_value(payload.get("resolution") or 384, "Repair resolution")
         smallest_feature_m = _optional_float(payload.get("smallestFeatureM"))
         unit_scale = _optional_float(payload.get("unitScale"))
         smallest_feature_source_units = (
@@ -696,7 +817,7 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         rotation = _model_rotation(payload.get("modelRotationDegrees"))
         result = detect_aero_features(
             model_path,
-            scale=float(payload.get("unitScale") or 1.0),
+            scale=_float_value(payload.get("unitScale") or 1.0, "Unit scale"),
             source_flow_direction=str(payload.get("sourceFlowDirection") or "+x"),
             source_up_direction=str(payload.get("sourceUpDirection") or "+z"),
             rotation_degrees=rotation,
@@ -735,7 +856,7 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         study_id = f"grid-{stamp}"
         case_paths: list[Path] = []
         for level in ("draft", "standard", "fine"):
-            level_options = dict(options)
+            level_options = options.copy()
             level_options["quality"] = level
             level_options["validation_study"] = {
                 "id": study_id,
@@ -776,11 +897,18 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         raw_values = payload.get("sensitivityValues")
         if not isinstance(raw_values, list):
             raise ValueError("Sensitivity values must be a JSON list of two to twelve numbers.")
-        values = [float(value) for value in raw_values]
+        values = [
+            _float_value(value, f"Sensitivity value {index}")
+            for index, value in enumerate(raw_values, start=1)
+        ]
         raw_baseline = payload.get("sensitivityBaselineIndex")
-        baseline_index = None if raw_baseline in (None, "") else int(raw_baseline)
+        baseline_index = (
+            None
+            if raw_baseline in (None, "")
+            else _int_value(raw_baseline, "Sensitivity baseline index")
+        )
         study = create_sensitivity_study(
-            base_options=options,
+            base_options=dict(options),
             base_name=base_name,
             cases_dir=self.server.root / "cases",
             parameter=parameter,
@@ -832,10 +960,10 @@ class AeroLabHandler(BaseHTTPRequestHandler):
             zones.append(dict(item))
         return zones
 
-    def _case_options(self, payload: dict[str, object]) -> dict[str, object]:
+    def _case_options(self, payload: dict[str, object]) -> _CaseOptions:
         return {
             "model_path": self._resolve_project_path(str(payload["modelPath"])),
-            "speed_mph": float(payload.get("speedMph") or 70),
+            "speed_mph": _float_value(payload.get("speedMph") or 70, "Air speed"),
             "air_temperature_c": _optional_finite_float(
                 payload.get("airTemperatureC"),
                 "Air temperature",
@@ -873,7 +1001,10 @@ class AeroLabHandler(BaseHTTPRequestHandler):
                 _optional_finite_float(payload.get("roughnessConstant"), "Roughness constant")
                 or 0.5
             ),
-            "closed_tunnel": payload.get("closedTunnel"),
+            "closed_tunnel": _optional_object_mapping(
+                payload.get("closedTunnel"),
+                "Closed-tunnel configuration",
+            ),
             "backflow_safe_outlet": bool(payload.get("backflowSafeOutlet")),
             "wheel_setup": self._wheel_setup_options(payload.get("wheelSetup")),
             "second_order_transient": bool(payload.get("secondOrderTransient")),
@@ -898,7 +1029,7 @@ class AeroLabHandler(BaseHTTPRequestHandler):
                 payload.get("groundClearanceM"),
                 "Ground clearance",
             ),
-            "unit_scale": float(payload.get("unitScale") or 1.0),
+            "unit_scale": _float_value(payload.get("unitScale") or 1.0, "Unit scale"),
             "unit_label": str(payload.get("unitLabel") or "m"),
             "reference_area_m2": _optional_float(payload.get("referenceAreaM2")),
             "reference_length_m": _optional_float(payload.get("referenceLengthM")),
@@ -928,7 +1059,10 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         backend = str(payload.get("backend") or "auto")
         run_mode = str(payload.get("mode") or "full")
         default_timeout = 14400 if run_mode == "mesh" else 21600
-        timeout_seconds = int(payload.get("timeoutSeconds") or default_timeout)
+        timeout_seconds = _int_value(
+            payload.get("timeoutSeconds") or default_timeout,
+            "Run timeout",
+        )
         reuse_mesh = payload.get("reuseMesh") is not False
         processes = normalize_process_request(payload.get("processes", "auto"))
         file_handler = normalize_file_handler(payload.get("fileHandler", "auto"))
@@ -966,7 +1100,10 @@ class AeroLabHandler(BaseHTTPRequestHandler):
         backend = str(payload.get("backend") or "auto")
         run_mode = str(payload.get("mode") or "full")
         default_timeout = 14400 if run_mode == "mesh" else 21600
-        timeout_seconds = int(payload.get("timeoutSeconds") or default_timeout)
+        timeout_seconds = _int_value(
+            payload.get("timeoutSeconds") or default_timeout,
+            "Run timeout",
+        )
         reuse_mesh = payload.get("reuseMesh") is not False
         processes = normalize_process_request(payload.get("processes", "auto"))
         process_budget = normalize_study_process_budget(
@@ -1131,7 +1268,7 @@ def _related_case_paths(case_path: Path) -> list[Path]:
     if not any(isinstance(value, dict) and value.get("id") for value in study_values):
         return [case_path]
     descriptor = study_members(case_path)
-    related_paths = [Path(str(value)).resolve() for value in descriptor["casePaths"]]
+    related_paths = _study_member_paths(descriptor)
     cases_root = case_path.parent.resolve()
     for related_path in related_paths:
         case_json_path = related_path / "case.json"
@@ -1295,7 +1432,7 @@ def _safe_case_name(value: str) -> str:
 def _optional_float(value: object) -> float | None:
     if value in (None, ""):
         return None
-    number = float(value)
+    number = _float_value(value, "Reference value")
     if number <= 0:
         raise ValueError("Reference values must be positive.")
     return number
@@ -1311,10 +1448,7 @@ def _optional_positive_float(value: object, label: str) -> float | None:
 def _optional_finite_float(value: object, label: str) -> float | None:
     if value in (None, ""):
         return None
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"{label} must be a finite number.")
-    return number
+    return _float_value(value, label)
 
 
 def _optional_vector(value: object, label: str) -> tuple[float, float, float] | None:
@@ -1328,17 +1462,20 @@ def _optional_vector(value: object, label: str) -> tuple[float, float, float] | 
         return None
     if provided != 3:
         raise ValueError(f"{label} requires X, Y, and Z coordinates together.")
-    return tuple(
-        float(_optional_finite_float(component, f"{label} {axis.upper()}"))
-        for axis, component in zip(("x", "y", "z"), raw)
-    )  # type: ignore[return-value]
+    components: list[float] = []
+    for axis, component in zip(("x", "y", "z"), raw):
+        number = _optional_finite_float(component, f"{label} {axis.upper()}")
+        if number is None:
+            raise ValueError(f"{label} requires X, Y, and Z coordinates together.")
+        components.append(number)
+    return (components[0], components[1], components[2])
 
 
 def _nonnegative_float(value: object, label: str) -> float:
     if value in (None, ""):
         return 0.0
-    number = float(value)
-    if not math.isfinite(number) or number < 0:
+    number = _float_value(value, label)
+    if number < 0:
         raise ValueError(f"{label} must be a non-negative number.")
     return number
 
@@ -1378,9 +1515,9 @@ def _report_payload(model_path: Path, report: object) -> dict[str, object]:
                 "label": "Repair fidelity",
                 "status": "pass",
                 "detail": (
-                    f"Recorded cell detail {float(fidelity.get('detailResolutionPercent') or 0):.3g}%; "
-                    f"source p99 {float(fidelity.get('sourceSurfaceDeviationP99Percent') or 0):.3g}%; "
-                    f"far sealing area {float(fidelity.get('addedSurfaceFarFractionPercent') or 0):.3g}%."
+                    f"Recorded cell detail {_float_value(fidelity.get('detailResolutionPercent') or 0, 'Detail resolution'):.3g}%; "
+                    f"source p99 {_float_value(fidelity.get('sourceSurfaceDeviationP99Percent') or 0, 'Source surface deviation p99'):.3g}%; "
+                    f"far sealing area {_float_value(fidelity.get('addedSurfaceFarFractionPercent') or 0, 'Added surface far fraction'):.3g}%."
                 ),
             }
         )

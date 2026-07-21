@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import SupportsFloat, SupportsIndex, TypeGuard, TypedDict
 
 from .openfoam import (
     estimate_reference_area,
@@ -17,6 +19,8 @@ from .openfoam import (
 from .repair import is_prepared_model_path, repair_fidelity_for_model
 from .stl import (
     Bounds,
+    StlReport,
+    Vector,
     inspect_stl,
     transform_direction,
     transform_point,
@@ -45,6 +49,171 @@ TURBULENCE_MODELS = {
     "SpalartAllmarasDES",
     "SpalartAllmarasIDDES",
 }
+
+
+class VectorMapping(TypedDict):
+    x: float
+    y: float
+    z: float
+
+
+class AirProperties(TypedDict):
+    model: str
+    property_source: str
+    temperature_c: float
+    temperature_k: float
+    pressure_pa: float
+    density_kg_m3: float
+    dynamic_viscosity_pa_s: float
+    kinematic_viscosity_m2_s: float
+    speed_of_sound_mps: float
+
+
+class InflowMetadata(TypedDict):
+    yaw_degrees: float
+    crosswind_mps: float
+    primary_speed_mps: float
+    flow_vector_mps: VectorMapping
+    primary_direction: VectorMapping
+    crosswind_direction: VectorMapping
+    yaw_convention: str
+    speed_definition: str
+    yaw_crosswind_source: str
+    applied_to_solver: bool
+
+
+class PhysicalInflowMetadata(InflowMetadata):
+    turbulence_intensity: float
+    turbulence_intensity_percent: float
+    turbulence_intensity_source: str
+    turbulence_length_scale_m: float
+    turbulence_length_scale_source: str
+
+
+class WheelMetadata(TypedDict):
+    name: str
+    patch: str
+    model_path: str
+    source_center: VectorMapping
+    source_axis: VectorMapping
+    source_radius: float
+    center_m: VectorMapping
+    axis: VectorMapping
+    radius_m: float
+    surface_speed_mps: float
+    omega_rad_s: float
+    rotation_direction_source: str
+
+
+class WheelSetupMetadata(TypedDict):
+    enabled: bool
+    moving_ground: bool
+    coordinate_contract: str
+    body_rotation_center_source: VectorMapping
+    patch_names: list[str]
+    wheels: list[WheelMetadata]
+    applied_to_solver: bool
+
+
+class PorousZoneMetadata(TypedDict):
+    name: str
+    cell_zone: str
+    face_zone: str
+    minimum_m: VectorMapping
+    maximum_m: VectorMapping
+    darcy_d_per_m2: VectorMapping
+    forchheimer_f_per_m: VectorMapping
+    coordinate_system: str
+
+
+class FanZoneMetadata(TypedDict):
+    name: str
+    cell_zone: str
+    face_zone: str
+    minimum_m: VectorMapping
+    maximum_m: VectorMapping
+    disk_direction: VectorMapping
+    power_coefficient: float
+    thrust_coefficient: float
+    disk_area_m2: float
+    upstream_point_m: VectorMapping
+
+
+class HeatZoneMetadata(TypedDict):
+    name: str
+    shape: str
+    component: str
+    cell_zone: str
+    face_zone: str
+    minimum_m: VectorMapping
+    maximum_m: VectorMapping
+    power_w: float
+    source_model: str
+    power_mode: str
+    coordinate_system: str
+
+
+class VolumeZonesBase(TypedDict):
+    enabled: bool
+    coordinate_frame: str
+    porous_zones: list[PorousZoneMetadata]
+    fan_zones: list[FanZoneMetadata]
+    zone_names: list[str]
+    applied_to_solver: bool
+
+
+class VolumeZonesMetadata(VolumeZonesBase, total=False):
+    heat_zones: list[HeatZoneMetadata]
+
+
+class PhysicalModelBase(TypedDict):
+    schema_version: int
+    fluid: dict[str, object]
+    inflow: PhysicalInflowMetadata
+    surface: dict[str, object]
+    domain: dict[str, object]
+    outlet: dict[str, object]
+    road_and_wheels: WheelSetupMetadata
+    transient: dict[str, object]
+
+
+class PhysicalModelMetadata(PhysicalModelBase, total=False):
+    turbulence: dict[str, object]
+    volume_zones: VolumeZonesMetadata
+    thermal: dict[str, object]
+
+
+class VehicleDatumsMetadata(TypedDict):
+    schema_version: int
+    coordinate_system: str
+    flow_axis: str
+    center_of_gravity_m: VectorMapping | None
+    moment_reference_m: VectorMapping
+    moment_reference_source: str
+    front_axle_station_m: float | None
+    rear_axle_station_m: float | None
+    axle_station_axis: str
+    wheelbase_m: float | None
+    balance_qualified: bool
+    qualification_detail: str
+
+
+class GeometryCheckMetadata(TypedDict):
+    label: str
+    status: str
+    actual_m: float
+    measured_m: float | None
+    error_percent: float | None
+    detail: str
+
+
+class GeometryValidationMetadata(TypedDict):
+    status: str
+    verified: bool
+    tolerance_percent: float
+    actual_dimensions_m: dict[str, float]
+    measured_dimensions_m: dict[str, float | None]
+    checks: list[GeometryCheckMetadata]
 
 
 def create_case(
@@ -196,18 +365,12 @@ def create_case(
     )
     vehicle_datums = normalize_vehicle_datums(
         flow_axis=flow_axis,
-        bounds_center=tuple(
-            (minimum + maximum) / 2.0
-            for minimum, maximum in zip(report.bounds.minimum, report.bounds.maximum)
-        ),
+        bounds_center=_bounds_center(report.bounds),
         center_of_gravity_m=center_of_gravity_m,
         front_axle_station_m=front_axle_station_m,
         rear_axle_station_m=rear_axle_station_m,
     )
-    body_rotation_center_source = tuple(
-        (minimum + maximum) / 2.0
-        for minimum, maximum in zip(raw_report.bounds.minimum, raw_report.bounds.maximum)
-    )
+    body_rotation_center_source = _bounds_center(raw_report.bounds)
     physical_model = _physical_model_metadata(
         air=air,
         reference_length_m=effective_reference_length,
@@ -273,7 +436,7 @@ def create_case(
         )
     case_path.mkdir(parents=True, exist_ok=True)
 
-    case = {
+    case: dict[str, object] = {
         "schema_version": CASE_SCHEMA_VERSION,
         "name": case_name,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -431,7 +594,7 @@ def _air_properties(
     pressure_pa: float | None,
     density_kg_m3: float | None,
     kinematic_viscosity_m2_s: float | None,
-) -> dict[str, object]:
+) -> AirProperties:
     temperature_was_set = temperature_c is not None
     pressure_was_set = pressure_pa is not None
     temperature_c = STANDARD_AIR_TEMPERATURE_C if temperature_c is None else float(temperature_c)
@@ -497,7 +660,7 @@ def _air_properties(
 
 def _physical_model_metadata(
     *,
-    air: dict[str, object],
+    air: AirProperties,
     reference_length_m: float,
     reference_area_m2: float,
     bounds: Bounds,
@@ -528,7 +691,7 @@ def _physical_model_metadata(
     model_rotation_degrees: tuple[float, float, float],
     model_translation_m: tuple[float, float, float],
     body_rotation_center_source: tuple[float, float, float],
-) -> dict[str, object]:
+) -> PhysicalModelMetadata:
     intensity_percent = 1.0 if turbulence_intensity_percent is None else float(turbulence_intensity_percent)
     if not math.isfinite(intensity_percent) or not 0 < intensity_percent <= 50:
         raise ValueError("Turbulence intensity must be greater than 0 and no more than 50 percent.")
@@ -602,12 +765,7 @@ def _physical_model_metadata(
             *(str(name) for name in wheels["patch_names"]),
         },
     )
-    heat_zone_values = volume_zones.get("heat_zones")
-    normalized_heat_zones = (
-        [zone for zone in heat_zone_values if isinstance(zone, dict)]
-        if isinstance(heat_zone_values, list)
-        else []
-    )
+    normalized_heat_zones = volume_zones.get("heat_zones", [])
     if normalized_heat_zones and fluid_profile != "compressible_thermal":
         raise ValueError(
             "Heat-load zones require the compressible_thermal fluid profile so OpenFOAM solves the energy equation."
@@ -631,21 +789,22 @@ def _physical_model_metadata(
             }
         )
 
-    result: dict[str, object] = {
+    physical_inflow: PhysicalInflowMetadata = {
+        **inflow,
+        "turbulence_intensity": intensity_percent / 100.0,
+        "turbulence_intensity_percent": intensity_percent,
+        "turbulence_intensity_source": (
+            "manual" if turbulence_intensity_percent is not None else "default_1_percent"
+        ),
+        "turbulence_length_scale_m": length_scale,
+        "turbulence_length_scale_source": (
+            "manual" if turbulence_length_scale_m is not None else "default_7_percent_reference_length"
+        ),
+    }
+    result: PhysicalModelMetadata = {
         "schema_version": PHYSICAL_MODEL_SCHEMA_VERSION,
         "fluid": fluid_metadata,
-        "inflow": {
-            **inflow,
-            "turbulence_intensity": intensity_percent / 100.0,
-            "turbulence_intensity_percent": intensity_percent,
-            "turbulence_intensity_source": (
-                "manual" if turbulence_intensity_percent is not None else "default_1_percent"
-            ),
-            "turbulence_length_scale_m": length_scale,
-            "turbulence_length_scale_source": (
-                "manual" if turbulence_length_scale_m is not None else "default_7_percent_reference_length"
-            ),
-        },
+        "inflow": physical_inflow,
         "surface": {
             "roughness_model": "nutkRoughWallFunction" if roughness_height > 0 else "smooth",
             "roughness_height_m": roughness_height,
@@ -700,7 +859,7 @@ def _physical_model_metadata(
             "model": "direct_air_volumetric_heat_source",
             "source_type": "heatSource",
             "power_mode": "total",
-            "total_power_w": sum(float(zone["power_w"]) for zone in normalized_heat_zones),
+            "total_power_w": sum(zone["power_w"] for zone in normalized_heat_zones),
             "temperature_field": "T",
             "component_temperatures_solved": False,
             "applied_to_solver": True,
@@ -744,10 +903,10 @@ def _normalize_volume_zones(
     fan_zones: list[dict[str, object]] | None,
     heat_zones: list[dict[str, object]] | None,
     reserved_names: set[str],
-) -> dict[str, object]:
-    normalized_porous: list[dict[str, object]] = []
-    normalized_fans: list[dict[str, object]] = []
-    normalized_heat: list[dict[str, object]] = []
+) -> VolumeZonesMetadata:
+    normalized_porous: list[PorousZoneMetadata] = []
+    normalized_fans: list[FanZoneMetadata] = []
+    normalized_heat: list[HeatZoneMetadata] = []
     names = set(reserved_names)
 
     for index, value in enumerate(_zone_list(porous_zones, "Porous zones"), start=1):
@@ -862,11 +1021,11 @@ def _normalize_volume_zones(
         )
 
     zone_names = [
-        *(str(zone["name"]) for zone in normalized_porous),
-        *(str(zone["name"]) for zone in normalized_fans),
-        *(str(zone["name"]) for zone in normalized_heat),
+        *(zone["name"] for zone in normalized_porous),
+        *(zone["name"] for zone in normalized_fans),
+        *(zone["name"] for zone in normalized_heat),
     ]
-    result: dict[str, object] = {
+    result: VolumeZonesMetadata = {
         "enabled": bool(zone_names),
         "coordinate_frame": "explicit_solver_coordinates_m",
         "porous_zones": normalized_porous,
@@ -948,9 +1107,22 @@ def _resistance_vector(
     return vector
 
 
+def _float_value(value: object) -> float:
+    if not isinstance(
+        value,
+        (str, bytes, bytearray, memoryview, SupportsFloat, SupportsIndex),
+    ):
+        raise TypeError(f"Expected a numeric value, got {type(value).__name__}.")
+    return float(value)
+
+
+def _is_object_iterable(value: object) -> TypeGuard[Iterable[object]]:
+    return isinstance(value, Iterable)
+
+
 def _finite_zone_number(value: object, label: str) -> float:
     try:
-        number = float(value)
+        number = _float_value(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} must be a finite number.") from exc
     if not math.isfinite(number):
@@ -963,7 +1135,7 @@ def _normalize_inflow(
     flow_axis: str,
     yaw_degrees: float | None,
     crosswind_mps: float | None,
-) -> dict[str, object]:
+) -> InflowMetadata:
     speed = float(speed_mps)
     requested_yaw = None if yaw_degrees is None else float(yaw_degrees)
     requested_crosswind = None if crosswind_mps is None else float(crosswind_mps)
@@ -998,9 +1170,10 @@ def _normalize_inflow(
     lift = (0.0, 0.0, 1.0) if flow_axis != "z" else (0.0, 1.0, 0.0)
     side = _cross_vector(lift, primary)
     radians = math.radians(yaw)
-    flow_vector = tuple(
-        speed * (math.cos(radians) * primary[index] + math.sin(radians) * side[index])
-        for index in range(3)
+    flow_vector: Vector = (
+        speed * (math.cos(radians) * primary[0] + math.sin(radians) * side[0]),
+        speed * (math.cos(radians) * primary[1] + math.sin(radians) * side[1]),
+        speed * (math.cos(radians) * primary[2] + math.sin(radians) * side[2]),
     )
     crosswind = speed * math.sin(radians)
     return {
@@ -1084,8 +1257,8 @@ def _normalize_domain(
             "height_m": height,
             "upstream_m": upstream,
             "downstream_m": downstream,
-            "minimum_m": _vector_mapping(tuple(minimum)),
-            "maximum_m": _vector_mapping(tuple(maximum)),
+            "minimum_m": _vector_mapping((minimum[0], minimum[1], minimum[2])),
+            "maximum_m": _vector_mapping((maximum[0], maximum[1], maximum[2])),
             "patches": ["sideWalls", "ceiling", "ground"],
         },
         "applied_to_solver": True,
@@ -1106,7 +1279,7 @@ def _normalize_wheel_setup(
     model_rotation_degrees: tuple[float, float, float],
     model_translation_m: tuple[float, float, float],
     body_rotation_center_source: tuple[float, float, float],
-) -> dict[str, object]:
+) -> WheelSetupMetadata:
     if not wheel_setup:
         return {
             "enabled": False,
@@ -1122,7 +1295,7 @@ def _normalize_wheel_setup(
     if not include_ground or not moving_ground:
         raise ValueError("Rotating wheels require both the ground patch and moving ground to be enabled.")
 
-    normalized: list[dict[str, object]] = []
+    normalized: list[WheelMetadata] = []
     names: set[str] = set()
     for index, wheel in enumerate(wheel_setup, start=1):
         if not isinstance(wheel, dict):
@@ -1221,7 +1394,7 @@ def _positive_mapping_value(mapping: dict[str, object], key: str, label: str) ->
 
 def _positive_number(value: object, label: str) -> float:
     try:
-        number = float(value)
+        number = _float_value(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} must be a finite positive value.") from exc
     if not math.isfinite(number) or number <= 0:
@@ -1229,36 +1402,50 @@ def _positive_number(value: object, label: str) -> float:
     return number
 
 
-def _vector_input(value: object, label: str) -> tuple[float, float, float]:
+def _vector_input(value: object, label: str) -> Vector:
     if isinstance(value, dict):
         try:
-            vector = (float(value["x"]), float(value["y"]), float(value["z"]))
+            vector: Vector = (
+                _float_value(value["x"]),
+                _float_value(value["y"]),
+                _float_value(value["z"]),
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"{label} requires finite X, Y, and Z values.") from exc
     else:
+        if not _is_object_iterable(value):
+            raise ValueError(f"{label} requires finite X, Y, and Z values.")
         try:
-            vector = tuple(float(component) for component in value)  # type: ignore[union-attr]
+            components = tuple(_float_value(component) for component in value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{label} requires finite X, Y, and Z values.") from exc
-        if len(vector) != 3:
+        if len(components) != 3:
             raise ValueError(f"{label} requires finite X, Y, and Z values.")
+        vector = (components[0], components[1], components[2])
     if not all(math.isfinite(component) for component in vector):
         raise ValueError(f"{label} requires finite X, Y, and Z values.")
-    return vector  # type: ignore[return-value]
+    return vector
 
 
-def _unit_vector_input(value: object, label: str) -> tuple[float, float, float]:
+def _unit_vector_input(value: object, label: str) -> Vector:
     vector = _vector_input(value, label)
     magnitude = math.sqrt(sum(component * component for component in vector))
     if magnitude <= 1e-12:
         raise ValueError(f"{label} must have non-zero length.")
-    return tuple(component / magnitude for component in vector)  # type: ignore[return-value]
+    return (
+        vector[0] / magnitude,
+        vector[1] / magnitude,
+        vector[2] / magnitude,
+    )
 
 
-def _axis_unit_vector(axis: str) -> tuple[float, float, float]:
-    vector = [0.0, 0.0, 0.0]
-    vector[{"x": 0, "y": 1, "z": 2}[axis]] = 1.0
-    return tuple(vector)  # type: ignore[return-value]
+def _axis_unit_vector(axis: str) -> Vector:
+    index = {"x": 0, "y": 1, "z": 2}[axis]
+    return (
+        1.0 if index == 0 else 0.0,
+        1.0 if index == 1 else 0.0,
+        1.0 if index == 2 else 0.0,
+    )
 
 
 def _cross_vector(
@@ -1279,13 +1466,17 @@ def normalize_vehicle_datums(
     center_of_gravity_m: tuple[float, float, float] | None,
     front_axle_station_m: float | None,
     rear_axle_station_m: float | None,
-) -> dict[str, object]:
+) -> VehicleDatumsMetadata:
     if center_of_gravity_m is None:
         cg = None
     else:
         if len(center_of_gravity_m) != 3:
             raise ValueError("The center of gravity requires solver-coordinate X, Y, and Z values.")
-        values = tuple(float(value) for value in center_of_gravity_m)
+        values: Vector = (
+            float(center_of_gravity_m[0]),
+            float(center_of_gravity_m[1]),
+            float(center_of_gravity_m[2]),
+        )
         if not all(math.isfinite(value) for value in values):
             raise ValueError("Center-of-gravity coordinates must be finite numbers in meters.")
         cg = values
@@ -1305,11 +1496,13 @@ def normalize_vehicle_datums(
             raise ValueError(
                 f"Front axle station must be lower than rear axle station along solver +{flow_axis.upper()}."
             )
-        cg_station = cg[{"x": 0, "y": 1, "z": 2}[flow_axis]]  # type: ignore[index]
+        if cg is None:
+            raise ValueError("Axle stations require a complete center-of-gravity vector.")
+        cg_station = cg[{"x": 0, "y": 1, "z": 2}[flow_axis]]
         if not front < cg_station < rear:
             raise ValueError("The center of gravity must lie between the front and rear axle stations.")
 
-    reference = cg or tuple(float(value) for value in bounds_center)
+    reference = cg or bounds_center
     balance_qualified = bool(cg is not None and front is not None and rear is not None)
     return {
         "schema_version": 1,
@@ -1331,30 +1524,33 @@ def normalize_vehicle_datums(
     }
 
 
-def _vector_mapping(vector: tuple[float, float, float]) -> dict[str, float]:
+def _vector_mapping(vector: Vector) -> VectorMapping:
     return {"x": float(vector[0]), "y": float(vector[1]), "z": float(vector[2])}
 
 
-def _vector_from_mapping(value: object) -> tuple[float, float, float]:
-    if not isinstance(value, dict):
-        raise ValueError("A complete solver-coordinate vector is required.")
-    return (float(value["x"]), float(value["y"]), float(value["z"]))
+def _vector_from_mapping(value: object) -> Vector:
+    return _vector_input(value, "A complete solver-coordinate vector")
+
+
+def _bounds_center(bounds: Bounds) -> Vector:
+    return (
+        (bounds.minimum[0] + bounds.maximum[0]) / 2.0,
+        (bounds.minimum[1] + bounds.maximum[1]) / 2.0,
+        (bounds.minimum[2] + bounds.maximum[2]) / 2.0,
+    )
+
+
+def _mapping_value(mapping: dict[str, object], key: str) -> dict[str, object]:
+    value = mapping.get(key)
+    return value if isinstance(value, dict) else {}
 
 
 def comparison_lock_metadata(case_payload: dict[str, object]) -> dict[str, object]:
-    flow = case_payload.get("flow") if isinstance(case_payload.get("flow"), dict) else {}
-    ground = case_payload.get("ground") if isinstance(case_payload.get("ground"), dict) else {}
-    placement = case_payload.get("placement") if isinstance(case_payload.get("placement"), dict) else {}
-    reference = (
-        case_payload.get("aerodynamic_reference")
-        if isinstance(case_payload.get("aerodynamic_reference"), dict)
-        else {}
-    )
-    mesh = (
-        case_payload.get("mesh_resolution")
-        if isinstance(case_payload.get("mesh_resolution"), dict)
-        else {}
-    )
+    flow = _mapping_value(case_payload, "flow")
+    ground = _mapping_value(case_payload, "ground")
+    placement = _mapping_value(case_payload, "placement")
+    reference = _mapping_value(case_payload, "aerodynamic_reference")
+    mesh = _mapping_value(case_payload, "mesh_resolution")
     setup = {
         "schema_version": COMPARISON_LOCK_SCHEMA_VERSION,
         "solver_target": case_payload.get("solver_target"),
@@ -1430,33 +1626,33 @@ def _available_case_path(cases_dir: Path, requested_name: str) -> tuple[Path, st
 
 
 def validate_geometry_dimensions(
-    report: object,
+    report: StlReport,
     flow_axis: str,
     measured_length_m: float | None = None,
     measured_width_m: float | None = None,
     measured_height_m: float | None = None,
     tolerance: float = GEOMETRY_DIMENSION_TOLERANCE,
-) -> dict[str, object]:
-    dimensions = report.bounds.dimensions  # type: ignore[attr-defined]
+) -> GeometryValidationMetadata:
+    dimensions = report.bounds.dimensions
     flow_index = {"x": 0, "y": 1, "z": 2}[flow_axis.lower()]
     up_index = 2 if flow_index != 2 else 1
     side_index = next(index for index in range(3) if index not in {flow_index, up_index})
-    actual = {
+    actual: dict[str, float] = {
         "length_m": float(dimensions[flow_index]),
         "width_m": float(dimensions[side_index]),
         "height_m": float(dimensions[up_index]),
     }
-    measured = {
+    measured: dict[str, float | None] = {
         "length_m": measured_length_m,
         "width_m": measured_width_m,
         "height_m": measured_height_m,
     }
-    labels = {
+    labels: dict[str, str] = {
         "length_m": "Vehicle length",
         "width_m": "Vehicle width",
         "height_m": "Vehicle height",
     }
-    checks: list[dict[str, object]] = []
+    checks: list[GeometryCheckMetadata] = []
     for key in ("length_m", "width_m", "height_m"):
         expected = measured[key]
         if expected is None:
