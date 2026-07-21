@@ -1,8 +1,9 @@
 # Animated Particle Traces — Implementation and Roadmap
 
-Status: **Version 1 implemented.** Commit `70ae6ce` shipped the browser-only
-Phase 7 feature "Add particle traces from OpenFOAM velocity fields." The
-post-Version 1 roadmap below is proposed and implementation-ready.
+Status: **Version 1 implemented; post-Version 1 work in progress.** Commit
+`70ae6ce` shipped the browser-only Phase 7 feature "Add particle traces from
+OpenFOAM velocity fields." Stage A is complete, Stage C retains the
+seeded-streamline architecture, and Stage B1 adds persisted motion controls.
 
 ## Summary
 
@@ -239,15 +240,17 @@ particle loop.
 - mean/final-field labeling; and
 - lifecycle cleanup and WebGL fallback.
 
-### Post-Version 1 — proposed order
+### Post-Version 1 — current progress
 
-Proceed in the order **A → C → B1 → B2 → B3 → D**:
+The implementation order remains **A → C → B1 → B2 → B3 → D**:
 
-1. lock the shipped behavior with a focused static test and a manual baseline;
-2. record the seeded-versus-volumetric product decision;
-3. add motion, appearance, and density polish as separate reversible changes;
-4. add JavaScript unit-test infrastructure only if its maintenance cost is
-   accepted.
+- [x] A1: focused static wiring regression test.
+- [x] A2: manual browser baseline on a lower-powered test device.
+- [x] C: seeded-streamline particles accepted as the current product boundary.
+- [x] B1: persisted Play/Pause and `0.5× | 1× | 2×` motion controls.
+- [ ] B2: particle size and opacity presets.
+- [ ] B3: density presets and safe buffer rebuilds.
+- [ ] D: optional pure JavaScript module and Node tests.
 
 ## Version 1 baseline validation
 
@@ -265,7 +268,9 @@ baseline is:
 
 ### Current implementation constraints
 
-All tunable values are hardcoded in `src/aerolab/web/app.js`:
+Version 1 shipped with the following hardcoded values in
+`src/aerolab/web/app.js`. B1 exposes pause and a multiplier around the base
+animation rate; appearance and density remain fixed until B2/B3:
 
 | Setting | Current value |
 | --- | ---: |
@@ -341,13 +346,12 @@ operation, a programmatic accessible name, and an exposed selected/pressed
 state. On narrow layouts, rows wrap without horizontal page overflow.
 
 Whenever `app.js` or `style.css` changes, increment its existing query-string
-asset version in `index.html` (`app.js?v=65` and `style.css?v=32` at the time of
-this plan). Use the values present when implementing rather than assuming these
-numbers remain current.
+asset version in `index.html`. Stage B1 is present with `app.js?v=71`
+and `style.css?v=34`; later stages must use the values present when implementing.
 
-### Stage A — lock in Version 1
+### Stage A — complete: lock in Version 1
 
-#### A1. Add a focused static wiring test
+#### A1. Focused static wiring test — complete
 
 **Files**
 
@@ -384,11 +388,16 @@ python -m unittest discover -s tests -p 'test_webapp.py' -v
 correctness; it only catches accidental unwiring. Roll back by removing this one
 test.
 
-#### A2. Record the manual browser baseline
+#### A2. Manual browser baseline — complete
 
-Run the matrix below before interaction controls are added. Record browser,
-operating system, report type, and pass/fail evidence in the change description
-or linked task.
+The baseline passed on a lower-powered test device. Two non-blocking follow-ups
+were recorded: make geometry-guided preview flow less bubble-like, and improve
+non-JSON polling errors plus stale-progress reporting. Neither issue changed the
+solved particle paths, labels, legends, or lifecycle behavior validated by A2.
+
+Run the matrix below before future interaction-control regressions are accepted.
+Record browser, operating system, report type, and pass/fail evidence in the
+change description or linked task.
 
 | Area | Checks |
 | --- | --- |
@@ -402,8 +411,8 @@ or linked task.
 | Accessibility | Keyboard traversal, pressed states, focus visibility, and OS reduced-motion setting |
 | Responsive layout | Desktop plus a narrow mobile-sized viewport; no clipped controls or horizontal overflow |
 
-The current lack of reduced-motion behavior is an expected B1 gap, not a reason
-to misreport the A2 baseline as passing.
+Reduced-motion startup behavior is implemented by B1 and remains part of future
+manual regression passes.
 
 **Acceptance criteria**
 
@@ -414,9 +423,9 @@ to misreport the A2 baseline as passing.
 **Risk and rollback:** No code risk. Manual evidence is not repeatable automation,
 which is why A1 and optional Stage D remain separate.
 
-### Stage C — record the product boundary
+### Stage C — complete: seeded-streamline product boundary
 
-**Recommended decision:** keep seeded-streamline particles for the current
+**Accepted decision:** keep seeded-streamline particles for the current
 product. Treat arbitrary free-space seeding as a separate epic only after a
 concrete user workflow demonstrates that the existing seeded topology is
 insufficient.
@@ -446,7 +455,7 @@ for shipping volumetric fields.
 **Risk and rollback:** No code or rollback. The risk is spending polish effort on
 a renderer that a confirmed volumetric requirement would replace.
 
-### Stage B1 — pause and animation-rate presets
+### Stage B1 — implemented: pause and animation-rate presets
 
 **Files and touch points**
 

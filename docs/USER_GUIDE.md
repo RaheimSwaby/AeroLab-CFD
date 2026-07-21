@@ -226,6 +226,8 @@ The initial animated smoke is geometry-guided setup visualization. It is useful 
 
 After a successful OpenFOAM run, solver-derived streamlines and animated particles replace preview smoke. Use **Lines**, **Particles**, or **Both** to choose the display. Both use the solved local-speed color legend, while `Cp`, temperature, and drag keep separate surface legends. Transient cases are labeled **Mean-flow speed** because their paths use the time-averaged velocity field; the particle motion is visual and must not be interpreted as instantaneous transient structure or elapsed solver time. Trace density is a visualization choice, not physical concentration or mass-flow density.
 
+When **Particles** or **Both** is selected, use **Pause/Play** to stop or resume particle motion and choose **0.5×**, **1×**, or **2×** speed. Pause and speed are remembered together in this browser, and resuming retains the selected rate. On a first visit with the operating system's reduced-motion preference enabled, particles start paused; an explicit Play/Pause choice is remembered afterward. These controls are disabled in **Lines** mode or whenever solved particles are unavailable.
+
 ### Cp Surface
 
 Use **Cp** to inspect solved surface pressure coefficient. Read values from the displayed legend. Compare matching locations and identical operating conditions between cases.
