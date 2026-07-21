@@ -34,6 +34,21 @@ def _case_visualization(case_path: Path, case_payload: dict[str, object]) -> dic
     streamlines = parse_streamlines(case_path, preview, flow_axis)
     speed_mps = float(flow.get("speed_mps") or 0.0) if isinstance(flow, dict) else 0.0
     density = float(flow.get("air_density_kg_m3") or 1.225) if isinstance(flow, dict) else 1.225
+    wind_vector_mps: tuple[float, float, float] | None = None
+    if isinstance(flow, dict):
+        raw_wind_vector = flow.get("flow_vector_mps")
+        raw_components: tuple[object, object, object] | None = None
+        if isinstance(raw_wind_vector, dict):
+            raw_components = tuple(raw_wind_vector.get(axis) for axis in ("x", "y", "z"))
+        elif isinstance(raw_wind_vector, list | tuple) and len(raw_wind_vector) == 3:
+            raw_components = tuple(raw_wind_vector)
+        if raw_components is not None:
+            try:
+                candidate = tuple(float(value) for value in raw_components)
+                if all(math.isfinite(value) for value in candidate):
+                    wind_vector_mps = candidate  # type: ignore[assignment]
+            except (TypeError, ValueError):
+                wind_vector_mps = None
     reference = case_payload.get("aerodynamic_reference")
     reference_area = None
     if isinstance(reference, dict):
@@ -55,6 +70,7 @@ def _case_visualization(case_path: Path, case_payload: dict[str, object]) -> dic
         density,
         reference_area_m2=reference_area,
         absolute_pressure_reference_pa=pressure_reference_pa,
+        wind_vector_mps=wind_vector_mps,
     )
     return {
         "geometryModelPath": str(body_path),
@@ -220,6 +236,7 @@ def parse_surface_pressure(
     max_triangles: int = 180_000,
     reference_area_m2: float | None = None,
     absolute_pressure_reference_pa: float | None = None,
+    wind_vector_mps: tuple[float, float, float] | None = None,
 ) -> dict[str, object] | None:
     post_dir = case_path / "postProcessing" / "bodyPressure"
     if not post_dir.exists():
@@ -317,20 +334,20 @@ def parse_surface_pressure(
         ]
         temperature_location = "cell-averaged-to-point"
 
-    point_shear = _vtk_field(lines, "wallShearStressMean", 3, point_count) or _vtk_field(
-        lines, "wallShearStress", 3, point_count
-    )
-    cell_shear = _vtk_field(lines, "wallShearStressMean", 3, polygon_count) or _vtk_field(
-        lines, "wallShearStress", 3, polygon_count
-    )
+    point_shear_mean = _vtk_field(lines, "wallShearStressMean", 3, point_count)
+    cell_shear_mean = _vtk_field(lines, "wallShearStressMean", 3, polygon_count)
+    point_shear = point_shear_mean or _vtk_field(lines, "wallShearStress", 3, point_count)
+    cell_shear = cell_shear_mean or _vtk_field(lines, "wallShearStress", 3, polygon_count)
     wall_shear: list[tuple[float, float, float]] | None = None
     wall_shear_location: str | None = None
+    wall_shear_time_averaged = False
     if point_shear is not None and len(point_shear) == point_count * 3:
         wall_shear = [
             tuple(float(value) for value in point_shear[index : index + 3])
             for index in range(0, len(point_shear), 3)
         ]  # type: ignore[list-item]
         wall_shear_location = "point"
+        wall_shear_time_averaged = point_shear_mean is not None
     elif cell_shear is not None and len(cell_shear) == polygon_count * 3:
         sums = [[0.0, 0.0, 0.0] for _ in range(point_count)]
         counts = [0] * point_count
@@ -346,6 +363,7 @@ def parse_surface_pressure(
             for index in range(point_count)
         ]  # type: ignore[list-item]
         wall_shear_location = "cell-averaged-to-point"
+        wall_shear_time_averaged = cell_shear_mean is not None
 
     center_obj = geometry_preview.get("normalizedCenter")
     scale_obj = geometry_preview.get("normalizedScale")
@@ -402,6 +420,19 @@ def parse_surface_pressure(
         denominator,
         flow_axis,
         reference_area_m2,
+    )
+    oil_flow = (
+        _surface_oil_flow(
+            points,
+            triangles,
+            wall_shear,
+            denominator,
+            flow_axis,
+            wind_vector_mps=wind_vector_mps,
+            time_averaged=wall_shear_time_averaged,
+        )
+        if wall_shear is not None
+        else None
     )
     decimated = False
     if len(triangles) > max_triangles:
@@ -532,6 +563,7 @@ def parse_surface_pressure(
             round(total_drag_coefficient, 6) if total_drag_coefficient is not None else None
         ),
         "wallShearDefinition": "Flow-direction wallShearStress divided by dynamic pressure; positive adds viscous drag.",
+        "oilFlow": oil_flow,
         **temperature_payload,
         **drag_summary,
         "points": [
@@ -550,6 +582,423 @@ def parse_surface_pressure(
         "trianglePressureDragValues": [round(value, 6) for value in triangle_pressure_drag_values],
         "triangleTotalDragValues": [round(value, 6) for value in triangle_total_drag_values],
     }
+
+
+def _surface_oil_flow(
+    points: list[tuple[float, float, float]],
+    triangles: list[tuple[int, int, int]],
+    wall_shear: list[tuple[float, float, float]],
+    dynamic_pressure: float,
+    flow_axis: str,
+    *,
+    wind_vector_mps: tuple[float, float, float] | None,
+    time_averaged: bool,
+    max_lines: int = 420,
+    max_steps: int = 72,
+) -> dict[str, object] | None:
+    if not points or not triangles or len(wall_shear) != len(points):
+        return None
+    pressure = max(float(dynamic_pressure), 1e-12)
+    vectors = [_canonical_solver_point(vector, flow_axis) for vector in wall_shear]
+    default_wind = {
+        "x": (1.0, 0.0, 0.0),
+        "y": (0.0, 1.0, 0.0),
+        "z": (0.0, 0.0, 1.0),
+    }.get(flow_axis, (1.0, 0.0, 0.0))
+    raw_wind = wind_vector_mps or default_wind
+    canonical_wind = _canonical_solver_point(raw_wind, flow_axis)
+    wind_length = _oil_vector_length(canonical_wind)
+    wind_direction = (
+        tuple(value / wind_length for value in canonical_wind)
+        if wind_length > 1e-12
+        else (1.0, 0.0, 0.0)
+    )
+    cf_values = [_oil_vector_length(vector) / pressure for vector in vectors]
+    finite_cf = [value for value in cf_values if math.isfinite(value)]
+    if not finite_cf or max(finite_cf) <= 1e-12:
+        return None
+    display_max = max(_percentile(finite_cf, 0.98), 1e-9)
+    stagnation_threshold = max(display_max * 0.015, 1e-10)
+    topology = _oil_flow_topology(points, triangles)
+    normals, neighbors, areas, characteristic_length, diagonal = topology
+    if diagonal <= 1e-12 or not any(area > 1e-16 for area in areas):
+        return None
+    step_length = min(
+        diagonal / 180.0,
+        max(diagonal / 900.0, characteristic_length * 0.45),
+    )
+    normal_offset = diagonal * 0.0015
+    maximum_length = diagonal * 0.42
+    paths: list[list[list[float]]] = []
+    for triangle_index, barycentric in _oil_flow_seeds(areas, max_lines):
+        backward = _trace_surface_oil_flow(
+            points,
+            triangles,
+            vectors,
+            wind_direction,
+            normals,
+            neighbors,
+            triangle_index,
+            barycentric,
+            direction_sign=-1.0,
+            dynamic_pressure=pressure,
+            stagnation_threshold=stagnation_threshold,
+            step_length=step_length,
+            maximum_length=maximum_length,
+            normal_offset=normal_offset,
+            max_steps=max_steps,
+        )
+        forward = _trace_surface_oil_flow(
+            points,
+            triangles,
+            vectors,
+            wind_direction,
+            normals,
+            neighbors,
+            triangle_index,
+            barycentric,
+            direction_sign=1.0,
+            dynamic_pressure=pressure,
+            stagnation_threshold=stagnation_threshold,
+            step_length=step_length,
+            maximum_length=maximum_length,
+            normal_offset=normal_offset,
+            max_steps=max_steps,
+        )
+        combined = list(reversed(backward[1:])) + forward if backward else forward
+        cleaned: list[tuple[float, float, float, float, float]] = []
+        for sample in combined:
+            if cleaned and _oil_vector_length(
+                tuple(sample[index] - cleaned[-1][index] for index in range(3))
+            ) <= 1e-7:
+                continue
+            cleaned.append(sample)
+        if len(cleaned) < 2:
+            continue
+        paths.append(
+            [
+                [
+                    round(sample[0], 6),
+                    round(sample[1], 6),
+                    round(sample[2], 6),
+                    round(sample[3], 8),
+                    round(sample[4], 6),
+                ]
+                for sample in cleaned
+            ]
+        )
+        if len(paths) >= max_lines:
+            break
+    if not paths:
+        return None
+    path_cf = [float(sample[3]) for path in paths for sample in path]
+    path_alignment = [float(sample[4]) for path in paths for sample in path]
+    reverse_count = sum(
+        value < -0.15 and path_cf[index] > stagnation_threshold
+        for index, value in enumerate(path_alignment)
+    )
+    stagnation_count = sum(value <= stagnation_threshold for value in finite_cf)
+    return {
+        "lineCount": len(paths),
+        "pointCount": sum(len(path) for path in paths),
+        "timeAveraged": time_averaged,
+        "windDirection": [round(value, 8) for value in wind_direction],
+        "cfMagnitudeRange": [round(min(finite_cf), 8), round(max(finite_cf), 8)],
+        "cfDisplayRange": [0.0, round(display_max, 8)],
+        "stagnationThreshold": round(stagnation_threshold, 8),
+        "stagnationVertexCount": stagnation_count,
+        "reverseSampleCount": reverse_count,
+        "directionDefinition": (
+            "Trace order follows the local wall-shear vector; alignment is its cosine "
+            "relative to the configured incoming-wind vector, including yaw or crosswind."
+        ),
+        "colorDefinition": (
+            "Cf magnitude is wall-shear magnitude divided by dynamic pressure; low-shear "
+            "samples use the neutral stagnation color."
+        ),
+        "lines": paths,
+    }
+
+
+def _oil_flow_topology(
+    points: list[tuple[float, float, float]],
+    triangles: list[tuple[int, int, int]],
+) -> tuple[
+    list[tuple[float, float, float]],
+    list[list[int | None]],
+    list[float],
+    float,
+    float,
+]:
+    minimum = [min(point[axis] for point in points) for axis in range(3)]
+    maximum = [max(point[axis] for point in points) for axis in range(3)]
+    center = tuple((minimum[axis] + maximum[axis]) * 0.5 for axis in range(3))
+    diagonal = math.sqrt(sum((maximum[axis] - minimum[axis]) ** 2 for axis in range(3)))
+    normals: list[tuple[float, float, float]] = []
+    areas: list[float] = []
+    characteristic_lengths: list[float] = []
+    neighbors: list[list[int | None]] = [[None, None, None] for _ in triangles]
+    edge_owner: dict[tuple[int, int], tuple[int, int]] = {}
+    for triangle_index, triangle in enumerate(triangles):
+        a, b, c = (points[index] for index in triangle)
+        ab = _oil_vector_subtract(b, a)
+        ac = _oil_vector_subtract(c, a)
+        cross = _oil_vector_cross(ab, ac)
+        cross_length = _oil_vector_length(cross)
+        area = 0.5 * cross_length
+        if cross_length <= 1e-16:
+            normal = (0.0, 0.0, 1.0)
+        else:
+            normal = tuple(value / cross_length for value in cross)
+            centroid = tuple((a[axis] + b[axis] + c[axis]) / 3.0 for axis in range(3))
+            radial = _oil_vector_subtract(centroid, center)
+            if _oil_vector_dot(normal, radial) < 0:
+                normal = tuple(-value for value in normal)
+        normals.append(normal)
+        areas.append(area)
+        if area > 1e-16:
+            characteristic_lengths.append(math.sqrt(2.0 * area))
+        opposite_edges = ((triangle[1], triangle[2]), (triangle[2], triangle[0]), (triangle[0], triangle[1]))
+        for opposite_index, edge in enumerate(opposite_edges):
+            key = tuple(sorted(edge))
+            owner = edge_owner.get(key)
+            if owner is None:
+                edge_owner[key] = (triangle_index, opposite_index)
+                continue
+            other_triangle, other_opposite = owner
+            if neighbors[triangle_index][opposite_index] is None:
+                neighbors[triangle_index][opposite_index] = other_triangle
+            if neighbors[other_triangle][other_opposite] is None:
+                neighbors[other_triangle][other_opposite] = triangle_index
+    characteristic = _percentile(characteristic_lengths, 0.5) if characteristic_lengths else 0.0
+    return normals, neighbors, areas, characteristic, diagonal
+
+
+def _oil_flow_seeds(
+    triangle_areas: list[float],
+    max_lines: int,
+) -> list[tuple[int, tuple[float, float, float]]]:
+    valid = [(index, area) for index, area in enumerate(triangle_areas) if area > 1e-16]
+    if not valid:
+        return []
+    target_count = min(
+        max_lines,
+        max(8, min(len(valid) * 4, int(math.sqrt(len(valid)) * 3.0) + 1)),
+    )
+    total_area = sum(area for _, area in valid)
+    seeds: list[tuple[int, tuple[float, float, float]]] = []
+    cursor = 0
+    cumulative = valid[0][1]
+    for seed_index in range(target_count):
+        target = (seed_index + 0.5) / target_count * total_area
+        while cursor < len(valid) - 1 and cumulative < target:
+            cursor += 1
+            cumulative += valid[cursor][1]
+        first = (seed_index * 0.61803398875 + 0.37) % 1.0
+        second = (seed_index * 0.41421356237 + 0.19) % 1.0
+        root = math.sqrt(first)
+        raw = (1.0 - root, root * (1.0 - second), root * second)
+        barycentric = tuple(0.1 + 0.7 * value for value in raw)
+        seeds.append((valid[cursor][0], barycentric))
+    return seeds
+
+
+def _trace_surface_oil_flow(
+    points: list[tuple[float, float, float]],
+    triangles: list[tuple[int, int, int]],
+    vectors: list[tuple[float, float, float]],
+    wind_direction: tuple[float, float, float],
+    normals: list[tuple[float, float, float]],
+    neighbors: list[list[int | None]],
+    triangle_index: int,
+    barycentric: tuple[float, float, float],
+    *,
+    direction_sign: float,
+    dynamic_pressure: float,
+    stagnation_threshold: float,
+    step_length: float,
+    maximum_length: float,
+    normal_offset: float,
+    max_steps: int,
+) -> list[tuple[float, float, float, float, float]]:
+    point = _oil_barycentric_point(points, triangles[triangle_index], barycentric)
+    samples: list[tuple[float, float, float, float, float]] = []
+    visited: set[tuple[int, int, int]] = set()
+    travelled = 0.0
+    previous_direction: tuple[float, float, float] | None = None
+    for _ in range(max_steps):
+        triangle = triangles[triangle_index]
+        barycentric = _oil_barycentric(point, *(points[index] for index in triangle))
+        if barycentric is None or min(barycentric) < -0.05:
+            break
+        vector = tuple(
+            sum(barycentric[vertex] * vectors[triangle[vertex]][axis] for vertex in range(3))
+            for axis in range(3)
+        )
+        normal = normals[triangle_index]
+        tangent = tuple(
+            vector[axis] - normal[axis] * _oil_vector_dot(vector, normal)
+            for axis in range(3)
+        )
+        tangent_length = _oil_vector_length(tangent)
+        cf_magnitude = tangent_length / dynamic_pressure
+        alignment = (
+            _oil_vector_dot(tangent, wind_direction) / tangent_length
+            if tangent_length > 1e-16
+            else 0.0
+        )
+        display_point = tuple(point[axis] + normal[axis] * normal_offset for axis in range(3))
+        samples.append((*display_point, cf_magnitude, max(-1.0, min(1.0, alignment))))
+        if cf_magnitude <= stagnation_threshold or tangent_length <= 1e-16:
+            break
+        direction = tuple(direction_sign * value / tangent_length for value in tangent)
+        if previous_direction is not None and _oil_vector_dot(previous_direction, direction) < -0.75:
+            break
+        key = (
+            triangle_index,
+            int(round(barycentric[0] * 32.0)),
+            int(round(barycentric[1] * 32.0)),
+        )
+        if key in visited:
+            break
+        visited.add(key)
+        advanced = _advance_surface_oil_flow(
+            point,
+            barycentric,
+            direction,
+            step_length,
+            triangle_index,
+            points,
+            triangles,
+            normals,
+            neighbors,
+        )
+        if advanced is None:
+            break
+        next_point, next_triangle = advanced
+        travelled += _oil_vector_length(_oil_vector_subtract(next_point, point))
+        if travelled > maximum_length:
+            break
+        point = next_point
+        triangle_index = next_triangle
+        previous_direction = direction
+    return samples
+
+
+def _advance_surface_oil_flow(
+    point: tuple[float, float, float],
+    barycentric: tuple[float, float, float],
+    direction: tuple[float, float, float],
+    step_length: float,
+    triangle_index: int,
+    points: list[tuple[float, float, float]],
+    triangles: list[tuple[int, int, int]],
+    normals: list[tuple[float, float, float]],
+    neighbors: list[list[int | None]],
+) -> tuple[tuple[float, float, float], int] | None:
+    triangle = triangles[triangle_index]
+    candidate = tuple(point[axis] + direction[axis] * step_length for axis in range(3))
+    candidate_barycentric = _oil_barycentric(candidate, *(points[index] for index in triangle))
+    if candidate_barycentric is None:
+        return None
+    if min(candidate_barycentric) >= -1e-7:
+        return candidate, triangle_index
+    crossed = min(range(3), key=lambda index: candidate_barycentric[index])
+    denominator = barycentric[crossed] - candidate_barycentric[crossed]
+    if denominator <= 1e-12:
+        return None
+    amount = max(0.0, min(1.0, barycentric[crossed] / denominator))
+    crossing = tuple(
+        point[axis] + (candidate[axis] - point[axis]) * amount
+        for axis in range(3)
+    )
+    neighbor = neighbors[triangle_index][crossed]
+    if neighbor is None:
+        return None
+    neighbor_triangle = triangles[neighbor]
+    centroid = tuple(
+        sum(points[index][axis] for index in neighbor_triangle) / 3.0
+        for axis in range(3)
+    )
+    toward_centroid = _oil_vector_subtract(centroid, crossing)
+    toward_length = _oil_vector_length(toward_centroid)
+    if toward_length <= 1e-16:
+        return crossing, neighbor
+    epsilon = step_length * 1e-4
+    entered = tuple(
+        crossing[axis] + toward_centroid[axis] / toward_length * epsilon
+        for axis in range(3)
+    )
+    plane_origin = points[neighbor_triangle[0]]
+    neighbor_normal = normals[neighbor]
+    plane_distance = _oil_vector_dot(_oil_vector_subtract(entered, plane_origin), neighbor_normal)
+    projected = tuple(
+        entered[axis] - neighbor_normal[axis] * plane_distance
+        for axis in range(3)
+    )
+    return projected, neighbor
+
+
+def _oil_barycentric_point(
+    points: list[tuple[float, float, float]],
+    triangle: tuple[int, int, int],
+    barycentric: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return tuple(
+        sum(barycentric[index] * points[triangle[index]][axis] for index in range(3))
+        for axis in range(3)
+    )
+
+
+def _oil_barycentric(
+    point: tuple[float, float, float],
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+    c: tuple[float, float, float],
+) -> tuple[float, float, float] | None:
+    v0 = _oil_vector_subtract(b, a)
+    v1 = _oil_vector_subtract(c, a)
+    v2 = _oil_vector_subtract(point, a)
+    d00 = _oil_vector_dot(v0, v0)
+    d01 = _oil_vector_dot(v0, v1)
+    d11 = _oil_vector_dot(v1, v1)
+    d20 = _oil_vector_dot(v2, v0)
+    d21 = _oil_vector_dot(v2, v1)
+    denominator = d00 * d11 - d01 * d01
+    if abs(denominator) <= 1e-20:
+        return None
+    second = (d11 * d20 - d01 * d21) / denominator
+    third = (d00 * d21 - d01 * d20) / denominator
+    return (1.0 - second - third, second, third)
+
+
+def _oil_vector_subtract(
+    first: tuple[float, float, float],
+    second: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return tuple(first[index] - second[index] for index in range(3))  # type: ignore[return-value]
+
+
+def _oil_vector_dot(
+    first: tuple[float, float, float],
+    second: tuple[float, float, float],
+) -> float:
+    return sum(first[index] * second[index] for index in range(3))
+
+
+def _oil_vector_cross(
+    first: tuple[float, float, float],
+    second: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    )
+
+
+def _oil_vector_length(vector: tuple[float, float, float]) -> float:
+    return math.sqrt(_oil_vector_dot(vector, vector))
 
 
 def _pressure_drag_map(

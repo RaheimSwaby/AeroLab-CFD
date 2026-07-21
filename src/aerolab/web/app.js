@@ -2,6 +2,7 @@ import * as THREE from "./vendor/three.module.min.js";
 
 const INVERT_ORBIT_STORAGE_KEY = "aerolab-invert-orbit";
 const VIEW_MODE_STORAGE_KEY = "aerolab-view-mode";
+const SOLVER_PARTICLE_SETTINGS_STORAGE_KEY = "aerolab-particle-settings-v1";
 const VIEWER_GROUND_Z = -0.58;
 const VIEWER_CAMERA_NEAR = 0.1;
 const VIEWER_CAMERA_FAR = 100;
@@ -9,6 +10,42 @@ const SOLVER_PARTICLE_TARGET_PER_LINE = 24;
 const SOLVER_PARTICLE_MAX_COUNT = 5_200;
 const SOLVER_PARTICLE_SPEED_FLOOR = 0.04;
 const SOLVER_PARTICLE_ANIMATION_RATE = 0.9;
+const SOLVER_PARTICLE_RATE_MULTIPLIERS = Object.freeze([0.5, 1, 2]);
+const SOLVER_PARTICLE_POINT_SIZES = Object.freeze([0.04, 0.052, 0.07]);
+const SOLVER_PARTICLE_OPACITIES = Object.freeze([0.55, 0.75, 0.92]);
+const SOLVER_PARTICLE_DENSITIES = Object.freeze([12, 24, 36]);
+const WIND_CROP_AXIS_NAMES = Object.freeze(["X", "Y", "Z"]);
+const WIND_CROP_EPSILON = 1e-9;
+const SOLVER_PARTICLE_SETTINGS_DEFAULTS = Object.freeze({
+  paused: false,
+  rateMultiplier: 1,
+  pointSize: 0.052,
+  opacity: 0.92,
+  particlesPerLine: SOLVER_PARTICLE_TARGET_PER_LINE,
+});
+const OIL_FLOW_SETTINGS_STORAGE_KEY = "aerolab-oil-flow-settings-v1";
+const OIL_FLOW_PARTICLES_PER_LINE = 6;
+const OIL_FLOW_MAX_PARTICLE_COUNT = 2_400;
+const OIL_FLOW_ANIMATION_RATE = 0.42;
+const OIL_FLOW_SETTINGS_DEFAULTS = Object.freeze({
+  mode: "both",
+  colorMode: "cf",
+  paused: false,
+  rateMultiplier: 1,
+});
+const OIL_FLOW_CF_COLOR_STOPS = Object.freeze([
+  [68, 1, 84],
+  [59, 82, 139],
+  [33, 145, 140],
+  [94, 201, 98],
+  [253, 231, 37],
+]);
+const OIL_FLOW_DIRECTION_COLOR_STOPS = Object.freeze([
+  [64, 84, 196],
+  [128, 139, 143],
+  [238, 156, 58],
+]);
+const OIL_FLOW_STAGNATION_COLOR = Object.freeze([116, 123, 128]);
 const SOLVER_PARTICLE_LINE_AVAILABILITY = new WeakMap();
 const SPEED_COLOR_STOPS = [
   [38, 105, 208],
@@ -58,9 +95,19 @@ const state = {
     smoothVertexLight: null,
     flowLayer: null,
     meshSource: "raw",
+    visualizationTab: "airflow",
     surfaceMode: "material",
+    airflowSurfaceMode: "material",
     solverFlowMode: "both",
+    solverParticleSettings: { ...SOLVER_PARTICLE_SETTINGS_DEFAULTS },
     solverParticles: null,
+    oilFlowSettings: { ...OIL_FLOW_SETTINGS_DEFAULTS },
+    surfaceOilFlow: null,
+    windCrop: {
+      extents: null,
+      lower: [0, 0, 0],
+      upper: [1, 1, 1],
+    },
     exactMesh: null,
     exactMeshLoading: false,
     exactMeshRequest: 0,
@@ -194,11 +241,41 @@ const els = {
   canvas: document.querySelector("#flowCanvas"),
   modelCanvas: document.querySelector("#modelCanvas"),
   dragSummary: document.querySelector("#dragSummary"),
+  airflowVisualizationTab: document.querySelector("#airflowVisualizationTab"),
+  oilFlowVisualizationTab: document.querySelector("#oilFlowVisualizationTab"),
+  airflowViewerPanel: document.querySelector("#airflowViewerPanel"),
+  oilFlowViewerPanel: document.querySelector("#oilFlowViewerPanel"),
+  oilFlowControl: document.querySelector("#oilFlowControl"),
+  oilFlowStatus: document.querySelector("#oilFlowStatus"),
+  oilFlowStaticButton: document.querySelector("#oilFlowStaticButton"),
+  oilFlowAnimatedButton: document.querySelector("#oilFlowAnimatedButton"),
+  oilFlowBothButton: document.querySelector("#oilFlowBothButton"),
+  oilFlowSettings: document.querySelector("#oilFlowSettings"),
+  oilFlowCfButton: document.querySelector("#oilFlowCfButton"),
+  oilFlowDirectionButton: document.querySelector("#oilFlowDirectionButton"),
+  oilFlowMotionButton: document.querySelector("#oilFlowMotionButton"),
+  oilFlowRateSelect: document.querySelector("#oilFlowRateSelect"),
   solverFlowControl: document.querySelector("#solverFlowControl"),
   solverFlowStatus: document.querySelector("#solverFlowStatus"),
   solverLinesButton: document.querySelector("#solverLinesButton"),
   solverParticlesButton: document.querySelector("#solverParticlesButton"),
   solverBothButton: document.querySelector("#solverBothButton"),
+  solverParticleSettings: document.querySelector("#solverParticleSettings"),
+  solverParticleMotionButton: document.querySelector("#solverParticleMotionButton"),
+  solverParticleRateSelect: document.querySelector("#solverParticleRateSelect"),
+  windCropControl: document.querySelector("#windCropControl"),
+  windCropSummary: document.querySelector("#windCropControl > summary"),
+  windCropStatus: document.querySelector("#windCropStatus"),
+  windCropReset: document.querySelector("#windCropReset"),
+  windCropXLower: document.querySelector("#windCropXLower"),
+  windCropXUpper: document.querySelector("#windCropXUpper"),
+  windCropXValue: document.querySelector("#windCropXValue"),
+  windCropYLower: document.querySelector("#windCropYLower"),
+  windCropYUpper: document.querySelector("#windCropYUpper"),
+  windCropYValue: document.querySelector("#windCropYValue"),
+  windCropZLower: document.querySelector("#windCropZLower"),
+  windCropZUpper: document.querySelector("#windCropZUpper"),
+  windCropZValue: document.querySelector("#windCropZValue"),
   showEdges: document.querySelector("#showEdges"),
   surfaceModeButton: document.querySelector("#surfaceModeButton"),
   pressureModeButton: document.querySelector("#pressureModeButton"),
@@ -225,7 +302,9 @@ async function boot() {
   syncAdvancedFlowControls();
   syncRotationOutputs();
   initFlowVisualization();
+  syncWindCropControls();
   syncSolverFlowControls();
+  syncVisualizationControls();
   startViewer();
 }
 
@@ -860,8 +939,11 @@ els.caseList.addEventListener("click", async (event) => {
   state.activeCasePath = requestedCasePath;
   state.caseReport = null;
   resetSolverParticles();
+  resetSurfaceOilFlow();
+  clearWindCropControls();
   state.viewer.flowLayer = null;
   syncSolverFlowControls();
+  syncVisualizationControls();
   state.activeRunProgress = state.cases.find((item) => item.path === requestedCasePath)?.progress || null;
   syncRunLogForActiveCase();
   state.report = null;
@@ -979,6 +1061,9 @@ for (const input of [
     updateCaseName();
     renderMetrics();
     renderReadiness();
+    if ([els.includeGround, els.groundClearanceMm, els.unitScale].includes(input)) {
+      syncWindCropControls();
+    }
     drawFlow();
     if (input === els.unitScale) scheduleAeroFeatureScan();
   });
@@ -1082,6 +1167,7 @@ async function applyRotationChange() {
   renderMetrics();
   renderReadiness();
   initFlowVisualization();
+  syncWindCropControls();
   drawFlow();
   scheduleAeroFeatureScan();
 }
@@ -1098,6 +1184,7 @@ els.autoAlignButton.addEventListener("click", async () => {
   renderMetrics();
   renderReadiness();
   initFlowVisualization();
+  syncWindCropControls();
   drawFlow();
   scheduleAeroFeatureScan();
   const dimensions = suggestion.aligned_dimensions || [];
@@ -1113,6 +1200,7 @@ els.resetRotationButton.addEventListener("click", async () => {
   renderMetrics();
   renderReadiness();
   initFlowVisualization();
+  syncWindCropControls();
   drawFlow();
   scheduleAeroFeatureScan();
 });
@@ -1127,6 +1215,507 @@ els.dragModeButton.addEventListener("click", () => setSurfaceMode("drag"));
 els.solverLinesButton.addEventListener("click", () => setSolverFlowMode("lines"));
 els.solverParticlesButton.addEventListener("click", () => setSolverFlowMode("particles"));
 els.solverBothButton.addEventListener("click", () => setSolverFlowMode("both"));
+els.solverParticleMotionButton.addEventListener("click", () => {
+  setSolverParticlePaused(!state.viewer.solverParticleSettings.paused);
+});
+els.solverParticleRateSelect.addEventListener("change", () => {
+  setSolverParticleRate(Number(els.solverParticleRateSelect.value));
+});
+els.airflowVisualizationTab.addEventListener("click", () => setVisualizationTab("airflow"));
+els.oilFlowVisualizationTab.addEventListener("click", () => setVisualizationTab("oilflow"));
+for (const tabButton of [els.airflowVisualizationTab, els.oilFlowVisualizationTab]) {
+  tabButton.addEventListener("keydown", handleVisualizationTabKeydown);
+}
+els.oilFlowStaticButton.addEventListener("click", () => setOilFlowMode("static"));
+els.oilFlowAnimatedButton.addEventListener("click", () => setOilFlowMode("animated"));
+els.oilFlowBothButton.addEventListener("click", () => setOilFlowMode("both"));
+els.oilFlowCfButton.addEventListener("click", () => setOilFlowColorMode("cf"));
+els.oilFlowDirectionButton.addEventListener("click", () => setOilFlowColorMode("direction"));
+els.oilFlowMotionButton.addEventListener("click", () => {
+  setOilFlowPaused(!state.viewer.oilFlowSettings.paused);
+});
+els.oilFlowRateSelect.addEventListener("change", () => {
+  setOilFlowRate(Number(els.oilFlowRateSelect.value));
+});
+
+const WIND_CROP_CONTROLS = Object.freeze([
+  { lower: els.windCropXLower, upper: els.windCropXUpper, output: els.windCropXValue },
+  { lower: els.windCropYLower, upper: els.windCropYUpper, output: els.windCropYValue },
+  { lower: els.windCropZLower, upper: els.windCropZUpper, output: els.windCropZValue },
+]);
+
+for (let axis = 0; axis < WIND_CROP_CONTROLS.length; axis += 1) {
+  const control = WIND_CROP_CONTROLS[axis];
+  control.lower.addEventListener("input", () => {
+    setWindCropBoundary(axis, "lower", control.lower.valueAsNumber);
+  });
+  control.upper.addEventListener("input", () => {
+    setWindCropBoundary(axis, "upper", control.upper.valueAsNumber);
+  });
+}
+els.windCropReset.addEventListener("click", resetWindCrop);
+els.windCropSummary.addEventListener("click", (event) => {
+  if (!state.viewer.windCrop.extents) event.preventDefault();
+});
+
+function setWindCropBoundary(axis, boundary, percent) {
+  if (!state.viewer.windCrop.extents || !Number.isFinite(percent)) return;
+  const crop = state.viewer.windCrop;
+  const fraction = clamp(percent / 100, 0, 1);
+  if (boundary === "lower") crop.lower[axis] = Math.min(fraction, crop.upper[axis]);
+  else crop.upper[axis] = Math.max(fraction, crop.lower[axis]);
+  state.viewer.flowLayer = null;
+  renderWindCropControls();
+}
+
+function resetWindCrop() {
+  state.viewer.windCrop.lower = [0, 0, 0];
+  state.viewer.windCrop.upper = [1, 1, 1];
+  state.viewer.flowLayer = null;
+  renderWindCropControls();
+  drawFlow();
+}
+
+function clearWindCropControls() {
+  state.viewer.windCrop.extents = null;
+  state.viewer.windCrop.lower = [0, 0, 0];
+  state.viewer.windCrop.upper = [1, 1, 1];
+  state.viewer.flowLayer = null;
+  els.windCropControl.open = false;
+  renderWindCropControls();
+}
+
+function syncWindCropControls(reset = false) {
+  const crop = state.viewer.windCrop;
+  crop.extents = windVisualizationExtents();
+  if (reset) {
+    crop.lower = [0, 0, 0];
+    crop.upper = [1, 1, 1];
+  } else {
+    crop.lower = crop.lower.map((value, axis) => clamp(value, 0, crop.upper[axis]));
+    crop.upper = crop.upper.map((value, axis) => clamp(value, crop.lower[axis], 1));
+  }
+  state.viewer.flowLayer = null;
+  renderWindCropControls();
+}
+
+function windVisualizationExtents() {
+  if (!state.modelPath && !hasSolverStreamlines()) return null;
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  const flow = state.caseReport?.solverStreamlines;
+  if (hasSolverStreamlines()) {
+    const zOffset = meshGroundOffset();
+    for (const path of flow.lines || []) {
+      for (const sample of path || []) {
+        const values = [Number(sample?.[0]), Number(sample?.[1]), Number(sample?.[2]) + zOffset];
+        if (!values.every(Number.isFinite)) continue;
+        for (let axis = 0; axis < 3; axis += 1) {
+          min[axis] = Math.min(min[axis], values[axis]);
+          max[axis] = Math.max(max[axis], values[axis]);
+        }
+      }
+    }
+  }
+
+  if (!min.every(Number.isFinite) || !max.every(Number.isFinite)) {
+    const env = bodyEnvelope();
+    const meshBounds = meshPreviewBounds();
+    const smokeHalfWidth = Math.max(env.width * 1.05, 1);
+    const verticalMargin = Math.max(env.height * 0.7, 0.5);
+    const smokeHeight = Math.max(env.height + 0.72, 1.55);
+    const minimumZ = Math.min(
+      VIEWER_GROUND_Z - verticalMargin,
+      (meshBounds?.min?.[2] ?? VIEWER_GROUND_Z) - verticalMargin,
+    );
+    const maximumZ = Math.max(
+      VIEWER_GROUND_Z + smokeHeight + verticalMargin * 0.25,
+      (meshBounds?.max?.[2] ?? VIEWER_GROUND_Z) + verticalMargin,
+    );
+    min.splice(0, 3, -env.tunnelLength / 2, -smokeHalfWidth, minimumZ);
+    max.splice(
+      0,
+      3,
+      env.tunnelLength / 2,
+      smokeHalfWidth,
+      maximumZ,
+    );
+  }
+
+  for (let axis = 0; axis < 3; axis += 1) {
+    if (max[axis] - min[axis] <= WIND_CROP_EPSILON) {
+      min[axis] -= 0.5;
+      max[axis] += 0.5;
+    }
+  }
+  return { min, max };
+}
+
+function currentWindCropBounds() {
+  const crop = state.viewer.windCrop;
+  if (!crop.extents) return null;
+  return {
+    min: crop.extents.min.map((minimum, axis) => (
+      lerp(minimum, crop.extents.max[axis], crop.lower[axis])
+    )),
+    max: crop.extents.max.map((maximum, axis) => (
+      lerp(crop.extents.min[axis], maximum, crop.upper[axis])
+    )),
+  };
+}
+
+function activeWindCropBounds() {
+  const crop = state.viewer.windCrop;
+  const bounds = currentWindCropBounds();
+  if (!bounds || !windCropIsActive()) return null;
+  return {
+    min: bounds.min.map((value, axis) => (
+      crop.lower[axis] > WIND_CROP_EPSILON ? value : -Infinity
+    )),
+    max: bounds.max.map((value, axis) => (
+      crop.upper[axis] < 1 - WIND_CROP_EPSILON ? value : Infinity
+    )),
+  };
+}
+
+function windCropIsActive() {
+  const crop = state.viewer.windCrop;
+  return crop.lower.some((value) => value > WIND_CROP_EPSILON)
+    || crop.upper.some((value) => value < 1 - WIND_CROP_EPSILON);
+}
+
+function windCropCacheKey() {
+  const crop = state.viewer.windCrop;
+  return [...crop.lower, ...crop.upper].map((value) => value.toFixed(4)).join(":");
+}
+
+function coordinatesInsideWindCrop(x, y, z, bounds = activeWindCropBounds()) {
+  if (!bounds) return true;
+  return Number.isFinite(x)
+    && Number.isFinite(y)
+    && Number.isFinite(z)
+    && x >= bounds.min[0] - WIND_CROP_EPSILON
+    && x <= bounds.max[0] + WIND_CROP_EPSILON
+    && y >= bounds.min[1] - WIND_CROP_EPSILON
+    && y <= bounds.max[1] + WIND_CROP_EPSILON
+    && z >= bounds.min[2] - WIND_CROP_EPSILON
+    && z <= bounds.max[2] + WIND_CROP_EPSILON;
+}
+
+function pointInsideWindCrop(point, bounds = activeWindCropBounds()) {
+  return coordinatesInsideWindCrop(point.x, point.y, point.z, bounds);
+}
+
+function formatWindCropCoordinate(value) {
+  const normalized = Math.abs(value) < 0.0005 ? 0 : value;
+  const formatted = normalized.toFixed(Math.abs(normalized) >= 10 ? 1 : 2);
+  return normalized > 0 ? `+${formatted}` : formatted;
+}
+
+function renderWindCropControls() {
+  const crop = state.viewer.windCrop;
+  const bounds = currentWindCropBounds();
+  const available = Boolean(bounds);
+  const activeAxes = [];
+  els.windCropControl.classList.toggle("unavailable", !available);
+  els.windCropControl.classList.toggle("active", available && windCropIsActive());
+  els.windCropControl.setAttribute("aria-disabled", String(!available));
+  els.windCropSummary.setAttribute("aria-disabled", String(!available));
+  if (!available) els.windCropControl.open = false;
+
+  for (let axis = 0; axis < WIND_CROP_CONTROLS.length; axis += 1) {
+    const control = WIND_CROP_CONTROLS[axis];
+    const lowerPercent = crop.lower[axis] * 100;
+    const upperPercent = crop.upper[axis] * 100;
+    control.lower.disabled = !available;
+    control.upper.disabled = !available;
+    control.lower.max = String(upperPercent);
+    control.upper.min = String(lowerPercent);
+    control.lower.value = String(lowerPercent);
+    control.upper.value = String(upperPercent);
+    const lowerLabel = available ? formatWindCropCoordinate(bounds.min[axis]) : "Unavailable";
+    const upperLabel = available ? formatWindCropCoordinate(bounds.max[axis]) : "Unavailable";
+    control.lower.setAttribute("aria-valuetext", lowerLabel);
+    control.upper.setAttribute("aria-valuetext", upperLabel);
+    control.output.textContent = available
+      ? `${lowerLabel} to ${upperLabel}`
+      : "Unavailable";
+    if (
+      available
+      && (crop.lower[axis] > WIND_CROP_EPSILON || crop.upper[axis] < 1 - WIND_CROP_EPSILON)
+    ) {
+      activeAxes.push(WIND_CROP_AXIS_NAMES[axis]);
+    }
+  }
+
+  const active = activeAxes.length > 0;
+  els.windCropReset.disabled = !available || !active;
+  els.windCropStatus.textContent = !available
+    ? "Load a model"
+    : active
+      ? `${activeAxes.join(", ")} limited`
+      : "Full flow";
+}
+
+function surfaceOilFlowData() {
+  return state.caseReport?.surfacePressure?.oilFlow || null;
+}
+
+function hasSurfaceOilFlow() {
+  const flow = surfaceOilFlowData();
+  return Boolean(!flow?.error && flow?.lines?.length && flow.lineCount > 0);
+}
+
+function oilFlowUnavailableReason() {
+  if (state.viewer.webgl.failed) return "WebGL could not start";
+  if (!hasSurfaceOilFlow()) return "Run the solver to generate wall-shear traces";
+  return null;
+}
+
+function handleVisualizationTabKeydown(event) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = [els.airflowVisualizationTab, els.oilFlowVisualizationTab]
+    .filter((tab) => !tab.disabled);
+  if (!tabs.length) return;
+  event.preventDefault();
+  const currentIndex = Math.max(0, tabs.indexOf(event.currentTarget));
+  let nextIndex = currentIndex;
+  if (event.key === "Home") nextIndex = 0;
+  else if (event.key === "End") nextIndex = tabs.length - 1;
+  else if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+  else nextIndex = (currentIndex + 1) % tabs.length;
+  const nextTab = tabs[nextIndex];
+  nextTab.focus();
+  setVisualizationTab(nextTab === els.oilFlowVisualizationTab ? "oilflow" : "airflow");
+}
+
+function setVisualizationTab(tab) {
+  const requested = tab === "oilflow" ? "oilflow" : "airflow";
+  const normalized = requested === "oilflow" && oilFlowUnavailableReason()
+    ? "airflow"
+    : requested;
+  if (normalized === state.viewer.visualizationTab) {
+    syncVisualizationControls();
+    return;
+  }
+  if (normalized === "oilflow") {
+    state.viewer.airflowSurfaceMode = state.viewer.surfaceMode;
+    state.viewer.surfaceMode = "material";
+  } else {
+    state.viewer.surfaceMode = state.viewer.airflowSurfaceMode || "material";
+  }
+  state.viewer.visualizationTab = normalized;
+  syncSurfaceModeControls();
+  syncSolverFlowControls();
+  syncVisualizationControls();
+  invalidateThreeGeometry();
+  drawFlow();
+}
+
+function syncVisualizationControls() {
+  const unavailableReason = oilFlowUnavailableReason();
+  if (state.viewer.visualizationTab === "oilflow" && unavailableReason) {
+    state.viewer.visualizationTab = "airflow";
+    state.viewer.surfaceMode = state.viewer.airflowSurfaceMode || "material";
+    syncSurfaceModeControls();
+  }
+  const oilActive = state.viewer.visualizationTab === "oilflow";
+  els.airflowVisualizationTab.classList.toggle("active", !oilActive);
+  els.oilFlowVisualizationTab.classList.toggle("active", oilActive);
+  els.airflowVisualizationTab.setAttribute("aria-selected", String(!oilActive));
+  els.oilFlowVisualizationTab.setAttribute("aria-selected", String(oilActive));
+  els.airflowVisualizationTab.tabIndex = oilActive ? -1 : 0;
+  els.oilFlowVisualizationTab.tabIndex = oilActive ? 0 : -1;
+  els.airflowViewerPanel.hidden = oilActive;
+  els.oilFlowViewerPanel.hidden = !oilActive;
+  els.oilFlowVisualizationTab.disabled = Boolean(unavailableReason);
+  els.oilFlowVisualizationTab.title = unavailableReason || "Show solved surface oil-flow traces";
+  syncOilFlowControls();
+}
+
+function oilFlowDefaultSettings() {
+  let reducedMotion = false;
+  let lowMemoryDevice = false;
+  try {
+    reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+    const deviceMemory = Number(navigator.deviceMemory || 0);
+    const hardwareThreads = Number(navigator.hardwareConcurrency || 0);
+    lowMemoryDevice = deviceMemory > 0
+      ? deviceMemory <= 4
+      : hardwareThreads > 0 && hardwareThreads <= 4;
+  } catch (_error) {
+    // Unknown devices use the balanced animated default.
+  }
+  const staticOnly = reducedMotion || lowMemoryDevice;
+  return {
+    ...OIL_FLOW_SETTINGS_DEFAULTS,
+    mode: staticOnly ? "static" : "both",
+    paused: staticOnly,
+  };
+}
+
+function normalizeOilFlowSettings(value, fallbackSettings = OIL_FLOW_SETTINGS_DEFAULTS) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    mode: ["static", "animated", "both"].includes(source.mode)
+      ? source.mode
+      : fallbackSettings.mode,
+    colorMode: ["cf", "direction"].includes(source.colorMode)
+      ? source.colorMode
+      : fallbackSettings.colorMode,
+    paused: typeof source.paused === "boolean" ? source.paused : fallbackSettings.paused,
+    rateMultiplier: normalizeSolverParticlePreset(
+      source.rateMultiplier,
+      SOLVER_PARTICLE_RATE_MULTIPLIERS,
+      0.25,
+      2,
+      fallbackSettings.rateMultiplier,
+    ),
+  };
+}
+
+function restoreOilFlowSettings() {
+  let savedSettings = null;
+  try {
+    const storedValue = window.localStorage.getItem(OIL_FLOW_SETTINGS_STORAGE_KEY);
+    if (storedValue != null) savedSettings = JSON.parse(storedValue);
+  } catch (_error) {
+    // Missing or unavailable storage falls back to device-aware defaults.
+  }
+  state.viewer.oilFlowSettings = normalizeOilFlowSettings(
+    savedSettings,
+    oilFlowDefaultSettings(),
+  );
+}
+
+function saveOilFlowSettings() {
+  state.viewer.oilFlowSettings = normalizeOilFlowSettings(state.viewer.oilFlowSettings);
+  try {
+    window.localStorage.setItem(
+      OIL_FLOW_SETTINGS_STORAGE_KEY,
+      JSON.stringify(state.viewer.oilFlowSettings),
+    );
+  } catch (_error) {
+    // In-memory controls remain available when storage is unavailable.
+  }
+}
+
+function setOilFlowMode(mode) {
+  state.viewer.oilFlowSettings = {
+    ...state.viewer.oilFlowSettings,
+    mode,
+  };
+  saveOilFlowSettings();
+  syncOilFlowControls();
+  drawFlow();
+}
+
+function setOilFlowColorMode(colorMode) {
+  state.viewer.oilFlowSettings = {
+    ...state.viewer.oilFlowSettings,
+    colorMode,
+  };
+  saveOilFlowSettings();
+  resetSurfaceOilFlow();
+  syncOilFlowControls();
+  drawFlow();
+}
+
+function setOilFlowPaused(paused) {
+  state.viewer.oilFlowSettings = {
+    ...state.viewer.oilFlowSettings,
+    paused: Boolean(paused),
+  };
+  saveOilFlowSettings();
+  syncOilFlowControls();
+  drawFlow();
+}
+
+function setOilFlowRate(rateMultiplier) {
+  state.viewer.oilFlowSettings = {
+    ...state.viewer.oilFlowSettings,
+    rateMultiplier,
+  };
+  saveOilFlowSettings();
+  syncOilFlowControls();
+}
+
+function shouldDrawOilFlowStatic() {
+  const mode = state.viewer.oilFlowSettings.mode;
+  return state.viewer.visualizationTab === "oilflow"
+    && hasSurfaceOilFlow()
+    && mode !== "animated";
+}
+
+function shouldDrawOilFlowAnimated() {
+  const mode = state.viewer.oilFlowSettings.mode;
+  return state.viewer.visualizationTab === "oilflow"
+    && hasSurfaceOilFlow()
+    && mode !== "static";
+}
+
+function syncOilFlowControls() {
+  const flow = surfaceOilFlowData();
+  const unavailableReason = oilFlowUnavailableReason();
+  const available = !unavailableReason;
+  const settings = state.viewer.oilFlowSettings;
+  for (const [button, mode] of [
+    [els.oilFlowStaticButton, "static"],
+    [els.oilFlowAnimatedButton, "animated"],
+    [els.oilFlowBothButton, "both"],
+  ]) {
+    button.disabled = !available;
+    const active = available && settings.mode === mode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  for (const [button, colorMode] of [
+    [els.oilFlowCfButton, "cf"],
+    [els.oilFlowDirectionButton, "direction"],
+  ]) {
+    button.disabled = !available;
+    const active = available && settings.colorMode === colorMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  const animationEnabled = available && settings.mode !== "static";
+  els.oilFlowControl.classList.toggle("unavailable", !available);
+  els.oilFlowSettings.classList.toggle("unavailable", !available);
+  els.oilFlowSettings.setAttribute("aria-disabled", String(!available));
+  els.oilFlowMotionButton.disabled = !animationEnabled;
+  const action = settings.paused ? "Play" : "Pause";
+  els.oilFlowMotionButton.textContent = action;
+  els.oilFlowMotionButton.setAttribute("aria-label", `${action} oil-flow animation`);
+  els.oilFlowMotionButton.title = `${action} oil-flow animation`;
+  els.oilFlowMotionButton.classList.toggle("active", animationEnabled && !settings.paused);
+  els.oilFlowRateSelect.disabled = !animationEnabled;
+  els.oilFlowRateSelect.value = String(settings.rateMultiplier);
+  if (!available) {
+    els.oilFlowStatus.textContent = unavailableReason;
+    els.oilFlowStatus.setAttribute("aria-label", unavailableReason);
+    els.oilFlowControl.title = unavailableReason;
+    return;
+  }
+  const fieldLabel = flow.timeAveraged ? "Mean wall shear" : "Final-field wall shear";
+  const reverse = Number(flow.reverseSampleCount || 0);
+  const stagnation = Number(flow.stagnationVertexCount || 0);
+  const maximumCf = Math.max(Number(flow.cfDisplayRange?.[1] || 0), 0);
+  const indicatorLabel = settings.colorMode === "direction"
+    ? "blue reverse · gray crossflow · orange with wind"
+    : `Cf 0–${fmt(maximumCf)} · neutral low shear`;
+  const visibleIndicator = settings.colorMode === "direction"
+    ? "wind-relative colors"
+    : `Cf to ${fmt(maximumCf)}`;
+  const windDirection = Array.isArray(flow.windDirection)
+    ? flow.windDirection.map((value) => fmt(Number(value))).join(", ")
+    : "unavailable";
+  els.oilFlowStatus.textContent = `${fieldLabel} · ${flow.lineCount} traces · ${visibleIndicator}`;
+  els.oilFlowStatus.setAttribute(
+    "aria-label",
+    `${fieldLabel}; ${flow.lineCount} traces; ${reverse} reverse-flow samples; ${stagnation} low-shear vertices; ${indicatorLabel}; normalized wind direction ${windDirection}`,
+  );
+  els.oilFlowControl.title = `${fieldLabel}; ${reverse} reverse-flow samples; ${stagnation} low-shear vertices`;
+}
 
 function hasSolverStreamlines() {
   const flow = state.caseReport?.solverStreamlines;
@@ -1171,12 +1760,13 @@ function solverParticleUnavailableReason() {
 }
 
 function shouldDrawSolverLines() {
-  if (!hasSolverStreamlines()) return false;
+  if (state.viewer.visualizationTab !== "airflow" || !hasSolverStreamlines()) return false;
   return Boolean(solverParticleUnavailableReason()) || state.viewer.solverFlowMode !== "particles";
 }
 
 function shouldDrawSolverParticles() {
-  return hasSolverStreamlines()
+  return state.viewer.visualizationTab === "airflow"
+    && hasSolverStreamlines()
     && !solverParticleUnavailableReason()
     && state.viewer.solverFlowMode !== "lines";
 }
@@ -1213,6 +1803,23 @@ function syncSolverFlowControls() {
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   }
+
+  const particleControlsEnabled = particleAvailable && state.viewer.solverFlowMode !== "lines";
+  const particleSettings = state.viewer.solverParticleSettings;
+  const particlePlaying = !particleSettings.paused;
+  els.solverParticleSettings.classList.toggle("unavailable", !particleControlsEnabled);
+  els.solverParticleSettings.setAttribute("aria-disabled", String(!particleControlsEnabled));
+  els.solverParticleMotionButton.disabled = !particleControlsEnabled;
+  const particleMotionAction = particlePlaying ? "Pause" : "Play";
+  els.solverParticleMotionButton.textContent = particleMotionAction;
+  els.solverParticleMotionButton.setAttribute(
+    "aria-label",
+    `${particleMotionAction} particle animation`,
+  );
+  els.solverParticleMotionButton.title = `${particleMotionAction} particle animation`;
+  els.solverParticleMotionButton.classList.toggle("active", particlePlaying);
+  els.solverParticleRateSelect.disabled = !particleControlsEnabled;
+  els.solverParticleRateSelect.value = String(particleSettings.rateMultiplier);
 
   let status = "Run the solver to generate solved flow";
   let detail = status;
@@ -1261,6 +1868,9 @@ function setSurfaceMode(mode) {
   else if (webglAvailable && mode === "temperature" && hasSurfaceTemperature()) state.viewer.surfaceMode = "temperature";
   else if (webglAvailable && mode === "drag" && hasSurfaceDrag()) state.viewer.surfaceMode = "drag";
   else state.viewer.surfaceMode = "material";
+  if (state.viewer.visualizationTab === "airflow") {
+    state.viewer.airflowSurfaceMode = state.viewer.surfaceMode;
+  }
   syncSurfaceModeControls();
   invalidateThreeGeometry();
   renderReadiness();
@@ -1430,6 +2040,109 @@ function restoreViewerPreferences() {
   } catch (_error) {
     els.invertOrbit.checked = false;
   }
+  restoreSolverParticleSettings();
+  restoreOilFlowSettings();
+}
+
+function solverParticleDefaultSettings() {
+  let reducedMotion = false;
+  try {
+    reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+  } catch (_error) {
+    // Motion remains enabled when the browser cannot report this preference.
+  }
+  return { ...SOLVER_PARTICLE_SETTINGS_DEFAULTS, paused: reducedMotion };
+}
+
+function normalizeSolverParticlePreset(value, presets, minimum, maximum, fallback) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  const clampedValue = Math.min(maximum, Math.max(minimum, value));
+  return presets.reduce((nearest, candidate) => (
+    Math.abs(candidate - clampedValue) < Math.abs(nearest - clampedValue) ? candidate : nearest
+  ));
+}
+
+function normalizeSolverParticleSettings(value, fallbackSettings = SOLVER_PARTICLE_SETTINGS_DEFAULTS) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    paused: typeof source.paused === "boolean" ? source.paused : fallbackSettings.paused,
+    rateMultiplier: normalizeSolverParticlePreset(
+      source.rateMultiplier,
+      SOLVER_PARTICLE_RATE_MULTIPLIERS,
+      0.25,
+      2,
+      fallbackSettings.rateMultiplier,
+    ),
+    pointSize: normalizeSolverParticlePreset(
+      source.pointSize,
+      SOLVER_PARTICLE_POINT_SIZES,
+      0.03,
+      0.09,
+      fallbackSettings.pointSize,
+    ),
+    opacity: normalizeSolverParticlePreset(
+      source.opacity,
+      SOLVER_PARTICLE_OPACITIES,
+      0.25,
+      1,
+      fallbackSettings.opacity,
+    ),
+    particlesPerLine: normalizeSolverParticlePreset(
+      source.particlesPerLine,
+      SOLVER_PARTICLE_DENSITIES,
+      1,
+      48,
+      fallbackSettings.particlesPerLine,
+    ),
+  };
+}
+
+function restoreSolverParticleSettings() {
+  let savedSettings = null;
+  try {
+    const storedValue = window.localStorage.getItem(SOLVER_PARTICLE_SETTINGS_STORAGE_KEY);
+    if (storedValue != null) savedSettings = JSON.parse(storedValue);
+  } catch (_error) {
+    // Missing, corrupt, or unavailable storage falls back to safe first-run settings.
+  }
+  state.viewer.solverParticleSettings = normalizeSolverParticleSettings(
+    savedSettings,
+    solverParticleDefaultSettings(),
+  );
+}
+
+function saveSolverParticleSettings() {
+  state.viewer.solverParticleSettings = normalizeSolverParticleSettings(
+    state.viewer.solverParticleSettings,
+  );
+  try {
+    window.localStorage.setItem(
+      SOLVER_PARTICLE_SETTINGS_STORAGE_KEY,
+      JSON.stringify(state.viewer.solverParticleSettings),
+    );
+  } catch (_error) {
+    // The in-memory controls still work when storage is unavailable.
+  }
+}
+
+function setSolverParticlePaused(paused) {
+  state.viewer.solverParticleSettings = {
+    ...state.viewer.solverParticleSettings,
+    paused: Boolean(paused),
+  };
+  saveSolverParticleSettings();
+  syncSolverFlowControls();
+  drawFlow();
+}
+
+function setSolverParticleRate(rateMultiplier) {
+  state.viewer.solverParticleSettings = {
+    ...state.viewer.solverParticleSettings,
+    rateMultiplier,
+  };
+  saveSolverParticleSettings();
+  syncSolverFlowControls();
+  drawFlow();
 }
 
 function saveViewerPreferences() {
@@ -1449,6 +2162,8 @@ function loadReport(modelPath, report, preview = null, exactData = null) {
   state.aeroFeatureScanStatus = "idle";
   state.caseReport = null;
   resetSolverParticles();
+  resetSurfaceOilFlow();
+  state.viewer.visualizationTab = "airflow";
   state.viewer.flowLayer = null;
   syncSolverFlowControls();
   state.activeCasePath = null;
@@ -1456,7 +2171,9 @@ function loadReport(modelPath, report, preview = null, exactData = null) {
   syncRunLogForActiveCase();
   state.viewer.meshSource = "raw";
   state.viewer.surfaceMode = "material";
+  state.viewer.airflowSurfaceMode = "material";
   syncSurfaceModeControls();
+  syncVisualizationControls();
   els.repairStatus.textContent = "";
   state.viewer.modelLayer = null;
   state.viewer.flowEnvelope = null;
@@ -1477,6 +2194,7 @@ function loadReport(modelPath, report, preview = null, exactData = null) {
   renderResultSummary();
   renderRunProgress();
   initFlowVisualization();
+  syncWindCropControls(true);
   drawFlow();
   void loadExactStl(modelPath, exactData);
   scheduleAeroFeatureScan(0);
@@ -2931,12 +3649,17 @@ async function refreshCaseReport(casePath) {
   if (state.activeCasePath !== requestedCasePath) return;
   state.caseReport = payload.report;
   resetSolverParticles();
+  resetSurfaceOilFlow();
   state.viewer.flowLayer = null;
   state.activeRunProgress = payload.report.runProgress || null;
   renderOptimizationStatus();
-  state.viewer.surfaceMode = hasSurfacePressure() ? "cp" : "material";
+  state.viewer.airflowSurfaceMode = hasSurfacePressure() ? "cp" : "material";
+  state.viewer.surfaceMode = state.viewer.visualizationTab === "oilflow"
+    ? "material"
+    : state.viewer.airflowSurfaceMode;
   syncSurfaceModeControls();
   syncSolverFlowControls();
+  syncVisualizationControls();
   restoreCaseContext(payload.report);
   if (payload.report.geometryPreview?.triangles?.length) {
     state.mesh = payload.report.geometryPreview;
@@ -2948,17 +3671,21 @@ async function refreshCaseReport(casePath) {
     state.viewer.flowLayer = null;
     els.modelName.textContent = payload.report.caseName || "OpenFOAM case";
     const progress = payload.report.runProgress;
-    els.modelStatus.textContent = payload.report.solverStreamlines?.lines?.length
+    const solvedVolumeFlow = hasSolverStreamlines();
+    const solvedOilFlow = hasSurfaceOilFlow();
+    els.modelStatus.textContent = solvedVolumeFlow
       ? "Solved OpenFOAM flow"
-      : progress?.isRunning
-        ? `${progress.phase} ${Math.round(progress.percent || 0)}% - current 3D view is preview`
-        : progress?.state === "failed"
-          ? "OpenFOAM run failed - preview only"
-        : progress?.isMeshComplete
-          ? "Mesh validated - preview flow until solver runs"
-        : progress?.isComplete
-            ? "OpenFOAM finished - solved visualization unavailable"
-            : "Preview only - case created, solver not run";
+      : solvedOilFlow
+        ? "Solved OpenFOAM surface oil flow"
+        : progress?.isRunning
+          ? `${progress.phase} ${Math.round(progress.percent || 0)}% - current 3D view is preview`
+          : progress?.state === "failed"
+            ? "OpenFOAM run failed - preview only"
+            : progress?.isMeshComplete
+              ? "Mesh validated - preview flow until solver runs"
+              : progress?.isComplete
+                ? "OpenFOAM finished - solved visualization unavailable"
+                : "Preview only - case created, solver not run";
     initFlowVisualization();
     renderMetrics();
     void loadExactStl(payload.report.geometryModelPath || payload.report.sourceModelPath);
@@ -2967,6 +3694,7 @@ async function refreshCaseReport(casePath) {
   renderResultSummary();
   renderRunProgress();
   renderReadiness();
+  syncWindCropControls(true);
   drawFlow();
 }
 
@@ -3510,15 +4238,21 @@ function renderFlowScene(time, dt = 0) {
 
   const camera = makeCamera(w, h);
   drawTunnelGrid(ctx, camera);
-  if (hasSolverStreamlines()) {
-    if (shouldDrawSolverLines()) drawSolverStreamlines(ctx, camera, time);
-  } else {
-    drawSmokeRibbons(ctx, camera, time);
+  if (state.viewer.visualizationTab === "airflow") {
+    if (hasSolverStreamlines()) {
+      if (shouldDrawSolverLines()) drawSolverStreamlines(ctx, camera, time);
+    } else {
+      drawSmokeRibbons(ctx, camera, time);
+    }
   }
   drawModel(ctx, camera, dt);
   drawViewerHud(ctx, w, h);
-  const surfaceLegendDrawn = drawPressureLegend(ctx, w, h);
-  drawSpeedLegend(ctx, w, h, surfaceLegendDrawn ? 66 : 0);
+  if (state.viewer.visualizationTab === "oilflow") {
+    drawOilFlowLegend(ctx, w, h);
+  } else {
+    const surfaceLegendDrawn = drawPressureLegend(ctx, w, h);
+    drawSpeedLegend(ctx, w, h, surfaceLegendDrawn ? 66 : 0);
+  }
   drawWindDirectionIndicator(ctx, camera, w, h);
 }
 
@@ -3592,6 +4326,7 @@ function drawSmokeRibbons(ctx, camera, time) {
   const speedScale = clamp(speedMph / 70, 0.35, 2.4);
   const speedResponse = previewSpeedResponse();
   const halfLength = env.tunnelLength / 2;
+  const cropBounds = activeWindCropBounds();
   ctx.save();
   ctx.globalCompositeOperation = "screen";
   ctx.lineCap = "round";
@@ -3620,7 +4355,9 @@ function drawSmokeRibbons(ctx, camera, time) {
             time,
           );
       const projected = project(point, camera);
+      const hiddenByCrop = !pointInsideWindCrop(point, cropBounds);
       const blocked =
+        hiddenByCrop ||
         pointInsideObstacle(point, 0.045) ||
         (previousPoint && segmentIntersectsObstacle(previousPoint, point, 0.035));
       if (blocked || !drawing) {
@@ -3687,21 +4424,65 @@ function drawSolverStreamlines(ctx, camera, time) {
   ctx.restore();
 }
 
-function solverFlowCameraSample(point, camera, zOffset) {
+function solverFlowWorldSample(point, zOffset) {
   const x = Number(point?.[0]);
   const y = Number(point?.[1]);
   const z = Number(point?.[2]) + zOffset;
   const speed = Number(point?.[3] ?? 0);
   if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+  return { x, y, z, speed: Number.isFinite(speed) ? speed : 0 };
+}
+
+function interpolateSolverFlowWorldSample(start, end, amount) {
+  return {
+    x: lerp(start.x, end.x, amount),
+    y: lerp(start.y, end.y, amount),
+    z: lerp(start.z, end.z, amount),
+    speed: lerp(start.speed, end.speed, amount),
+  };
+}
+
+function clipSolverFlowWorldSegment(start, end, bounds = activeWindCropBounds()) {
+  if (!bounds) return [start, end];
+  const axes = ["x", "y", "z"];
+  let firstAmount = 0;
+  let lastAmount = 1;
+  for (let axis = 0; axis < axes.length; axis += 1) {
+    const name = axes[axis];
+    const startValue = start[name];
+    const delta = end[name] - startValue;
+    if (Math.abs(delta) <= WIND_CROP_EPSILON) {
+      if (
+        startValue < bounds.min[axis] - WIND_CROP_EPSILON
+        || startValue > bounds.max[axis] + WIND_CROP_EPSILON
+      ) {
+        return null;
+      }
+      continue;
+    }
+    let entryAmount = (bounds.min[axis] - startValue) / delta;
+    let exitAmount = (bounds.max[axis] - startValue) / delta;
+    if (entryAmount > exitAmount) [entryAmount, exitAmount] = [exitAmount, entryAmount];
+    firstAmount = Math.max(firstAmount, entryAmount);
+    lastAmount = Math.min(lastAmount, exitAmount);
+    if (firstAmount >= lastAmount) return null;
+  }
+  return [
+    interpolateSolverFlowWorldSample(start, end, firstAmount),
+    interpolateSolverFlowWorldSample(start, end, lastAmount),
+  ];
+}
+
+function solverFlowCameraSample(point, camera) {
   const yawCos = Math.cos(camera.yaw);
   const yawSin = Math.sin(camera.yaw);
   const pitchCos = Math.cos(camera.pitch);
   const pitchSin = Math.sin(camera.pitch);
-  const cameraX = x * yawCos - y * yawSin;
-  const yawDepth = x * yawSin + y * yawCos;
-  const cameraY = z * pitchCos - yawDepth * pitchSin;
-  const cameraDepth = camera.focal + yawDepth * pitchCos + z * pitchSin;
-  return { x: cameraX, y: cameraY, depth: cameraDepth, speed: Number.isFinite(speed) ? speed : 0 };
+  const cameraX = point.x * yawCos - point.y * yawSin;
+  const yawDepth = point.x * yawSin + point.y * yawCos;
+  const cameraY = point.z * pitchCos - yawDepth * pitchSin;
+  const cameraDepth = camera.focal + yawDepth * pitchCos + point.z * pitchSin;
+  return { x: cameraX, y: cameraY, depth: cameraDepth, speed: point.speed };
 }
 
 function interpolateSolverFlowCameraSample(start, end, amount) {
@@ -3747,12 +4528,18 @@ function projectSolverFlowCameraSample(sample, camera) {
 
 function projectSolverFlowPaths(lines, camera, zOffset) {
   const projectedPaths = [];
+  const cropBounds = activeWindCropBounds();
   for (const path of lines || []) {
     let projected = [];
     let previousEnd = null;
     for (let index = 1; index < path.length; index += 1) {
-      const start = solverFlowCameraSample(path[index - 1], camera, zOffset);
-      const end = solverFlowCameraSample(path[index], camera, zOffset);
+      const worldStart = solverFlowWorldSample(path[index - 1], zOffset);
+      const worldEnd = solverFlowWorldSample(path[index], zOffset);
+      const cropped = worldStart && worldEnd
+        ? clipSolverFlowWorldSegment(worldStart, worldEnd, cropBounds)
+        : null;
+      const start = cropped ? solverFlowCameraSample(cropped[0], camera) : null;
+      const end = cropped ? solverFlowCameraSample(cropped[1], camera) : null;
       const clipped = start && end ? clipSolverFlowSegment(start, end) : null;
       if (!clipped) {
         if (projected.length >= 2) projectedPaths.push(projected);
@@ -3788,6 +4575,7 @@ function solverFlowLayer(camera, flow) {
     camera.pitch.toFixed(4),
     camera.unit.toFixed(2),
     meshGroundOffset().toFixed(6),
+    windCropCacheKey(),
   ].join("|");
   if (state.viewer.flowLayer?.key === key) return state.viewer.flowLayer;
 
@@ -3969,7 +4757,7 @@ function drawPressureLegend(ctx, width, height) {
 }
 
 function drawSpeedLegend(ctx, width, height, verticalOffset = 0) {
-  if (!hasSolverStreamlines()) return false;
+  if (state.viewer.visualizationTab !== "airflow" || !hasSolverStreamlines()) return false;
   const flow = state.caseReport.solverStreamlines;
   const rangeMin = Number(flow.speedRange?.[0] ?? 0);
   const rangeMax = Number(flow.speedRange?.[1] ?? rangeMin);
@@ -4006,9 +4794,60 @@ function drawSpeedLegend(ctx, width, height, verticalOffset = 0) {
   return true;
 }
 
+function drawOilFlowLegend(ctx, width, height) {
+  const flow = surfaceOilFlowData();
+  if (state.viewer.visualizationTab !== "oilflow" || !flow) return false;
+  const directionMode = state.viewer.oilFlowSettings.colorMode === "direction";
+  const maximum = Math.max(Number(flow.cfDisplayRange?.[1] || 0), 1e-12);
+  const panelWidth = Math.min(270, width - 28);
+  const x = 14;
+  const y = Math.max(104, height - 72);
+  const barX = x + 14;
+  const barY = y + 24;
+  const barWidth = panelWidth - 28;
+  ctx.save();
+  ctx.fillStyle = "rgba(15,24,34,0.82)";
+  roundRectPath(ctx, x, y, panelWidth, 58, 8);
+  ctx.fill();
+  for (let pixel = 0; pixel < barWidth; pixel += 1) {
+    const amount = pixel / Math.max(1, barWidth - 1);
+    const color = directionMode
+      ? interpolateOilFlowColor(OIL_FLOW_DIRECTION_COLOR_STOPS, amount)
+      : oilFlowColorChannels(flow, amount * maximum, amount * 2 - 1);
+    ctx.fillStyle = `rgb(${color[0]},${color[1]},${color[2]})`;
+    ctx.fillRect(barX + pixel, barY, 1.2, 8);
+  }
+  ctx.fillStyle = "#dfeaf1";
+  ctx.font = "600 11px Inter, system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(
+    directionMode ? "Wall shear vs incoming wind" : "Skin-friction magnitude Cf",
+    x + panelWidth / 2,
+    y + 16,
+  );
+  ctx.font = "600 10px Inter, system-ui, sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(directionMode ? "Reverse" : "Stagnation", barX, y + 47);
+  ctx.textAlign = "center";
+  ctx.fillText(directionMode ? "Crossflow" : fmt(maximum * 0.5), x + panelWidth / 2, y + 47);
+  ctx.textAlign = "right";
+  ctx.fillText(directionMode ? "With wind" : fmt(maximum), x + panelWidth - 14, y + 47);
+  ctx.restore();
+  return true;
+}
+
 function drawWindDirectionIndicator(ctx, camera, width, height) {
+  const solvedDirection = surfaceOilFlowData()?.windDirection;
+  const windDirection = Array.isArray(solvedDirection)
+    && solvedDirection.length === 3
+    && solvedDirection.every((value) => Number.isFinite(Number(value)))
+    ? solvedDirection.map(Number)
+    : [1, 0, 0];
   const projectedOrigin = project({ x: 0, y: 0, z: 0 }, camera);
-  const projectedTip = project({ x: 1, y: 0, z: 0 }, camera);
+  const projectedTip = project(
+    { x: windDirection[0], y: windDirection[1], z: windDirection[2] },
+    camera,
+  );
   let dx = projectedTip.x - projectedOrigin.x;
   let dy = projectedTip.y - projectedOrigin.y;
   const magnitude = Math.hypot(dx, dy);
@@ -4021,6 +4860,10 @@ function drawWindDirectionIndicator(ctx, camera, width, height) {
   }
 
   const axis = state.caseReport?.caseSetup?.flow?.axis || els.flowAxis.value || "x";
+  const yaw = Number(state.caseReport?.caseSetup?.flow?.yaw_degrees);
+  const windLabel = Number.isFinite(yaw) && Math.abs(yaw) > 0.05
+    ? `WIND ${fmt(yaw)}° YAW`
+    : `WIND +${String(axis).toUpperCase()}`;
   const centerX = width - 62;
   const centerY = height - 35;
   const halfLength = 25;
@@ -4051,7 +4894,7 @@ function drawWindDirectionIndicator(ctx, camera, width, height) {
   ctx.fillStyle = "#dfeaf1";
   ctx.font = "700 11px Inter, system-ui, sans-serif";
   ctx.textAlign = "center";
-  ctx.fillText(`WIND +${String(axis).toUpperCase()}`, centerX, centerY - 20);
+  ctx.fillText(windLabel, centerX, centerY - 20);
   ctx.restore();
 }
 
@@ -4394,8 +5237,14 @@ function updateSolverParticles(view, dt) {
   ensureSolverParticlePoints(view, particles);
   particles.points.visible = true;
 
-  const advance = Math.max(0, Number(dt) || 0) * SOLVER_PARTICLE_ANIMATION_RATE;
+  const settings = state.viewer.solverParticleSettings;
+  const effectiveRate = settings.paused
+    ? 0
+    : SOLVER_PARTICLE_ANIMATION_RATE * settings.rateMultiplier;
+  const advance = Math.max(0, Number(dt) || 0) * effectiveRate;
   const zOffset = meshGroundOffset();
+  const cropBounds = activeWindCropBounds();
+  let visibleCount = 0;
   for (let particleIndex = 0; particleIndex < particles.lineIndices.length; particleIndex += 1) {
     const line = particles.lines[particles.lineIndices[particleIndex]];
     let travel = particles.travelPositions[particleIndex] + advance;
@@ -4414,17 +5263,24 @@ function updateSolverParticles(view, dt) {
     const amount = clamp((travel - segmentStart) / Math.max(segmentEnd - segmentStart, 1e-9), 0, 1);
     const fromOffset = segment * 3;
     const toOffset = fromOffset + 3;
-    const outputOffset = particleIndex * 3;
-    particles.positions[outputOffset] = lerp(line.coordinates[fromOffset], line.coordinates[toOffset], amount);
-    particles.positions[outputOffset + 1] = lerp(line.coordinates[fromOffset + 1], line.coordinates[toOffset + 1], amount);
-    particles.positions[outputOffset + 2] = lerp(
+    const x = lerp(line.coordinates[fromOffset], line.coordinates[toOffset], amount);
+    const y = lerp(line.coordinates[fromOffset + 1], line.coordinates[toOffset + 1], amount);
+    const z = lerp(
       line.coordinates[fromOffset + 2],
       line.coordinates[toOffset + 2],
       amount,
     ) + zOffset;
+    if (!coordinatesInsideWindCrop(x, y, z, cropBounds)) continue;
+
+    const outputOffset = visibleCount * 3;
+    visibleCount += 1;
+    particles.positions[outputOffset] = x;
+    particles.positions[outputOffset + 1] = y;
+    particles.positions[outputOffset + 2] = z;
     const speed = lerp(line.speeds[segment], line.speeds[segment + 1], amount);
     writeSolverParticleColor(particles.colors, outputOffset, speed, particles.speedMin, particles.speedMax);
   }
+  particles.points.geometry.setDrawRange(0, visibleCount);
   particles.points.geometry.getAttribute("position").needsUpdate = true;
   particles.points.geometry.getAttribute("color").needsUpdate = true;
 }
@@ -4438,6 +5294,302 @@ function resetSolverParticles() {
     particles.points.material.dispose();
   }
   state.viewer.solverParticles = null;
+}
+
+function oilFlowColorChannels(flow, cfMagnitude, windAlignment) {
+  const cf = Number.isFinite(cfMagnitude) ? Math.max(0, cfMagnitude) : 0;
+  const threshold = Math.max(Number(flow?.stagnationThreshold || 0), 0);
+  if (cf <= threshold) return [...OIL_FLOW_STAGNATION_COLOR];
+  if (state.viewer.oilFlowSettings.colorMode === "direction") {
+    const amount = clamp((Number(windAlignment || 0) + 1) * 0.5, 0, 1);
+    return interpolateOilFlowColor(OIL_FLOW_DIRECTION_COLOR_STOPS, amount);
+  }
+  const maximum = Math.max(Number(flow?.cfDisplayRange?.[1] || 0), 1e-12);
+  return interpolateOilFlowColor(OIL_FLOW_CF_COLOR_STOPS, clamp(cf / maximum, 0, 1));
+}
+
+function interpolateOilFlowColor(stops, amount) {
+  const scaled = clamp(amount, 0, 1) * (stops.length - 1);
+  const index = Math.min(stops.length - 2, Math.floor(scaled));
+  const blend = scaled - index;
+  return stops[index].map(
+    (channel, channelIndex) => Math.round(lerp(channel, stops[index + 1][channelIndex], blend)),
+  );
+}
+
+function writeOilFlowLinearColor(colors, offset, flow, cfMagnitude, windAlignment) {
+  const channels = oilFlowColorChannels(flow, cfMagnitude, windAlignment);
+  for (let channel = 0; channel < 3; channel += 1) {
+    const value = channels[channel] / 255;
+    colors[offset + channel] = value <= 0.04045
+      ? value / 12.92
+      : ((value + 0.055) / 1.055) ** 2.4;
+  }
+}
+
+function prepareSurfaceOilFlow(view, flow) {
+  resetSurfaceOilFlow();
+  const zOffset = meshGroundOffset();
+  const lines = [];
+  const segmentPositions = [];
+  const segmentColors = [];
+  const displayMaximum = Math.max(Number(flow.cfDisplayRange?.[1] || 0), 1e-12);
+  for (const rawLine of flow.lines || []) {
+    const coordinates = [];
+    const cfValues = [];
+    const alignments = [];
+    for (const sample of rawLine || []) {
+      const x = Number(sample?.[0]);
+      const y = Number(sample?.[1]);
+      const z = Number(sample?.[2]) + zOffset;
+      const cf = Number(sample?.[3]);
+      const alignment = Number(sample?.[4]);
+      if (![x, y, z, cf, alignment].every(Number.isFinite)) continue;
+      if (coordinates.length) {
+        const previous = coordinates.length - 3;
+        if (Math.hypot(
+          x - coordinates[previous],
+          y - coordinates[previous + 1],
+          z - coordinates[previous + 2],
+        ) <= 1e-8) continue;
+      }
+      coordinates.push(x, y, z);
+      cfValues.push(Math.max(0, cf));
+      alignments.push(clamp(alignment, -1, 1));
+    }
+    if (cfValues.length < 2) continue;
+    const travelTimes = new Float32Array(cfValues.length);
+    let totalTravelTime = 0;
+    for (let index = 1; index < cfValues.length; index += 1) {
+      const previousOffset = (index - 1) * 3;
+      const currentOffset = index * 3;
+      const distance = Math.hypot(
+        coordinates[currentOffset] - coordinates[previousOffset],
+        coordinates[currentOffset + 1] - coordinates[previousOffset + 1],
+        coordinates[currentOffset + 2] - coordinates[previousOffset + 2],
+      );
+      const meanCf = (cfValues[index - 1] + cfValues[index]) * 0.5;
+      const response = clamp(meanCf / displayMaximum, 0.08, 1);
+      totalTravelTime += distance / response;
+      travelTimes[index] = totalTravelTime;
+      for (const sampleIndex of [index - 1, index]) {
+        const sampleOffset = sampleIndex * 3;
+        segmentPositions.push(
+          coordinates[sampleOffset],
+          coordinates[sampleOffset + 1],
+          coordinates[sampleOffset + 2],
+        );
+        const colorOffset = segmentColors.length;
+        segmentColors.push(0, 0, 0);
+        writeOilFlowLinearColor(
+          segmentColors,
+          colorOffset,
+          flow,
+          cfValues[sampleIndex],
+          alignments[sampleIndex],
+        );
+      }
+    }
+    if (!Number.isFinite(totalTravelTime) || totalTravelTime <= 1e-8) continue;
+    lines.push({
+      coordinates: new Float32Array(coordinates),
+      cfValues: new Float32Array(cfValues),
+      alignments: new Float32Array(alignments),
+      travelTimes,
+      totalTravelTime,
+    });
+  }
+  if (!lines.length) {
+    state.viewer.surfaceOilFlow = {
+      source: flow,
+      colorMode: state.viewer.oilFlowSettings.colorMode,
+      zOffset,
+      lines: [],
+      lineObject: null,
+      points: null,
+    };
+    return;
+  }
+
+  let lineObject = null;
+  if (segmentPositions.length) {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(segmentPositions, 3));
+    geometry.setAttribute("color", new THREE.Float32BufferAttribute(segmentColors, 3));
+    const material = new THREE.LineBasicMaterial({
+      depthTest: true,
+      depthWrite: false,
+      opacity: 0.88,
+      toneMapped: false,
+      transparent: true,
+      vertexColors: true,
+    });
+    lineObject = new THREE.LineSegments(geometry, material);
+    lineObject.frustumCulled = false;
+    lineObject.renderOrder = 4;
+    view.group.add(lineObject);
+  }
+
+  const particleCount = Math.min(
+    OIL_FLOW_MAX_PARTICLE_COUNT,
+    lines.length * OIL_FLOW_PARTICLES_PER_LINE,
+  );
+  const lineIndices = new Uint16Array(particleCount);
+  const travelPositions = new Float32Array(particleCount);
+  const segmentIndices = new Uint16Array(particleCount);
+  const baseCount = Math.floor(particleCount / lines.length);
+  const remainder = particleCount % lines.length;
+  let particleIndex = 0;
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
+    const count = baseCount + (lineIndex < remainder ? 1 : 0);
+    const stagger = (lineIndex * 0.38196601125) % 1;
+    for (let localIndex = 0; localIndex < count; localIndex += 1) {
+      const phase = ((localIndex + 0.5) / count + stagger) % 1;
+      const travel = phase * line.totalTravelTime;
+      let segment = 0;
+      while (segment < line.travelTimes.length - 2 && travel >= line.travelTimes[segment + 1]) {
+        segment += 1;
+      }
+      lineIndices[particleIndex] = lineIndex;
+      travelPositions[particleIndex] = travel;
+      segmentIndices[particleIndex] = segment;
+      particleIndex += 1;
+    }
+  }
+  state.viewer.surfaceOilFlow = {
+    source: flow,
+    colorMode: state.viewer.oilFlowSettings.colorMode,
+    zOffset,
+    lines,
+    lineObject,
+    lineIndices,
+    travelPositions,
+    segmentIndices,
+    positions: new Float32Array(particleCount * 3),
+    colors: new Float32Array(particleCount * 3),
+    points: null,
+  };
+}
+
+function ensureSurfaceOilFlowPoints(view, layer) {
+  if (layer.points) return;
+  const geometry = new THREE.BufferGeometry();
+  const positions = new THREE.BufferAttribute(layer.positions, 3);
+  const colors = new THREE.BufferAttribute(layer.colors, 3);
+  positions.setUsage(THREE.DynamicDrawUsage);
+  colors.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute("position", positions);
+  geometry.setAttribute("color", colors);
+  const material = new THREE.PointsMaterial({
+    alphaTest: 0.03,
+    blending: THREE.AdditiveBlending,
+    depthTest: true,
+    depthWrite: false,
+    map: createSolverParticleTexture(),
+    opacity: 0.9,
+    size: 0.026,
+    sizeAttenuation: true,
+    toneMapped: false,
+    transparent: true,
+    vertexColors: true,
+  });
+  layer.points = new THREE.Points(geometry, material);
+  layer.points.frustumCulled = false;
+  layer.points.renderOrder = 5;
+  view.group.add(layer.points);
+}
+
+function updateSurfaceOilFlow(view, dt) {
+  const flow = surfaceOilFlowData();
+  if (!flow || !hasSurfaceOilFlow()) {
+    resetSurfaceOilFlow();
+    return;
+  }
+  if (state.viewer.visualizationTab !== "oilflow") {
+    if (state.viewer.surfaceOilFlow?.lineObject) {
+      state.viewer.surfaceOilFlow.lineObject.visible = false;
+    }
+    if (state.viewer.surfaceOilFlow?.points) {
+      state.viewer.surfaceOilFlow.points.visible = false;
+    }
+    return;
+  }
+  const zOffset = meshGroundOffset();
+  const colorMode = state.viewer.oilFlowSettings.colorMode;
+  if (
+    state.viewer.surfaceOilFlow?.source !== flow
+    || state.viewer.surfaceOilFlow?.colorMode !== colorMode
+    || Math.abs(Number(state.viewer.surfaceOilFlow?.zOffset || 0) - zOffset) > 1e-9
+  ) {
+    prepareSurfaceOilFlow(view, flow);
+  }
+  const layer = state.viewer.surfaceOilFlow;
+  if (!layer?.lines?.length) return;
+  if (layer.lineObject) layer.lineObject.visible = shouldDrawOilFlowStatic();
+  if (!shouldDrawOilFlowAnimated()) {
+    if (layer.points) layer.points.visible = false;
+    return;
+  }
+  ensureSurfaceOilFlowPoints(view, layer);
+  layer.points.visible = true;
+  const settings = state.viewer.oilFlowSettings;
+  const advance = settings.paused
+    ? 0
+    : Math.max(0, Number(dt) || 0) * OIL_FLOW_ANIMATION_RATE * settings.rateMultiplier;
+  for (let particleIndex = 0; particleIndex < layer.lineIndices.length; particleIndex += 1) {
+    const line = layer.lines[layer.lineIndices[particleIndex]];
+    let travel = layer.travelPositions[particleIndex] + advance;
+    let segment = layer.segmentIndices[particleIndex];
+    if (travel >= line.totalTravelTime) {
+      travel %= line.totalTravelTime;
+      segment = 0;
+    }
+    while (segment < line.travelTimes.length - 2 && travel >= line.travelTimes[segment + 1]) {
+      segment += 1;
+    }
+    while (segment > 0 && travel < line.travelTimes[segment]) segment -= 1;
+    layer.travelPositions[particleIndex] = travel;
+    layer.segmentIndices[particleIndex] = segment;
+    const segmentStart = line.travelTimes[segment];
+    const segmentEnd = line.travelTimes[segment + 1];
+    const amount = clamp(
+      (travel - segmentStart) / Math.max(segmentEnd - segmentStart, 1e-9),
+      0,
+      1,
+    );
+    const fromOffset = segment * 3;
+    const toOffset = fromOffset + 3;
+    const outputOffset = particleIndex * 3;
+    for (let axis = 0; axis < 3; axis += 1) {
+      layer.positions[outputOffset + axis] = lerp(
+        line.coordinates[fromOffset + axis],
+        line.coordinates[toOffset + axis],
+        amount,
+      );
+    }
+    const cf = lerp(line.cfValues[segment], line.cfValues[segment + 1], amount);
+    const alignment = lerp(line.alignments[segment], line.alignments[segment + 1], amount);
+    writeOilFlowLinearColor(layer.colors, outputOffset, flow, cf, alignment);
+  }
+  layer.points.geometry.getAttribute("position").needsUpdate = true;
+  layer.points.geometry.getAttribute("color").needsUpdate = true;
+}
+
+function resetSurfaceOilFlow() {
+  const layer = state.viewer.surfaceOilFlow;
+  if (layer?.lineObject) {
+    layer.lineObject.parent?.remove(layer.lineObject);
+    layer.lineObject.geometry.dispose();
+    layer.lineObject.material.dispose();
+  }
+  if (layer?.points) {
+    layer.points.parent?.remove(layer.points);
+    layer.points.geometry.dispose();
+    layer.points.material.map?.dispose();
+    layer.points.material.dispose();
+  }
+  state.viewer.surfaceOilFlow = null;
 }
 
 function renderThreeStlModel(cameraState, dt = 0) {
@@ -4470,6 +5622,7 @@ function renderThreeStlModel(cameraState, dt = 0) {
     updateThreeCamera(view, cameraState);
     view.wireframe.visible = els.showEdges.checked;
     updateSolverParticles(view, dt);
+    updateSurfaceOilFlow(view, dt);
     view.renderer.render(view.scene, view.camera);
     return true;
   } catch (error) {
@@ -4522,6 +5675,7 @@ function disableThreeViewer(error) {
   const view = state.viewer.webgl;
   if (!view.failed) console.warn("Three.js viewer failed; using Canvas2D solved lines.", error);
   resetSolverParticles();
+  resetSurfaceOilFlow();
   try {
     if (view.group) disposeThreeGeometry(view);
   } catch (_disposeError) {
@@ -4550,10 +5704,13 @@ function disableThreeViewer(error) {
   view.pixelRatio = 0;
   els.modelCanvas.width = Math.max(1, els.modelCanvas.width);
   state.viewer.modelLayer = null;
+  state.viewer.visualizationTab = "airflow";
   state.viewer.surfaceMode = "material";
+  state.viewer.airflowSurfaceMode = "material";
   state.viewer.solverFlowMode = "lines";
   syncSurfaceModeControls();
   syncSolverFlowControls();
+  syncVisualizationControls();
 }
 
 function rebuildThreeGeometry(view, geometryKey) {

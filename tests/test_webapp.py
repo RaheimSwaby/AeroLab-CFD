@@ -151,6 +151,9 @@ class AccuracyStudyApiTests(unittest.TestCase):
             "solverLinesButton",
             "solverParticlesButton",
             "solverBothButton",
+            "solverParticleSettings",
+            "solverParticleMotionButton",
+            "solverParticleRateSelect",
         ):
             with self.subTest(control_id=control_id):
                 self.assertIn(f'id="{control_id}"', index)
@@ -162,6 +165,10 @@ class AccuracyStudyApiTests(unittest.TestCase):
             "setSolverFlowMode",
             "ensureSolverParticlePoints",
             "syncSolverFlowControls",
+            "restoreSolverParticleSettings",
+            "saveSolverParticleSettings",
+            "setSolverParticlePaused",
+            "setSolverParticleRate",
         ):
             with self.subTest(function_name=function_name):
                 self.assertIn(f"function {function_name}(", app)
@@ -178,6 +185,13 @@ class AccuracyStudyApiTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertIn(f'[els.{button_name}, "{mode}"]', app)
         self.assertIn('button.setAttribute("aria-pressed", String(active))', app)
+        self.assertIn('"aerolab-particle-settings-v1"', app)
+        self.assertIn('"(prefers-reduced-motion: reduce)"', app)
+        self.assertIn("SOLVER_PARTICLE_ANIMATION_RATE * settings.rateMultiplier", app)
+        self.assertIn("particleAvailable && state.viewer.solverFlowMode !== \"lines\"", app)
+        for rate_value in ("0.5", "1", "2"):
+            with self.subTest(rate_value=rate_value):
+                self.assertIn(f'<option value="{rate_value}"', index)
 
     def test_creates_thermal_case_with_heat_zone_through_api(self) -> None:
         project = Path(__file__).resolve().parents[1]
@@ -257,7 +271,7 @@ class AccuracyStudyApiTests(unittest.TestCase):
         ):
             with self.subTest(control_id=control_id):
                 self.assertIn(f'id="{control_id}"', index)
-        self.assertIn('src="/assets/app.js?v=67"', index)
+        self.assertIn('src="/assets/app.js?v=71"', index)
         self.assertIn('processes: els.solverProcesses.value', app)
         self.assertIn('fileHandler: els.solverFileHandler.value', app)
         self.assertIn('resume: !meshOnly && els.resumeSolver.checked', app)
