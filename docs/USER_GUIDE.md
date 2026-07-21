@@ -157,6 +157,16 @@ The browser exposes the same optimization controls as the CLI:
 
 Automatic selection reserves one CPU, reserves at least 25% or 1 GiB of memory, budgets 2 GiB per rank, and caps a case at eight ranks. It also reduces ranks for small cell budgets. If MPI tools are incomplete, Auto uses serial execution. A manually requested count is rejected when it exceeds backend CPU or conservative memory limits; AeroLab does not silently reduce it.
 
+### Failure budget guidance and retry
+
+When a run fails with resource evidence, the red progress detail and Engineering optimization status explain the evidence and show a concrete safer allowance. Memory guidance reserves the larger of 25% or 1 GiB from backend-visible memory, subtracts 2 GiB of fixed solver overhead, allows about 2 KiB per configured maximum cell, and rounds down to 50,000 cells. This is a conservative planning estimate, not a replacement for **Validate Mesh**.
+
+A high-confidence out-of-memory or MPI-slot failure can expose **Retry with safer budget**. That action reruns the same case with fewer processes only; geometry, mesh quality, physical models, numerics, and every trust gate stay unchanged. If the failed request used **Auto**, AeroLab may perform this same adjustment once automatically. It never loops and never lowers Draft/Standard/Fine on its own.
+
+No compute retry is offered for full storage, ambiguous timeout evidence, a memory failure already at one process, or a configured mesh cap above the safe allowance. Follow the displayed action instead: free backend storage, increase an evidenced runtime limit, add backend memory, or explicitly regenerate at the stated cell allowance. Choosing a lower quality preset changes fidelity, so validate the new mesh and repeat comparison evidence.
+
+A failed study is never auto-retried. When every failed member has a safe rank-only adjustment, **Retry with safer budget** sets the per-case and aggregate process budgets equal, forcing one member at a time. This is an explicit whole-study rerun and can repeat members that previously succeeded.
+
 Parallel mesh and solve stages decompose the case, execute the MPI-capable OpenFOAM command, reconstruct durable serial results, and remove `processorN` directories. The optimization status reports the requested and resolved rank counts. Do not assume eight ranks are eight times faster: MPI communication, decomposition, reconstruction, and filesystem work impose overhead, and small cases may run faster serially. This repository has not yet completed a real serial-versus-auto timing run, so no speedup percentage is claimed.
 
 ### Cache and mesh reuse

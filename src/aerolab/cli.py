@@ -46,6 +46,27 @@ def _text_number(value: object, digits: int = 6) -> str:
     return f"{float(value):.{digits}g}"
 
 
+def _print_budget_recommendation(value: object) -> None:
+    if not isinstance(value, dict):
+        return
+    print(f"Budget guidance: {value.get('title') or 'Safer workstation budget'}")
+    if value.get("detail"):
+        print(f"  {value['detail']}")
+    if isinstance(value.get("recommendedProcesses"), int):
+        print(f"  Recommended processes: {value['recommendedProcesses']}")
+    if isinstance(value.get("recommendedProcessBudget"), int):
+        print(f"  Recommended study process budget: {value['recommendedProcessBudget']}")
+    if isinstance(value.get("safeCellBudget"), int):
+        print(f"  Conservative cell allowance: {value['safeCellBudget']:,}")
+    if isinstance(value.get("configuredCellBudget"), int):
+        print(f"  Configured case cell cap: {value['configuredCellBudget']:,}")
+    if value.get("suggestedQuality"):
+        print(
+            "  Explicit mesh alternative (changes fidelity): "
+            f"{str(value['suggestedQuality']).title()}"
+        )
+
+
 def _report_text(report: dict[str, object]) -> str:
     lines = [
         f"Case: {report.get('caseName')}",
@@ -1016,6 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Return code: {result.returncode}")
             print(f"Numerically qualified: {'yes' if result.trusted else 'no'}")
             print(f"Log: {result.log_path}")
+            _print_budget_recommendation(result.budget_recommendation)
             force_coeffs = result.report.get("forceCoeffs")
             if force_coeffs:
                 print(f"Mean Cd: {force_coeffs.get('meanCd')}")
@@ -1049,6 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if plan.get("memoryWarning"):
                 print(f"Memory warning: {plan.get('memoryWarning')}")
+            _print_budget_recommendation(result.get("budgetRecommendation"))
             for member in result.get("results", []):
                 if isinstance(member, dict):
                     status = "ok" if member.get("ok") else "failed"

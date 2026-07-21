@@ -112,6 +112,143 @@ class SolverQualityTests(unittest.TestCase):
         self.assertEqual(selection["autoCaps"]["cellBudget"], 6)
         self.assertEqual(selection["qualityRecommendation"]["status"], "comfortable")
 
+    def test_oom_recommendation_allows_one_same_fidelity_auto_retry(self) -> None:
+        from aerolab.solver.run import (
+            _failure_budget_recommendation,
+            _safe_cell_budget,
+            _suggested_quality,
+        )
+
+        gib = 1024**3
+        resources = {
+            "effectiveCpus": 8,
+            "memoryAvailableBytes": 8 * gib,
+            "parallelAvailable": True,
+        }
+        self.assertEqual(_safe_cell_budget(resources), 2_050_000)
+        self.assertIsNone(_suggested_quality(1_500_000))
+        self.assertEqual(_suggested_quality(2_050_000), "draft")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            case_path = Path(temp_dir)
+            case_path.joinpath("case.json").write_text(
+                json.dumps(
+                    {
+                        "cfd_quality": {"name": "standard"},
+                        "mesh_resolution": {
+                            "configured_max_global_cells": 1_500_000,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            recommendation = _failure_budget_recommendation(
+                case_path,
+                returncode=137,
+                log_text="OpenFOAM process killed by the backend",
+                requested_processes="auto",
+                processes=4,
+                process_selection={"detectedResources": resources},
+            )
+
+        assert recommendation is not None
+        self.assertEqual(recommendation["category"], "memory_oom")
+        self.assertEqual(recommendation["confidence"], "high")
+        self.assertEqual(recommendation["recommendedProcesses"], 2)
+        self.assertTrue(recommendation["retryAllowed"])
+        self.assertTrue(recommendation["autoRetrySafe"])
+        self.assertTrue(recommendation["preservesCaseFidelity"])
+        self.assertIsNone(recommendation["suggestedQuality"])
+
+    def test_resource_failure_categories_do_not_guess_at_unsafe_retries(self) -> None:
+        from aerolab.solver.run import _failure_budget_recommendation
+
+        gib = 1024**3
+        resources = {
+            "effectiveCpus": 8,
+            "memoryAvailableBytes": 4 * gib,
+            "parallelAvailable": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            case_path = Path(temp_dir)
+            case_path.joinpath("case.json").write_text(
+                json.dumps(
+                    {
+                        "cfd_quality": {"name": "standard"},
+                        "mesh_resolution": {
+                            "configured_max_global_cells": 2_800_000,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            selection = {"detectedResources": resources}
+            single_rank = _failure_budget_recommendation(
+                case_path,
+                returncode=1,
+                log_text="terminate called after throwing std::bad_alloc",
+                requested_processes="auto",
+                processes=1,
+                process_selection=selection,
+            )
+            slots = _failure_budget_recommendation(
+                case_path,
+                returncode=1,
+                log_text="There are not enough slots available in the system",
+                requested_processes="auto",
+                processes=8,
+                process_selection=selection,
+            )
+            storage = _failure_budget_recommendation(
+                case_path,
+                returncode=1,
+                log_text="write failed: No space left on device",
+                requested_processes="auto",
+                processes=4,
+                process_selection=selection,
+            )
+            mesh = _failure_budget_recommendation(
+                case_path,
+                returncode=124,
+                log_text=(
+                    "Shell refinement iteration 2\n"
+                    "After refinement shell refinement iteration 1 : "
+                    "cells:2100000 faces:1 points:1"
+                ),
+                requested_processes="auto",
+                processes=4,
+                process_selection=selection,
+            )
+            timeout = _failure_budget_recommendation(
+                case_path,
+                returncode=124,
+                log_text="=== AEROLAB STEP: foamRun ===\nTime = 25s",
+                requested_processes="auto",
+                processes=4,
+                process_selection=selection,
+            )
+
+        assert single_rank is not None
+        assert slots is not None
+        assert storage is not None
+        assert mesh is not None
+        assert timeout is not None
+        self.assertEqual(single_rank["category"], "memory_oom")
+        self.assertFalse(single_rank["retryAllowed"])
+        self.assertFalse(single_rank["autoRetrySafe"])
+        self.assertEqual(single_rank["safeCellBudget"], 500_000)
+        self.assertEqual(slots["category"], "cpu_mpi_oversubscription")
+        self.assertEqual(slots["recommendedProcesses"], 4)
+        self.assertTrue(slots["retryAllowed"])
+        self.assertEqual(storage["category"], "storage_exhaustion")
+        self.assertFalse(storage["retryAllowed"])
+        self.assertEqual(mesh["category"], "mesh_cell_budget")
+        self.assertEqual(mesh["safeCellBudget"], 500_000)
+        self.assertEqual(mesh["configuredCellBudget"], 2_800_000)
+        self.assertFalse(mesh["retryAllowed"])
+        self.assertEqual(timeout["category"], "runtime_timeout")
+        self.assertFalse(timeout["retryAllowed"])
+
     def test_wsl_and_docker_commands_propagate_optimization_settings(self) -> None:
         import os
         from unittest import mock
@@ -269,6 +406,12 @@ class SolverQualityTests(unittest.TestCase):
                 "qualityRecommendation": {"status": "comfortable"},
             }
             convergence = {"controller": "foundationResidualControl"}
+            budget_recommendation = {
+                "category": "memory_oom",
+                "detail": "Retry unchanged with fewer processes.",
+                "retryAllowed": True,
+                "recommendedProcesses": 3,
+            }
             case_path.joinpath("aerolab-run.json").write_text(
                 json.dumps(
                     {
@@ -281,6 +424,7 @@ class SolverQualityTests(unittest.TestCase):
                         "resumeFromTime": None,
                         "convergencePolicy": convergence,
                         "processSelection": process_selection,
+                        "budgetRecommendation": budget_recommendation,
                     }
                 ),
                 encoding="utf-8",
@@ -302,6 +446,11 @@ class SolverQualityTests(unittest.TestCase):
             self.assertEqual(
                 progress["optimization"]["processSelection"],
                 process_selection,
+            )
+            self.assertEqual(progress["budgetRecommendation"], budget_recommendation)
+            self.assertEqual(
+                progress["optimization"]["budgetRecommendation"],
+                budget_recommendation,
             )
             self.assertEqual(progress["studyRun"], study_run)
 
@@ -746,8 +895,22 @@ POLYGONS 4 16
                 ),
                 encoding="utf-8",
             )
+            budget_recommendation = {
+                "category": "mesh_cell_budget",
+                "title": "Mesh refinement reached workstation budget pressure",
+                "detail": "Use a conservative 2,050,000-cell allowance.",
+                "safeCellBudget": 2_050_000,
+                "retryAllowed": False,
+            }
             case_path.joinpath("aerolab-run.json").write_text(
-                json.dumps({"status": "failed", "mode": "mesh", "returncode": 15}),
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "mode": "mesh",
+                        "returncode": 15,
+                        "budgetRecommendation": budget_recommendation,
+                    }
+                ),
                 encoding="utf-8",
             )
             case_path.joinpath("aerolab-run.log").write_text(
@@ -770,6 +933,8 @@ POLYGONS 4 16
             self.assertIn("3,714,808 cells", progress["detail"])
             self.assertIn("refinement level 9", progress["detail"])
             self.assertIn("4 mm feature target", progress["detail"])
+            self.assertIn("2,050,000-cell allowance", progress["detail"])
+            self.assertEqual(progress["budgetRecommendation"], budget_recommendation)
 
     def test_interrupted_shell_refinement_is_not_mislabeled_as_feature_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

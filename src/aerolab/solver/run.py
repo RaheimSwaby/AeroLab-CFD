@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -14,8 +15,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
-from ..openfoam import configure_decomposition, ensure_case_postprocessing
-from .analysis import _latest_body_surface_vtk, assess_meshed_surface_fidelity, case_report
+from ..openfoam import QUALITY_PRESETS, configure_decomposition, ensure_case_postprocessing
+from .analysis import (
+    _latest_body_surface_vtk,
+    _tail_text,
+    assess_meshed_surface_fidelity,
+    case_report,
+)
 from .backends import (
     _backend_cleanup_command,
     _backend_cleanup_verification_command,
@@ -39,6 +45,262 @@ MANUAL_MIN_BYTES_PER_PROCESS = 1024**3
 AUTO_CELLS_PER_PROCESS = 250_000
 QUALITY_ESTIMATED_BYTES_PER_CELL = 2048
 QUALITY_FIXED_MEMORY_BYTES = 2 * 1024**3
+SAFE_CELL_BUDGET_ROUNDING = 50_000
+
+
+def _safe_cell_budget(resources: dict[str, object]) -> int | None:
+    """Estimate a conservative generated-cell allowance from backend memory."""
+    available_value = resources.get("memoryAvailableBytes")
+    if (
+        isinstance(available_value, bool)
+        or not isinstance(available_value, int | float)
+        or available_value < 0
+    ):
+        return None
+    available = int(available_value)
+    reserve = max(1024**3, available // 4)
+    cell_memory = max(0, available - reserve - QUALITY_FIXED_MEMORY_BYTES)
+    cells = cell_memory // QUALITY_ESTIMATED_BYTES_PER_CELL
+    return int(cells // SAFE_CELL_BUDGET_ROUNDING * SAFE_CELL_BUDGET_ROUNDING)
+
+
+def _suggested_quality(safe_cell_budget: int | None) -> str | None:
+    if safe_cell_budget is None:
+        return None
+    ranked = sorted(
+        (
+            (
+                max(
+                    int(preset["max_global_cells"]),
+                    int(preset.get("adaptive_max_global_cells", 0)),
+                ),
+                name,
+            )
+            for name, preset in QUALITY_PRESETS.items()
+        ),
+        reverse=True,
+    )
+    return next(
+        (name for cell_budget, name in ranked if safe_cell_budget >= cell_budget),
+        None,
+    )
+
+
+def _failure_budget_recommendation(
+    case_path: Path,
+    *,
+    returncode: int,
+    log_text: str,
+    requested_processes: str | int,
+    processes: int,
+    process_selection: dict[str, object],
+) -> dict[str, object] | None:
+    """Diagnose resource-related failures without changing case fidelity."""
+    resources_value = process_selection.get("detectedResources")
+    resources = resources_value if isinstance(resources_value, dict) else {}
+    safe_cells = _safe_cell_budget(resources)
+    configured_cells = _case_cell_budget(case_path)
+    lower_quality = (
+        _suggested_quality(safe_cells)
+        if safe_cells is not None
+        and configured_cells is not None
+        and configured_cells > safe_cells
+        else None
+    )
+    recommended_processes = max(1, math.ceil(max(1, processes) / 2))
+    normalized_log = log_text.lower()
+
+    def payload(
+        *,
+        category: str,
+        confidence: str,
+        title: str,
+        detail: str,
+        evidence: list[str],
+        retry_allowed: bool = False,
+        auto_retry_safe: bool = False,
+        process_recommendation: int | None = None,
+        preserves_fidelity: bool = True,
+    ) -> dict[str, object]:
+        return {
+            "category": category,
+            "confidence": confidence,
+            "title": title,
+            "detail": detail,
+            "evidence": evidence,
+            "retryAllowed": retry_allowed,
+            "autoRetrySafe": auto_retry_safe,
+            "recommendedProcesses": process_recommendation,
+            "recommendedProcessBudget": None,
+            "safeCellBudget": safe_cells,
+            "configuredCellBudget": configured_cells,
+            "suggestedQuality": lower_quality,
+            "preservesCaseFidelity": preserves_fidelity,
+        }
+
+    storage_evidence = [
+        phrase
+        for phrase in ("no space left on device", "disk quota exceeded")
+        if phrase in normalized_log
+    ]
+    if storage_evidence:
+        return payload(
+            category="storage_exhaustion",
+            confidence="high",
+            title="Solver storage is exhausted",
+            detail=(
+                "Free space in the solver backend or increase its storage allocation, then "
+                "retry the unchanged case. Reducing MPI ranks does not repair a full filesystem."
+            ),
+            evidence=storage_evidence,
+        )
+
+    slot_evidence = [
+        phrase
+        for phrase in (
+            "not enough slots",
+            "not enough processors",
+            "unable to allocate the requested resources",
+        )
+        if phrase in normalized_log
+    ]
+    if slot_evidence:
+        can_retry = processes > 1
+        return payload(
+            category="cpu_mpi_oversubscription",
+            confidence="high",
+            title="MPI requested more slots than the backend can provide",
+            detail=(
+                f"Retry the unchanged case with {recommended_processes} process"
+                f"{'es' if recommended_processes != 1 else ''}. Geometry, mesh quality, "
+                "physics, and verification gates remain unchanged."
+                if can_retry
+                else "The run already used one process; inspect the backend MPI host/slot configuration."
+            ),
+            evidence=slot_evidence,
+            retry_allowed=can_retry,
+            auto_retry_safe=can_retry and requested_processes == "auto",
+            process_recommendation=recommended_processes if can_retry else None,
+        )
+
+    memory_evidence: list[str] = []
+    if returncode in {-9, 137}:
+        memory_evidence.append(f"process return code {returncode}")
+    for phrase in (
+        "std::bad_alloc",
+        "cannot allocate memory",
+        "out of memory",
+        "oom-kill",
+        "oom killer",
+    ):
+        if phrase in normalized_log:
+            memory_evidence.append(phrase)
+    if memory_evidence:
+        cell_budget_fits = (
+            safe_cells is None
+            or configured_cells is None
+            or configured_cells <= safe_cells
+        )
+        can_retry = processes > 1 and cell_budget_fits
+        if can_retry:
+            detail = (
+                f"Retry the unchanged case with {recommended_processes} process"
+                f"{'es' if recommended_processes != 1 else ''} to reduce MPI memory overhead. "
+                "Geometry, mesh quality, physics, and verification gates remain unchanged."
+            )
+        elif safe_cells is not None and configured_cells is not None and not cell_budget_fits:
+            quality_detail = (
+                f" The largest built-in preset within that allowance is {lower_quality.title()}."
+                if lower_quality
+                else " No built-in quality preset fits that allowance."
+            )
+            detail = (
+                f"The backend's conservative allowance is about {safe_cells:,} cells, below "
+                f"this case's {configured_cells:,}-cell cap.{quality_detail} Add backend memory "
+                "to preserve this case, or explicitly regenerate with a lower mesh budget and "
+                "repeat mesh validation; AeroLab will not downgrade it automatically."
+            )
+        else:
+            detail = (
+                "The run already used one process, so no safer same-fidelity rank reduction "
+                "remains. Add backend memory or explicitly regenerate with a lower mesh budget "
+                "and repeat mesh validation."
+            )
+        return payload(
+            category="memory_oom",
+            confidence="high",
+            title="OpenFOAM exceeded the backend memory budget",
+            detail=detail,
+            evidence=memory_evidence,
+            retry_allowed=can_retry,
+            auto_retry_safe=can_retry and requested_processes == "auto",
+            process_recommendation=recommended_processes if can_retry else None,
+            preserves_fidelity=can_retry or lower_quality is None,
+        )
+
+    cell_matches = re.findall(
+        r"After refinement[^\n]*cells:\s*(\d+)",
+        log_text,
+        re.IGNORECASE,
+    )
+    refinement_pressure = bool(cell_matches) or any(
+        marker in normalized_log
+        for marker in (
+            "feature refinement iteration",
+            "surface refinement iteration",
+            "shell refinement iteration",
+        )
+    )
+    if refinement_pressure:
+        evidence = ["run ended during mesh refinement"]
+        if cell_matches:
+            evidence.append(f"last reported mesh size {int(cell_matches[-1]):,} cells")
+        if safe_cells is None:
+            detail = (
+                "Mesh refinement ended before a usable mesh was produced, but the backend did "
+                "not report enough memory data to calculate a safe cell allowance. Inspect the "
+                "run log and backend memory before retrying."
+            )
+        elif configured_cells is not None and configured_cells > safe_cells:
+            quality_detail = (
+                f" {lower_quality.title()} is the largest built-in preset within that allowance."
+                if lower_quality
+                else " No built-in preset fits that allowance."
+            )
+            detail = (
+                f"This backend's conservative allowance is about {safe_cells:,} cells versus "
+                f"the case's {configured_cells:,}-cell cap.{quality_detail} Add memory to keep "
+                "the case unchanged, or explicitly regenerate at a lower mesh budget and "
+                "validate it again."
+            )
+        else:
+            detail = (
+                f"The configured mesh cap is within the backend's conservative {safe_cells:,}-cell "
+                "allowance, so this log alone does not prove an out-of-memory failure. Inspect the "
+                "final meshing messages or increase the runtime limit before retrying."
+            )
+        return payload(
+            category="mesh_cell_budget",
+            confidence="medium",
+            title="Mesh refinement reached workstation budget pressure",
+            detail=detail,
+            evidence=evidence,
+            preserves_fidelity=lower_quality is None,
+        )
+
+    if returncode == 124:
+        return payload(
+            category="runtime_timeout",
+            confidence="high",
+            title="The solver reached its runtime limit",
+            detail=(
+                "No direct memory, MPI-slot, or storage failure was found. Increase the runtime "
+                "limit or inspect the final solver phase; AeroLab will not guess at a compute "
+                "adjustment from timeout evidence alone."
+            ),
+            evidence=["process return code 124"],
+        )
+    return None
 
 
 def normalize_process_request(value: object) -> str | int:
@@ -305,6 +567,7 @@ class SolverRunResult:
     solver_input_fingerprint: str | None = None
     convergence_policy: dict[str, object] = field(default_factory=dict)
     process_selection: dict[str, object] = field(default_factory=dict)
+    budget_recommendation: dict[str, object] | None = None
 
     @property
     def ok(self) -> bool:
@@ -336,6 +599,7 @@ class SolverRunResult:
             "solverInputFingerprint": self.solver_input_fingerprint,
             "convergencePolicy": self.convergence_policy,
             "processSelection": self.process_selection,
+            "budgetRecommendation": self.budget_recommendation,
             "returncode": self.returncode,
             "logPath": str(self.log_path),
             "startedAt": self.started_at,
@@ -361,6 +625,7 @@ def _run_record(result: SolverRunResult) -> dict[str, object]:
         "solverInputFingerprint": result.solver_input_fingerprint,
         "convergencePolicy": result.convergence_policy,
         "processSelection": result.process_selection,
+        "budgetRecommendation": result.budget_recommendation,
         "returncode": result.returncode,
         "logPath": str(result.log_path),
         "startedAt": result.started_at,
@@ -484,6 +749,7 @@ def run_case(
                 "solverInputFingerprint": solver_input_fingerprint,
                 "convergencePolicy": convergence_policy,
                 "processSelection": process_selection,
+                "budgetRecommendation": None,
                 "returncode": None,
                 "logPath": str(log_path),
                 "startedAt": started_at,
@@ -526,6 +792,18 @@ def run_case(
                 "staged partial results were copied back.\n"
             )
     finished_at = datetime.now(timezone.utc).isoformat()
+    budget_recommendation = (
+        _failure_budget_recommendation(
+            case_path,
+            returncode=returncode,
+            log_text=_tail_text(log_path, maximum_bytes=512 * 1024),
+            requested_processes=requested_processes,
+            processes=resolved_processes,
+            process_selection=process_selection,
+        )
+        if returncode != 0
+        else None
+    )
     mesh_fidelity_path = case_path / "mesh-surface-fidelity.json"
     mesh_outputs_present = _mesh_outputs_present(case_path)
     if mesh_outputs_present:
@@ -562,6 +840,7 @@ def run_case(
         solver_input_fingerprint=solver_input_fingerprint,
         convergence_policy=convergence_policy,
         process_selection=process_selection,
+        budget_recommendation=budget_recommendation,
     )
     run_path.write_text(json.dumps(_run_record(result), indent=2) + "\n", encoding="utf-8")
     if mesh_returncode is not None and not reused_mesh:
@@ -614,6 +893,7 @@ def run_case(
         solver_input_fingerprint=solver_input_fingerprint,
         convergence_policy=convergence_policy,
         process_selection=process_selection,
+        budget_recommendation=budget_recommendation,
     )
 
 

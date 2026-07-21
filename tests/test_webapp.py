@@ -267,18 +267,29 @@ class AccuracyStudyApiTests(unittest.TestCase):
             "studyProcessBudget",
             "resumeSolver",
             "runStudyButton",
+            "retryBudgetButton",
             "optimizationStatus",
         ):
             with self.subTest(control_id=control_id):
                 self.assertIn(f'id="{control_id}"', index)
-        self.assertIn('src="/assets/app.js?v=71"', index)
-        self.assertIn('processes: els.solverProcesses.value', app)
+        self.assertIn('src="/assets/app.js?v=72"', index)
+        self.assertIn("options.processes ?? els.solverProcesses.value", app)
         self.assertIn('fileHandler: els.solverFileHandler.value', app)
-        self.assertIn('resume: !meshOnly && els.resumeSolver.checked', app)
-        self.assertIn('processBudget: els.studyProcessBudget.value', app)
+        self.assertIn('resume: attempt === 0 ? originalResume : false', app)
+        self.assertIn("options.processBudget ?? els.studyProcessBudget.value", app)
         self.assertIn('fetchJson("/api/run-study"', app)
         self.assertIn('/api/study-progress?casePath=', app)
         self.assertIn('function renderOptimizationStatus()', app)
+        self.assertIn('function activeBudgetRecommendation()', app)
+        self.assertIn('function retryRecommendedBudget()', app)
+        self.assertIn('function runActiveCase(mode, options = {})', app)
+        self.assertIn('function runActiveStudy(options = {})', app)
+        self.assertIn('while (attempt < 2)', app)
+        self.assertIn('recommendation?.autoRetrySafe === true', app)
+        self.assertIn('minimumUpdatedAt = 0', app)
+        self.assertIn('const staleTerminal =', app)
+        self.assertIn('recommendedProcessBudget', app)
+        self.assertIn('Retry with safer budget', index)
 
     def test_run_case_api_normalizes_and_propagates_optimization_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

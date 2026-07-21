@@ -151,7 +151,7 @@ Additional local controls:
 - **Resume:** `--resume` is opt-in and accepted only after a failed full run with unchanged solver inputs, a reusable mesh, and a reconstructed numeric time containing `U` and `p`.
 - **File handling:** leave `--file-handler auto` selected unless the target OpenFOAM/MPI installation has been tested with another handler. Collated output can reduce file counts, but support and performance depend on the installation.
 - **Studies:** independent cases run concurrently within one CPU/memory budget. This improves total study throughput; it does not make each individual case faster.
-- **Resource guidance:** run records and the browser report selected ranks, cache hits, convergence policy, and conservative memory guidance.
+- **Resource guidance:** run records and the browser report selected ranks, cache hits, convergence policy, conservative memory guidance, and evidence-based post-failure `budgetRecommendation` data. High-confidence memory/MPI failures from an `auto` run may receive one bounded retry at fewer ranks; the app also exposes **Retry with safer budget** when an unchanged-case retry is safe. Storage, ambiguous timeout, single-rank memory, and over-budget mesh failures remain guidance-only. AeroLab never changes geometry, physics, mesh quality, or verification gates silently.
 
 There is no GPU path for the generated Foundation v13 workflow. CPU MPI, safe storage staging, cache reuse, mesh reuse, and bounded study concurrency are the supported acceleration mechanisms.
 

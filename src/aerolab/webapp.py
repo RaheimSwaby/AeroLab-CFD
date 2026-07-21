@@ -866,6 +866,7 @@ def _record_background_run_failure(
         "mode": run_mode,
         "backend": backend,
         "returncode": 127,
+        "budgetRecommendation": None,
         "startedAt": existing.get("startedAt") or now,
         "finishedAt": now,
         "error": str(error),
@@ -903,6 +904,7 @@ def _record_background_study_failure(
             "status": "failed",
             "ok": False,
             "backend": backend,
+            "budgetRecommendation": None,
             "startedAt": existing.get("startedAt") or now,
             "finishedAt": now,
             "error": {

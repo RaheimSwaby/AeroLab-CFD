@@ -201,6 +201,39 @@ class StudySchedulerTests(unittest.TestCase):
         self.assertEqual(allocation["maxConcurrentCases"], 1)
         self.assertEqual(allocation["maximumAllocatedProcesses"], 1)
 
+    def test_failed_study_recommends_one_same_fidelity_member_at_a_time(self) -> None:
+        from aerolab.solver.studies import _study_budget_recommendation
+
+        recommendation = _study_budget_recommendation(
+            {"processesPerCase": 4},
+            [
+                {
+                    "casePath": "/tmp/failed-member",
+                    "ok": False,
+                    "budgetRecommendation": {
+                        "category": "memory_oom",
+                        "confidence": "high",
+                        "retryAllowed": True,
+                        "recommendedProcesses": 2,
+                        "safeCellBudget": 2_050_000,
+                        "configuredCellBudget": 1_500_000,
+                        "suggestedQuality": None,
+                        "preservesCaseFidelity": True,
+                    },
+                },
+                {"casePath": "/tmp/completed-member", "ok": True},
+            ],
+        )
+
+        assert recommendation is not None
+        self.assertEqual(recommendation["category"], "study_concurrency_pressure")
+        self.assertEqual(recommendation["recommendedProcesses"], 2)
+        self.assertEqual(recommendation["recommendedProcessBudget"], 2)
+        self.assertTrue(recommendation["retryAllowed"])
+        self.assertFalse(recommendation["autoRetrySafe"])
+        self.assertTrue(recommendation["preservesCaseFidelity"])
+        self.assertIn("one member at a time", recommendation["detail"])
+
     def test_mpi_unavailable_schedules_independent_serial_cases(self) -> None:
         from aerolab.solver.studies import _study_resource_allocation
 
@@ -286,6 +319,7 @@ class StudySchedulerTests(unittest.TestCase):
                     "qualityRecommendation": {"status": "comfortable"},
                     "stageCache": {"featureHit": True},
                 },
+                budget_recommendation=None,
             )
             snapshots: list[dict[str, object]] = []
 
@@ -328,6 +362,10 @@ class StudySchedulerTests(unittest.TestCase):
             )
             self.assertEqual(final["status"], "complete")
             self.assertEqual(final["percent"], 100)
+            self.assertIsNone(final["budgetRecommendation"])
+            self.assertTrue(
+                all("budgetRecommendation" in member for member in final["results"])
+            )
             for member in members:
                 stored = json.loads(
                     member.joinpath("aerolab-study-run.json").read_text(encoding="utf-8")

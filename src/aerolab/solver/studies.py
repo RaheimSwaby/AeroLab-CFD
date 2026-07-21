@@ -149,6 +149,7 @@ def run_study(
         "percent": 0,
         "plan": plan,
         "results": [],
+        "budgetRecommendation": None,
     }
     _write_study_run_record(member_paths, running_record)
 
@@ -198,6 +199,11 @@ def run_study(
                     "qualityRecommendation": result.process_selection.get(
                         "qualityRecommendation"
                     ),
+                    "budgetRecommendation": getattr(
+                        result,
+                        "budget_recommendation",
+                        None,
+                    ),
                     "stageCache": result.process_selection.get("stageCache"),
                 }
             partial_results = [
@@ -212,6 +218,10 @@ def run_study(
                     "completedCases": completed_cases,
                     "percent": round(completed_cases / len(member_paths) * 100),
                     "results": partial_results,
+                    "budgetRecommendation": _study_budget_recommendation(
+                        plan,
+                        partial_results,
+                    ),
                 },
             )
 
@@ -232,9 +242,109 @@ def run_study(
         "percent": 100,
         "plan": plan,
         "results": results,
+        "budgetRecommendation": _study_budget_recommendation(plan, results),
     }
     _write_study_run_record(member_paths, final_record)
     return final_record
+
+
+def _study_budget_recommendation(
+    plan: dict[str, object],
+    results: list[dict[str, object]],
+) -> dict[str, object] | None:
+    failed_results = [result for result in results if result.get("ok") is False]
+    recommendations = [
+        recommendation
+        for result in failed_results
+        if isinstance(
+            recommendation := result.get("budgetRecommendation"),
+            dict,
+        )
+    ]
+    if not recommendations:
+        return None
+
+    retryable = bool(failed_results) and len(recommendations) == len(failed_results)
+    retryable = retryable and all(
+        recommendation.get("retryAllowed") is True
+        and isinstance(recommendation.get("recommendedProcesses"), int)
+        for recommendation in recommendations
+    )
+    planned_processes = max(1, int(plan.get("processesPerCase") or 1))
+    recommended_processes = (
+        min(int(recommendation["recommendedProcesses"]) for recommendation in recommendations)
+        if retryable
+        else max(1, math.ceil(planned_processes / 2))
+    )
+    safe_cell_values = [
+        int(value)
+        for recommendation in recommendations
+        if isinstance(value := recommendation.get("safeCellBudget"), int)
+    ]
+    configured_cell_values = [
+        int(value)
+        for recommendation in recommendations
+        if isinstance(value := recommendation.get("configuredCellBudget"), int)
+    ]
+    suggested_quality = next(
+        (
+            str(value)
+            for recommendation in recommendations
+            if (value := recommendation.get("suggestedQuality"))
+        ),
+        None,
+    )
+    confidence = (
+        "high"
+        if all(recommendation.get("confidence") == "high" for recommendation in recommendations)
+        else "medium"
+    )
+    evidence = [
+        f"{len(failed_results)} of {len(results)} completed study members failed",
+        *[
+            f"{Path(str(result.get('casePath') or 'member')).name}: "
+            f"{recommendation.get('category') or 'resource pressure'}"
+            for result in failed_results
+            if isinstance(
+                recommendation := result.get("budgetRecommendation"),
+                dict,
+            )
+        ],
+    ]
+    if retryable:
+        detail = (
+            f"Retry explicitly with {recommended_processes} process"
+            f"{'es' if recommended_processes != 1 else ''} per case and an aggregate budget "
+            f"of {recommended_processes}. That runs one member at a time while preserving every "
+            "case's geometry, mesh, physics, and verification gates. Successful members are not "
+            "silently reused, so confirm the explicit whole-study retry."
+        )
+    else:
+        detail = (
+            "Review each failed member's resource evidence before rerunning the study. At least "
+            "one failure has no safe same-fidelity compute adjustment, so AeroLab will not offer "
+            "an automatic or one-click whole-study retry."
+        )
+    return {
+        "category": "study_concurrency_pressure",
+        "confidence": confidence,
+        "title": "Study members exceeded the shared workstation budget",
+        "detail": detail,
+        "evidence": evidence,
+        "retryAllowed": retryable,
+        "autoRetrySafe": False,
+        "recommendedProcesses": recommended_processes if retryable else None,
+        "recommendedProcessBudget": recommended_processes if retryable else None,
+        "safeCellBudget": min(safe_cell_values) if safe_cell_values else None,
+        "configuredCellBudget": (
+            max(configured_cell_values) if configured_cell_values else None
+        ),
+        "suggestedQuality": suggested_quality,
+        "preservesCaseFidelity": retryable and all(
+            recommendation.get("preservesCaseFidelity") is True
+            for recommendation in recommendations
+        ),
+    }
 
 
 def _discover_study(case_path: Path) -> tuple[dict[str, object], list[Path]]:

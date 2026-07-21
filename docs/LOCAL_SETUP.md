@@ -111,6 +111,18 @@ aerolab run-study .\cases\one-study-member --processes auto --process-budget aut
 
 The process budget is shared across every concurrent member. AeroLab estimates the largest member's memory need, bounds worker count, and falls back to concurrent serial cases when MPI is unavailable.
 
+### Post-failure workstation budget
+
+After an unsuccessful solver process, AeroLab inspects the return code, bounded log tail, configured cell cap, resolved ranks, and backend-visible memory. `aerolab-run.json`, JSON CLI output, progress APIs, and the browser can report a `budgetRecommendation` for supported evidence: out-of-memory termination, MPI slot oversubscription, study concurrency pressure, exhausted storage, mesh/cell pressure, or a runtime limit.
+
+The conservative cell allowance reserves the larger of 25% or 1 GiB of backend-visible memory, subtracts a 2 GiB fixed allowance, budgets 2 KiB per configured maximum cell, and rounds down to 50,000 cells. It is diagnostic guidance, not proof that a particular mesh will fit.
+
+A single case receives at most one automatic retry, and only when the original process request was `auto`, memory/MPI evidence is high-confidence, reducing ranks is possible, and the configured cell cap does not exceed the calculated allowance. The retry changes only MPI rank count; geometry, mesh dictionaries, quality preset, physical setup, convergence controls, and verification gates remain unchanged. The browser waits briefly for worker cleanup and retries once. If it still fails, the failure remains visible.
+
+**Retry with safer budget** performs the same explicit rank-only retry when available. For studies, AeroLab never retries automatically; the button uses the recommended ranks as both the per-case and aggregate budget so one unchanged member runs at a time. A whole-study retry reruns its members, including members that previously succeeded.
+
+Single-rank memory failures, storage exhaustion, ambiguous timeouts, and cases whose configured cell cap exceeds the allowance are not auto-adjusted. Add backend memory/storage, increase an evidenced runtime limit, or explicitly regenerate at a lower mesh budget. Regeneration changes numerical fidelity and requires mesh validation and comparison evidence again; AeroLab never selects a lower quality preset on the user's behalf.
+
 ## Performance And Safety Contract
 
 Automatic rank selection uses resources visible **inside** the selected backend, not browser CPU counts or host-only values. It:

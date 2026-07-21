@@ -102,6 +102,10 @@ def case_run_progress(case_path: Path) -> dict[str, object]:
         tone = "failed"
         label = f"Failed during {phase.lower()}"
         detail = _run_failure_detail(case_payload, run_payload, log_text, phase)
+        recommendation = run_payload.get("budgetRecommendation")
+        if isinstance(recommendation, dict) and recommendation.get("detail"):
+            title = str(recommendation.get("title") or "Safer workstation budget")
+            detail = f"{detail} {title}: {recommendation['detail']}"
     elif "=== AEROLAB COMPLETE ===" in log_text:
         state = "complete"
         tone = "review"
@@ -131,6 +135,7 @@ def case_run_progress(case_path: Path) -> dict[str, object]:
         "runMode": run_mode,
         "solverTime": solver_time,
         "solverEndTime": end_time if solver_time is not None else None,
+        "budgetRecommendation": run_payload.get("budgetRecommendation"),
         "optimization": {
             "requestedProcesses": run_payload.get("requestedProcesses"),
             "processes": run_payload.get("processes"),
@@ -139,6 +144,7 @@ def case_run_progress(case_path: Path) -> dict[str, object]:
             "resumeFromTime": run_payload.get("resumeFromTime"),
             "convergencePolicy": run_payload.get("convergencePolicy"),
             "processSelection": run_payload.get("processSelection"),
+            "budgetRecommendation": run_payload.get("budgetRecommendation"),
         },
         "studyRun": study_run_payload or None,
         "updatedAt": case_payload.get("updated_at") or run_payload.get("finishedAt"),
