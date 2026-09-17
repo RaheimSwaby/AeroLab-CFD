@@ -8,12 +8,34 @@ from pathlib import Path
 
 from aerolab.case import create_case
 from aerolab.cli import main as cli_main
-from aerolab.openfoam import ensure_case_postprocessing
+from aerolab.openfoam import _distance_refinement_levels, ensure_case_postprocessing
 from aerolab.solver import case_report
 from aerolab.stl import inspect_stl, read_stl_triangles, write_binary_stl_triangles
 
 
 class OpenFoamCaseTests(unittest.TestCase):
+    def test_distance_shells_grade_outward_and_respect_the_level_floor(self) -> None:
+        base_cell = 1.2375
+
+        shells = _distance_refinement_levels(base_cell, body_region_level=4)
+        distances = [distance for distance, _ in shells]
+        levels = [level for _, level in shells]
+
+        self.assertEqual(levels, [4, 3, 2])
+        self.assertEqual(distances, sorted(distances))
+        # Each shell is REFINEMENT_SHELL_CELLS thick at its own level, so the
+        # first shell is the finest and the steps widen as the level drops.
+        self.assertAlmostEqual(distances[0], 8.0 * base_cell / 16)
+        self.assertAlmostEqual(distances[1], distances[0] + 8.0 * base_cell / 8)
+        self.assertAlmostEqual(distances[2], distances[1] + 8.0 * base_cell / 4)
+
+        # A coarse preset cannot step below the floor.
+        floored = _distance_refinement_levels(base_cell, body_region_level=2)
+        self.assertEqual([level for _, level in floored], [2, 1])
+
+        single = _distance_refinement_levels(base_cell, body_region_level=1)
+        self.assertEqual([level for _, level in single], [1])
+
     def test_generated_scripts_cover_serial_mpi_cache_handler_and_resume_paths(self) -> None:
         from aerolab.openfoam import configure_decomposition
 
@@ -324,8 +346,10 @@ class OpenFoamCaseTests(unittest.TestCase):
             self.assertEqual(body_report.format, "binary")
             self.assertEqual(body_stl.stat().st_size, 84 + body_report.triangle_count * 50)
             self.assertTrue((case_path / "system" / "surfaceFeaturesDict").exists())
-            self.assertIn("bodyRefinement", snappy)
+            self.assertIn("mode distance;", snappy)
             self.assertIn("wakeRefinement", snappy)
+            # The near-body bounding box is gone; only the wake stays a box.
+            self.assertNotIn("bodyRefinement", snappy)
             self.assertIn("nSurfaceLayers 5;", snappy)
             self.assertIn("relativeSizes false;", snappy)
             self.assertIn("firstLayerThickness", snappy)
@@ -390,7 +414,17 @@ class OpenFoamCaseTests(unittest.TestCase):
             self.assertIn("maxLocalCells 2000000;", snappy)
             self.assertIn("maxGlobalCells 2800000;", snappy)
             self.assertIn("nCellsBetweenLevels 2;", snappy)
-            self.assertIn("bodyRefinement\n        {\n            mode inside;\n            level 3;", snappy)
+            # Near-body refinement grades outward from the surface, and the
+            # shells step down from the configured body region level.
+            self.assertIn("body\n        {\n            mode distance;\n            levels (", snappy)
+            shells = metadata["mesh_resolution"]["configured_body_distance_levels"]
+            self.assertEqual([level for _, level in shells], [3, 2, 1])
+            distances = [distance for distance, _ in shells]
+            self.assertEqual(distances, sorted(distances))
+            self.assertIn(
+                " ".join(f"({distance:.9g} {level})" for distance, level in shells),
+                snappy,
+            )
             self.assertIn("minRefinementCells 100;", snappy)
             self.assertIn("level 8;", snappy)
             self.assertIn("level (4 8);", snappy)

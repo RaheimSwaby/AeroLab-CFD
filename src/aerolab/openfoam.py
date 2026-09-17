@@ -10,6 +10,10 @@ from .stl import Bounds, StlReport, Vector, write_transformed_binary_stl
 
 AXES = {"x": 0, "y": 1, "z": 2}
 SIMULATION_MODES = {"steady", "transient"}
+# Near-body refinement shells: how many cells thick each shell is at its own
+# level, and how many shells step down from the body region level.
+REFINEMENT_SHELL_CELLS = 8.0
+REFINEMENT_SHELL_COUNT = 3
 
 
 class QualityPreset(TypedDict):
@@ -69,6 +73,7 @@ class MeshResolutionMetadata(TypedDict):
     configured_surface_max_level: int
     configured_feature_level: int
     configured_body_region_level: int
+    configured_body_distance_levels: list[tuple[float, int]]
     configured_wake_region_level: int
     configured_n_cells_between_levels: int
     maximum_supported_surface_level: int
@@ -128,7 +133,7 @@ class OpenFoamValues(TypedDict):
     k: float
     omega: float
     location_in_mesh: Vector
-    refinement_boxes: dict[str, dict[str, Vector]]
+    wake_refinement_box: dict[str, Vector]
     wall_resolution: WallLayerMetadata
     mesh_resolution: MeshResolutionMetadata
     quality: SimulationQualityMetadata
@@ -381,6 +386,9 @@ def mesh_resolution_metadata(
         "configured_surface_max_level": configured_surface_level,
         "configured_feature_level": configured_feature_level,
         "configured_body_region_level": configured_body_region_level,
+        "configured_body_distance_levels": _distance_refinement_levels(
+            conservative_base_cell, configured_body_region_level
+        ),
         "configured_wake_region_level": int(preset["wake_region_level"]),
         "configured_n_cells_between_levels": configured_transition_levels,
         "maximum_supported_surface_level": maximum_supported_level,
@@ -620,7 +628,7 @@ def generate_openfoam_case(
             turbulent_length,
         ),
         "location_in_mesh": _location_in_mesh(tunnel),
-        "refinement_boxes": _refinement_boxes(report.bounds, flow_axis),
+        "wake_refinement_box": _wake_refinement_box(report.bounds, flow_axis),
         "wall_resolution": wall_resolution,
         "mesh_resolution": mesh_resolution,
         "quality": simulation_quality,
@@ -660,7 +668,7 @@ def generate_openfoam_case(
         ),
         "system/snappyHexMeshDict": _snappy_hex_mesh_dict(
             values["location_in_mesh"],
-            values["refinement_boxes"],
+            values["wake_refinement_box"],
             values["wall_resolution"],
             values["mesh_resolution"],
             preset,
@@ -910,39 +918,50 @@ def _wind_tunnel(
     }
 
 
-def _refinement_boxes(bounds: Bounds, flow_axis: str) -> dict[str, dict[str, Vector]]:
+def _wake_refinement_box(bounds: Bounds, flow_axis: str) -> dict[str, Vector]:
+    """Box covering the separated wake, which distance shells cannot reach."""
     axis = AXES[flow_axis]
     dimensions = [max(value, 1e-6) for value in bounds.dimensions]
     flow_length = max(dimensions[axis], 1.0)
-    body_min = list(bounds.minimum)
-    body_max = list(bounds.maximum)
     wake_min = list(bounds.minimum)
     wake_max = list(bounds.maximum)
 
     for index in range(3):
         if index == axis:
-            body_min[index] -= 0.6 * flow_length
-            body_max[index] += 1.0 * flow_length
             wake_min[index] -= 0.1 * flow_length
             wake_max[index] += 5.0 * flow_length
         else:
-            body_margin = max(0.65 * dimensions[index], 0.25 * flow_length)
             wake_margin = max(0.45 * dimensions[index], 0.18 * flow_length)
-            body_min[index] -= body_margin
-            body_max[index] += body_margin
             wake_min[index] -= wake_margin
             wake_max[index] += wake_margin
 
     return {
-        "bodyRefinement": {
-            "min": (body_min[0], body_min[1], body_min[2]),
-            "max": (body_max[0], body_max[1], body_max[2]),
-        },
-        "wakeRefinement": {
-            "min": (wake_min[0], wake_min[1], wake_min[2]),
-            "max": (wake_max[0], wake_max[1], wake_max[2]),
-        },
+        "min": (wake_min[0], wake_min[1], wake_min[2]),
+        "max": (wake_max[0], wake_max[1], wake_max[2]),
     }
+
+
+def _distance_refinement_levels(
+    base_cell_m: float,
+    body_region_level: int,
+    minimum_level: int = 1,
+) -> list[tuple[float, int]]:
+    """Grade near-body refinement in shells measured from the body surface.
+
+    A bounding box spends its finest cells on far-field air: for a road car the
+    old box spanned roughly seventeen times the vehicle's bounding-box volume,
+    all at one level. Shells follow the geometry instead, and each is a fixed number of
+    cells thick at its own level so the transition stays smooth when the base
+    mesh or quality preset changes. snappyHexMesh wants increasing distances
+    paired with decreasing levels.
+    """
+    levels: list[tuple[float, int]] = []
+    distance = 0.0
+    lowest = max(minimum_level, body_region_level - REFINEMENT_SHELL_COUNT + 1)
+    for level in range(body_region_level, lowest - 1, -1):
+        distance += REFINEMENT_SHELL_CELLS * base_cell_m / (2**level)
+        levels.append((distance, level))
+    return levels
 
 
 def _block_mesh_dict(
@@ -1147,15 +1166,17 @@ mergePatchPairs
 
 def _snappy_hex_mesh_dict(
     location_in_mesh: Vector,
-    refinement_boxes: dict[str, dict[str, Vector]],
+    wake_box: dict[str, Vector],
     wall_resolution: WallLayerMetadata,
     mesh_resolution: MeshResolutionMetadata,
     preset: QualityPreset,
     wheels: list[dict[str, object]] | None = None,
     volume_zones: list[dict[str, object]] | None = None,
 ) -> str:
-    body_box = refinement_boxes["bodyRefinement"]
-    wake_box = refinement_boxes["wakeRefinement"]
+    body_distance_text = " ".join(
+        f"({float(distance):.9g} {int(level)})"
+        for distance, level in mesh_resolution["configured_body_distance_levels"]
+    )
     surface_min_level = int(mesh_resolution["configured_surface_min_level"])
     surface_max_level = int(mesh_resolution["configured_surface_max_level"])
     feature_level = int(mesh_resolution["configured_feature_level"])
@@ -1261,13 +1282,6 @@ geometry
         file "body.stl";
     }}{wheel_geometry}
 
-    bodyRefinement
-    {{
-        type box;
-        min {_foam_vec(body_box["min"])};
-        max {_foam_vec(body_box["max"])};
-    }}
-
     wakeRefinement
     {{
         type box;
@@ -1308,10 +1322,10 @@ castellatedMeshControls
     resolveFeatureAngle 30;
     refinementRegions
     {{
-        bodyRefinement
+        body
         {{
-            mode inside;
-            level {body_region_level};
+            mode distance;
+            levels ({body_distance_text});
         }}
 
         wakeRefinement
