@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import math
 import struct
-from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import SupportsFloat, SupportsIndex, TypedDict
+
+import numpy as np
 
 Vector = tuple[float, float, float]
 Triangle = tuple[Vector, Vector, Vector]
@@ -190,12 +192,350 @@ class StlReport:
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Vectorized triangle-array core
+#
+# Triangles are handled internally as one float64 array of shape (n, 3, 3):
+# n triangles, three vertices, xyz. Parsed meshes are cached by path, size
+# and mtime so that inspect, transform, preview and feature detection over
+# the same file never re-parse or re-allocate the triangle soup.
+# ---------------------------------------------------------------------------
+
+
+def _as_array(triangles: Iterable[Triangle]) -> np.ndarray:
+    """Convert tuple triangles to the internal (n, 3, 3) float64 array."""
+    if isinstance(triangles, np.ndarray):
+        array = np.asarray(triangles, dtype=np.float64)
+        if array.ndim == 3 and array.shape[1:] == (3, 3):
+            return array
+        raise ValueError("triangle array must have shape (n, 3, 3)")
+    triangle_list = list(triangles)
+    if not triangle_list:
+        return np.empty((0, 3, 3), dtype=np.float64)
+    return np.asarray(triangle_list, dtype=np.float64).reshape(-1, 3, 3)
+
+
+def _as_tuples(array: np.ndarray) -> list[Triangle]:
+    """Convert the internal array back to the public tuple representation."""
+    return [
+        (
+            (float(triangle[0, 0]), float(triangle[0, 1]), float(triangle[0, 2])),
+            (float(triangle[1, 0]), float(triangle[1, 1]), float(triangle[1, 2])),
+            (float(triangle[2, 0]), float(triangle[2, 1]), float(triangle[2, 2])),
+        )
+        for triangle in array
+    ]
+
+
+def _cross_arrays(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return np.cross(a, b)
+
+
+def _triangle_areas(array: np.ndarray) -> np.ndarray:
+    crosses = _cross_arrays(array[:, 1] - array[:, 0], array[:, 2] - array[:, 0])
+    return 0.5 * np.linalg.norm(crosses, axis=1)
+
+
+def _triangle_normals(array: np.ndarray) -> np.ndarray:
+    crosses = _cross_arrays(array[:, 1] - array[:, 0], array[:, 2] - array[:, 0])
+    lengths = np.linalg.norm(crosses, axis=1)
+    normals = np.zeros_like(crosses)
+    valid = lengths > 1e-12
+    normals[valid] = crosses[valid] / lengths[valid, None]
+    return normals
+
+
+def _bounds_array(array: np.ndarray) -> Bounds:
+    vertices = array.reshape(-1, 3)
+    minimum = vertices.min(axis=0)
+    maximum = vertices.max(axis=0)
+    return Bounds(
+        minimum=(float(minimum[0]), float(minimum[1]), float(minimum[2])),
+        maximum=(float(maximum[0]), float(maximum[1]), float(maximum[2])),
+    )
+
+
+def _quantize_array(vertices: np.ndarray) -> np.ndarray:
+    """Quantize vertices to the same 9-decimal grid used for topology keys."""
+    return np.round(vertices * 1e9).astype(np.int64)
+
+
+def _unique_vertex_count(array: np.ndarray) -> int:
+    keys = _quantize_array(array.reshape(-1, 3))
+    return int(np.unique(keys, axis=0).shape[0])
+
+
+def _edge_open_non_manifold(array: np.ndarray) -> tuple[int, int]:
+    triangles = _quantize_array(array)  # (n, 3, 3)
+    first = triangles
+    second = np.roll(triangles, -1, axis=1)
+    # Lexicographic canonical order for each edge's endpoint pair.
+    less = (
+        (first[..., 0] < second[..., 0])
+        | ((first[..., 0] == second[..., 0]) & (first[..., 1] < second[..., 1]))
+        | (
+            (first[..., 0] == second[..., 0])
+            & (first[..., 1] == second[..., 1])
+            & (first[..., 2] <= second[..., 2])
+        )
+    )
+    low = np.where(less[..., None], first, second)
+    high = np.where(less[..., None], second, first)
+    edges = np.concatenate((low, high), axis=2).reshape(-1, 6)
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    return int(np.count_nonzero(counts == 1)), int(np.count_nonzero(counts > 2))
+
+
+def _projected_areas_array(array: np.ndarray, areas: np.ndarray) -> ProjectedAreas:
+    normals = _triangle_normals(array)
+    projected = (np.abs(normals) * (areas * 0.5)[:, None]).sum(axis=0)
+    return ProjectedAreas(x=float(projected[0]), y=float(projected[1]), z=float(projected[2]))
+
+
+def _volume_array(array: np.ndarray) -> float:
+    signed = np.einsum(
+        "ij,ij->i",
+        array[:, 0],
+        _cross_arrays(array[:, 1], array[:, 2]),
+    )
+    return float(abs(signed.sum()) / 6.0)
+
+
+def _silhouette_scanline_count(triangle_count: int) -> int:
+    if triangle_count <= 100_000:
+        return 512
+    if triangle_count <= 500_000:
+        return 384
+    return 256
+
+
+def _projected_triangle_union_area_array(
+    array: np.ndarray,
+    first_axis: int,
+    second_axis: int,
+    scanline_count: int,
+) -> float:
+    projected = array[:, :, (first_axis, second_axis)]
+    x_values = projected[..., 0]
+    y_values = projected[..., 1]
+    second_min = float(y_values.min())
+    second_max = float(y_values.max())
+    span = second_max - second_min
+    if span <= 1e-15:
+        return 0.0
+    step = span / float(scanline_count)
+    epsilon = max(span, 1.0) * 1e-13
+
+    # Skip triangles that project to a line, matching the scalar reference.
+    area_twice = (
+        (x_values[:, 1] - x_values[:, 0]) * (y_values[:, 2] - y_values[:, 0])
+        - (y_values[:, 1] - y_values[:, 0]) * (x_values[:, 2] - x_values[:, 0])
+    )
+    usable = np.abs(area_twice) > epsilon * epsilon
+
+    x0 = x_values
+    x1 = np.roll(x_values, -1, axis=1)
+    y0 = y_values
+    y1 = np.roll(y_values, -1, axis=1)
+    low = np.minimum(y0, y1)
+    high = np.maximum(y0, y1)
+    tall = (high - low) > epsilon
+    active = usable[:, None] & tall
+
+    # Flat, fully vectorized scanline rasterisation: expand every edge into
+    # the scanlines it crosses, compute all crossing coordinates at once,
+    # then reduce per (scanline, triangle) to that triangle's interval and
+    # merge intervals per scanline. This replaces a per-row mask loop whose
+    # temporary allocations dominated the whole inspect path.
+    row_lo = np.ceil((low - second_min) / step - 0.5 - 1e-12).astype(np.int64)
+    row_hi = np.ceil((high - second_min) / step - 0.5 - 1e-12).astype(np.int64)
+    row_lo = np.clip(row_lo, 0, scanline_count)
+    row_hi = np.clip(row_hi, 0, scanline_count)
+    counts = np.maximum(row_hi - row_lo, 0)
+    counts[~active] = 0
+    flat_counts = counts.ravel()
+    total_crossings = int(flat_counts.sum())
+    if total_crossings == 0:
+        return 0.0
+
+    triangle_per_edge = np.broadcast_to(
+        np.arange(len(array), dtype=np.int64)[:, None], counts.shape
+    ).ravel()
+    group_end = np.cumsum(flat_counts)
+    within = np.arange(total_crossings, dtype=np.int64) - np.repeat(
+        group_end - flat_counts, flat_counts
+    )
+    rows = np.repeat(row_lo.ravel(), flat_counts) + within
+    edge_x0 = np.repeat(x0.ravel(), flat_counts)
+    edge_x1 = np.repeat(x1.ravel(), flat_counts)
+    edge_y0 = np.repeat(y0.ravel(), flat_counts)
+    edge_y1 = np.repeat(y1.ravel(), flat_counts)
+    triangles = np.repeat(triangle_per_edge, flat_counts)
+
+    coordinates = second_min + (rows + 0.5) * step
+    edge_low = np.repeat(low.ravel(), flat_counts)
+    edge_high = np.repeat(high.ravel(), flat_counts)
+    valid = (coordinates >= edge_low) & (coordinates < edge_high)
+    rows = rows[valid]
+    triangles = triangles[valid]
+    fraction = (coordinates[valid] - edge_y0[valid]) / (edge_y1[valid] - edge_y0[valid])
+    crossings = edge_x0[valid] + fraction * (edge_x1[valid] - edge_x0[valid])
+
+    order = np.lexsort((crossings, triangles, rows))
+    sorted_rows = rows[order]
+    sorted_triangles = triangles[order]
+    sorted_crossings = crossings[order]
+    boundary = np.r_[
+        True,
+        (np.diff(sorted_rows) != 0) | (np.diff(sorted_triangles) != 0),
+    ]
+    group_starts = np.nonzero(boundary)[0]
+    group_ends = np.r_[group_starts[1:], len(sorted_crossings)]
+    group_sizes = group_ends - group_starts
+    keep = group_sizes >= 2
+    interval_rows = sorted_rows[group_starts[keep]]
+    interval_starts = sorted_crossings[group_starts[keep]]
+    interval_ends = sorted_crossings[group_ends[keep] - 1]
+    wide = (interval_ends - interval_starts) > epsilon
+    interval_rows = interval_rows[wide]
+    interval_starts = interval_starts[wide]
+    interval_ends = interval_ends[wide]
+    if len(interval_rows) == 0:
+        return 0.0
+
+    order_intervals = np.lexsort((interval_starts, interval_rows))
+    interval_rows = interval_rows[order_intervals]
+    interval_starts = interval_starts[order_intervals]
+    interval_ends = interval_ends[order_intervals]
+
+    total_width = 0.0
+    row_boundaries = np.r_[0, np.nonzero(np.diff(interval_rows) != 0)[0] + 1, len(interval_rows)]
+    for start, end in zip(row_boundaries[:-1], row_boundaries[1:], strict=True):
+        starts = interval_starts[start:end]
+        ends = interval_ends[start:end]
+        running_max = np.maximum.accumulate(ends)
+        new_segment = starts > np.roll(running_max, 1) + epsilon
+        new_segment[0] = True
+        segment_start_positions = np.nonzero(new_segment)[0]
+        segment_end_positions = np.r_[segment_start_positions[1:], len(starts)] - 1
+        total_width += float(
+            (running_max[segment_end_positions] - starts[segment_start_positions]).sum()
+        )
+    return total_width * step
+
+
+def silhouette_projected_areas_for_triangles(
+    triangles: Iterable[Triangle],
+    scanline_count: int | None = None,
+) -> ProjectedAreas:
+    """Estimate the visible projected union without filling concave model gaps."""
+    array = _as_array(triangles)
+    if len(array) == 0:
+        return ProjectedAreas(x=0.0, y=0.0, z=0.0)
+    if scanline_count is None:
+        scanline_count = _silhouette_scanline_count(len(array))
+    scanline_count = max(128, int(scanline_count))
+    planes = ((1, 2), (0, 2), (0, 1))
+    areas = [
+        _projected_triangle_union_area_array(array, first, second, scanline_count)
+        for first, second in planes
+    ]
+    return ProjectedAreas(x=areas[0], y=areas[1], z=areas[2])
+
+
+def silhouette_projected_area_for_axis(
+    triangles: Iterable[Triangle],
+    axis: str | int,
+    scanline_count: int | None = None,
+) -> float:
+    array = _as_array(triangles)
+    if len(array) == 0:
+        return 0.0
+    axis_index = {"x": 0, "y": 1, "z": 2}.get(axis, axis) if isinstance(axis, str) else axis
+    if axis_index not in (0, 1, 2):
+        raise ValueError(f"Unsupported silhouette axis: {axis}")
+    if scanline_count is None:
+        scanline_count = _silhouette_scanline_count(len(array))
+    planes = ((1, 2), (0, 2), (0, 1))
+    first, second = planes[int(axis_index)]
+    return _projected_triangle_union_area_array(
+        array,
+        first,
+        second,
+        max(128, int(scanline_count)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# STL parsing with a parsed-mesh cache
+# ---------------------------------------------------------------------------
+
+_BINARY_STL_DTYPE = np.dtype(
+    [
+        ("normal", "<f4", (3,)),
+        ("vertices", "<f4", (3, 3)),
+        ("attribute", "<u2"),
+    ]
+)
+
+
+def _looks_like_binary_stl(data: bytes) -> bool:
+    if len(data) < 84:
+        return False
+    triangle_count = struct.unpack("<I", data[80:84])[0]
+    expected_size = 84 + triangle_count * 50
+    return expected_size == len(data)
+
+
+def _load_binary_stl_array(data: bytes) -> np.ndarray:
+    triangle_count = struct.unpack("<I", data[80:84])[0]
+    records = np.frombuffer(data, dtype=_BINARY_STL_DTYPE, count=triangle_count, offset=84)
+    return np.asarray(records["vertices"], dtype=np.float64)
+
+
+def _load_ascii_stl_array(data: bytes) -> np.ndarray:
+    text = data.decode("utf-8", errors="ignore")
+    rows: list[list[str]] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[0].lower() == "vertex":
+            rows.append(parts[1:4])
+    if not rows:
+        return np.empty((0, 3, 3), dtype=np.float64)
+    vertices = np.asarray(rows, dtype=np.float64)
+    usable = (len(vertices) // 3) * 3
+    return vertices[:usable].reshape(-1, 3, 3)
+
+
+def _load_stl_array(data: bytes) -> tuple[np.ndarray, str]:
+    if _looks_like_binary_stl(data):
+        return _load_binary_stl_array(data), "binary"
+    return _load_ascii_stl_array(data), "ascii"
+
+
+@lru_cache(maxsize=4)
+def _read_stl_cached(path_str: str, size: int, mtime_ns: int) -> tuple[np.ndarray, str]:
+    data = Path(path_str).read_bytes()
+    return _load_stl_array(data)
+
+
+def _read_stl_array(path: Path) -> tuple[np.ndarray, str]:
+    stat = path.stat()
+    return _read_stl_cached(str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+
+
+def clear_stl_cache() -> None:
+    """Drop cached parsed meshes, e.g. after a file is rewritten in place."""
+    _read_stl_cached.cache_clear()
+
+
 def read_stl_triangles(path: Path) -> tuple[list[Triangle], str]:
     if not path.exists():
         raise FileNotFoundError(path)
     if path.suffix.lower() != ".stl":
         raise ValueError(f"Only STL files are supported right now: {path}")
-    return _load_stl(path.read_bytes())
+    array, stl_format = _read_stl_array(path)
+    return _as_tuples(array), stl_format
 
 
 def inspect_stl(path: Path) -> StlReport:
@@ -204,10 +544,10 @@ def inspect_stl(path: Path) -> StlReport:
     if path.suffix.lower() != ".stl":
         raise ValueError(f"Only STL files are supported right now: {path}")
 
-    triangles, stl_format = read_stl_triangles(path)
-    if not triangles:
+    array, stl_format = _read_stl_array(path)
+    if len(array) == 0:
         raise ValueError(f"No triangles found in STL: {path}")
-    return report_for_triangles(path, triangles, stl_format)
+    return _report_for_array(path, array, stl_format)
 
 
 def detect_aero_features(
@@ -218,55 +558,62 @@ def detect_aero_features(
     rotation_degrees: Vector = (0.0, 0.0, 0.0),
 ) -> dict[str, object]:
     """Find geometry that resembles a rear underbody diffuser in a canonical frame."""
-    triangles, _ = read_stl_triangles(path)
-    canonical = transform_triangles(
-        triangles,
+    array, _ = _read_stl_array(path)
+    canonical = _transform_array(
+        array,
         scale=scale,
         source_flow_direction=source_flow_direction,
         source_up_direction=source_up_direction,
         target_flow_axis="x",
         rotation_degrees=rotation_degrees,
     )
-    return detect_aero_features_for_triangles(canonical)
+    return _detect_aero_features_for_array(canonical)
 
 
 def detect_aero_features_for_triangles(triangles: list[Triangle]) -> dict[str, object]:
     """Return conservative diffuser candidates; absence is not proof of no diffuser."""
-    if not triangles:
+    return _detect_aero_features_for_array(_as_array(triangles))
+
+
+def _detect_aero_features_for_array(array: np.ndarray) -> dict[str, object]:
+    if len(array) == 0:
         return _aero_feature_result([])
-    bounds = _bounds(triangles)
+    bounds = _bounds_array(array)
     length, width, height = bounds.dimensions
     if min(length, width, height) <= 1e-9:
         return _aero_feature_result([])
 
-    candidate_indices: list[int] = []
-    candidate_values: dict[int, tuple[float, float]] = {}
+    areas = _triangle_areas(array)
+    centroids = array.mean(axis=1)
+    normals = _triangle_normals(array)
+
     rear_start = bounds.minimum[0] + 0.52 * length
     lower_limit = bounds.minimum[2] + 0.42 * height
-    for index, triangle in enumerate(triangles):
-        area = _triangle_area(triangle)
-        if area <= 1e-12:
-            continue
-        centroid = tuple(sum(vertex[axis] for vertex in triangle) / 3.0 for axis in range(3))
-        if centroid[0] < rear_start or centroid[2] > lower_limit:
-            continue
-        normal = _normal(triangle)
-        if abs(normal[2]) < 0.35:
-            continue
-        slope = -normal[0] / normal[2]
-        angle = math.degrees(math.atan(slope))
-        if not 2.0 <= angle <= 30.0:
-            continue
-        candidate_indices.append(index)
-        candidate_values[index] = (area, angle)
-
+    with np.errstate(divide="ignore", invalid="ignore"):
+        slopes = np.where(
+            np.abs(normals[:, 2]) > 1e-12,
+            -normals[:, 0] / np.where(np.abs(normals[:, 2]) > 1e-12, normals[:, 2], 1.0),
+            0.0,
+        )
+    angles = np.degrees(np.arctan(slopes))
+    mask = (
+        (areas > 1e-12)
+        & (centroids[:, 0] >= rear_start)
+        & (centroids[:, 2] <= lower_limit)
+        & (np.abs(normals[:, 2]) >= 0.35)
+        & (angles >= 2.0)
+        & (angles <= 30.0)
+    )
+    candidate_indices = np.nonzero(mask)[0].tolist()
     if not candidate_indices:
         return _aero_feature_result([])
 
-    vertex_to_triangles: dict[Vector, list[int]] = {}
+    vertex_to_triangles: dict[tuple[int, int, int], list[int]] = {}
+    quantized = _quantize_array(array)
     for index in candidate_indices:
-        for vertex in triangles[index]:
-            vertex_to_triangles.setdefault(_quantize_vertex(vertex), []).append(index)
+        for vertex in quantized[index]:
+            key = (int(vertex[0]), int(vertex[1]), int(vertex[2]))
+            vertex_to_triangles.setdefault(key, []).append(index)
 
     adjacency: dict[int, set[int]] = {index: set() for index in candidate_indices}
     for connected in vertex_to_triangles.values():
@@ -291,13 +638,12 @@ def detect_aero_features_for_triangles(triangles: list[Triangle]) -> dict[str, o
 
     candidates: list[_AeroFeatureCandidate] = []
     for component in components:
-        component_bounds = _bounds([triangles[index] for index in component])
+        component_array = array[np.asarray(component, dtype=np.int64)]
+        component_bounds = _bounds_array(component_array)
         x_span, y_span, z_span = component_bounds.dimensions
-        area = sum(candidate_values[index][0] for index in component)
-        weighted_angle = sum(
-            candidate_values[index][0] * candidate_values[index][1]
-            for index in component
-        ) / max(area, 1e-12)
+        component_areas = areas[np.asarray(component, dtype=np.int64)]
+        area = float(component_areas.sum())
+        weighted_angle = float((component_areas * angles[np.asarray(component, dtype=np.int64)]).sum()) / max(area, 1e-12)
         x_fraction = x_span / length
         y_fraction = y_span / width
         outlet_fraction = (component_bounds.maximum[0] - bounds.minimum[0]) / length
@@ -359,25 +705,27 @@ def _aero_feature_result(candidates: list[_AeroFeatureCandidate]) -> dict[str, o
 
 
 def report_for_triangles(path: Path, triangles: list[Triangle], stl_format: str) -> StlReport:
-    bounds = _bounds(triangles)
-    unique_vertices = {_quantize_vertex(v) for triangle in triangles for v in triangle}
-    areas = [_triangle_area(triangle) for triangle in triangles]
-    degenerate_count = sum(1 for area in areas if area <= 1e-12)
-    edge_counts = _edge_counts(triangles)
-    open_edges = sum(1 for count in edge_counts.values() if count == 1)
-    non_manifold_edges = sum(1 for count in edge_counts.values() if count > 2)
-    surface_area = sum(areas)
-    projected_areas = _projected_areas(triangles, areas)
-    silhouette_projected_areas = silhouette_projected_areas_for_triangles(triangles)
-    volume = abs(sum(_signed_tetra_volume(triangle) for triangle in triangles))
+    return _report_for_array(path, _as_array(triangles), stl_format)
+
+
+def _report_for_array(path: Path, array: np.ndarray, stl_format: str) -> StlReport:
+    bounds = _bounds_array(array)
+    unique_vertices = _unique_vertex_count(array)
+    areas = _triangle_areas(array)
+    degenerate_count = int(np.count_nonzero(areas <= 1e-12))
+    open_edges, non_manifold_edges = _edge_open_non_manifold(array)
+    surface_area = float(areas.sum())
+    projected_areas = _projected_areas_array(array, areas)
+    silhouette_projected_areas = silhouette_projected_areas_for_triangles(array)
+    volume = _volume_array(array)
     warnings = _warnings(bounds, open_edges, non_manifold_edges, degenerate_count)
-    alignment_suggestion = _principal_axis_alignment(triangles, areas, bounds)
+    alignment_suggestion = _principal_axis_alignment(array, areas, bounds)
 
     return StlReport(
         path=str(path),
         format=stl_format,
-        triangle_count=len(triangles),
-        unique_vertex_count=len(unique_vertices),
+        triangle_count=len(array),
+        unique_vertex_count=unique_vertices,
         bounds=bounds,
         surface_area=surface_area,
         projected_areas=projected_areas,
@@ -392,42 +740,33 @@ def report_for_triangles(path: Path, triangles: list[Triangle], stl_format: str)
 
 
 def _principal_axis_alignment(
-    triangles: list[Triangle],
-    areas: list[float],
+    array: np.ndarray,
+    areas: np.ndarray,
     bounds: Bounds,
 ) -> dict[str, object] | None:
     """Fit a vehicle-like length/width/height frame to the STL surface."""
-    total_area = sum(area for area in areas if area > 1e-12)
+    valid = areas > 1e-12
+    total_area = float(areas[valid].sum())
     if total_area <= 1e-12:
         return None
 
-    first = [0.0, 0.0, 0.0]
-    second = [[0.0, 0.0, 0.0] for _ in range(3)]
-    for triangle, area in zip(triangles, areas):
-        if area <= 1e-12:
-            continue
-        vertex_sum = [sum(vertex[axis] for vertex in triangle) for axis in range(3)]
-        for row in range(3):
-            first[row] += area * vertex_sum[row] / 3.0
-            for column in range(3):
-                diagonal_sum = sum(vertex[row] * vertex[column] for vertex in triangle)
-                second[row][column] += area * (
-                    vertex_sum[row] * vertex_sum[column] + diagonal_sum
-                ) / 12.0
+    triangles = array[valid]
+    weights = areas[valid]
+    vertex_sum = triangles.sum(axis=1)  # (n, 3)
+    first = (weights[:, None] * vertex_sum / 3.0).sum(axis=0)
+    diagonal_sum = np.einsum("nij,nik->njk", triangles, triangles)  # (n, 3, 3)
+    second = (
+        weights[:, None, None]
+        * (
+            vertex_sum[:, :, None] * vertex_sum[:, None, :]
+            + diagonal_sum
+        )
+        / 12.0
+    ).sum(axis=0)
 
-    center: Vector = (
-        first[0] / total_area,
-        first[1] / total_area,
-        first[2] / total_area,
-    )
-    covariance = [
-        [
-            second[row][column] / total_area - center[row] * center[column]
-            for column in range(3)
-        ]
-        for row in range(3)
-    ]
-    eigenpairs = _symmetric_eigenpairs(covariance)
+    center = first / total_area
+    covariance = second / total_area - np.outer(center, center)
+    eigenpairs = _symmetric_eigenpairs(covariance.tolist())
     if not eigenpairs or eigenpairs[0][0] <= 1e-16:
         return None
 
@@ -442,23 +781,15 @@ def _principal_axis_alignment(
 
     rotation = (length_axis, width_axis, up_axis)
     rotation_degrees = _rotation_matrix_to_euler_degrees(rotation)
-    aligned_min = [math.inf, math.inf, math.inf]
-    aligned_max = [-math.inf, -math.inf, -math.inf]
-    for triangle in triangles:
-        for vertex in triangle:
-            relative: Vector = (
-                vertex[0] - center[0],
-                vertex[1] - center[1],
-                vertex[2] - center[2],
-            )
-            for axis, basis_axis in enumerate(rotation):
-                coordinate = _dot(relative, basis_axis)
-                aligned_min[axis] = min(aligned_min[axis], coordinate)
-                aligned_max[axis] = max(aligned_max[axis], coordinate)
+    rotation_array = np.asarray(rotation, dtype=np.float64)
+    relative = array.reshape(-1, 3) - center
+    aligned = relative @ rotation_array.T
+    aligned_min = aligned.min(axis=0)
+    aligned_max = aligned.max(axis=0)
     aligned_dimensions: Vector = (
-        aligned_max[0] - aligned_min[0],
-        aligned_max[1] - aligned_min[1],
-        aligned_max[2] - aligned_min[2],
+        float(aligned_max[0] - aligned_min[0]),
+        float(aligned_max[1] - aligned_min[1]),
+        float(aligned_max[2] - aligned_min[2]),
     )
 
     eigenvalues = [max(pair[0], 1e-16) for pair in eigenpairs]
@@ -613,9 +944,13 @@ def transformed_report(
     translation: Vector = (0.0, 0.0, 0.0),
     rotation_center: Vector | None = None,
 ) -> StlReport:
-    triangles, stl_format = read_stl_triangles(source_path)
-    transformed = transform_triangles(
-        triangles,
+    if not source_path.exists():
+        raise FileNotFoundError(source_path)
+    if source_path.suffix.lower() != ".stl":
+        raise ValueError(f"Only STL files are supported right now: {source_path}")
+    array, stl_format = _read_stl_array(source_path)
+    transformed = _transform_array(
+        array,
         scale=scale,
         source_flow_direction=source_flow_direction,
         source_up_direction=source_up_direction,
@@ -624,11 +959,109 @@ def transformed_report(
         translation=translation,
         rotation_center=rotation_center,
     )
-    return report_for_triangles(source_path, transformed, stl_format)
+    return _report_for_array(source_path, transformed, stl_format)
 
 
 def write_scaled_ascii_stl(source_path: Path, target_path: Path, scale: float) -> None:
     write_transformed_ascii_stl(source_path, target_path, scale=scale)
+
+
+def _euler_matrix(rotation_radians: Vector) -> np.ndarray:
+    rx, ry, rz = rotation_radians
+    cos_x, sin_x = math.cos(rx), math.sin(rx)
+    cos_y, sin_y = math.cos(ry), math.sin(ry)
+    cos_z, sin_z = math.cos(rz), math.sin(rz)
+    rotate_x = np.array(
+        ((1.0, 0.0, 0.0), (0.0, cos_x, -sin_x), (0.0, sin_x, cos_x)),
+        dtype=np.float64,
+    )
+    rotate_y = np.array(
+        ((cos_y, 0.0, sin_y), (0.0, 1.0, 0.0), (-sin_y, 0.0, cos_y)),
+        dtype=np.float64,
+    )
+    rotate_z = np.array(
+        ((cos_z, -sin_z, 0.0), (sin_z, cos_z, 0.0), (0.0, 0.0, 1.0)),
+        dtype=np.float64,
+    )
+    return rotate_z @ rotate_y @ rotate_x
+
+
+def _basis_matrix(
+    source_flow_direction: str,
+    source_up_direction: str,
+    target_flow_axis: str,
+) -> np.ndarray:
+    source_flow, source_side, source_up, target_flow, target_side, target_up = _orientation_basis(
+        source_flow_direction, source_up_direction, target_flow_axis
+    )
+    return (
+        np.outer(target_flow, source_flow)
+        + np.outer(target_side, source_side)
+        + np.outer(target_up, source_up)
+    )
+
+
+def _transform_affine(
+    *,
+    scale: float,
+    source_flow_direction: str,
+    source_up_direction: str,
+    target_flow_axis: str,
+    rotation_degrees: Vector,
+    translation: Vector,
+    rotation_center: Vector,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the (matrix, offset) pair for the shared transform contract."""
+    factor = float(scale)
+    if not math.isfinite(factor) or factor <= 0:
+        raise ValueError("Geometry scale must be a finite positive value.")
+    center = _finite_vector(rotation_center, "Rotation center")
+    offset = _finite_vector(translation, "Translation")
+    rotation = _finite_vector(rotation_degrees, "Rotation")
+    rotation_radians: Vector = (
+        math.radians(rotation[0]),
+        math.radians(rotation[1]),
+        math.radians(rotation[2]),
+    )
+    euler = _euler_matrix(rotation_radians)
+    basis = _basis_matrix(source_flow_direction, source_up_direction, target_flow_axis)
+    matrix = factor * (basis @ euler)
+    center_array = np.asarray(center, dtype=np.float64)
+    shift = factor * (basis @ center_array) + np.asarray(offset, dtype=np.float64)
+    return matrix, shift - matrix @ center_array
+
+
+def _apply_affine(vertices: np.ndarray, matrix: np.ndarray, offset: np.ndarray) -> np.ndarray:
+    return vertices @ matrix.T + offset
+
+
+def _transform_array(
+    array: np.ndarray,
+    scale: float = 1.0,
+    source_flow_direction: str = "+x",
+    source_up_direction: str = "+z",
+    target_flow_axis: str = "x",
+    rotation_degrees: Vector = (0.0, 0.0, 0.0),
+    translation: Vector = (0.0, 0.0, 0.0),
+    rotation_center: Vector | None = None,
+) -> np.ndarray:
+    center = (
+        _array_center(array)
+        if rotation_center is None
+        else _finite_vector(rotation_center, "Rotation center")
+    )
+    matrix, offset = _transform_affine(
+        scale=scale,
+        source_flow_direction=source_flow_direction,
+        source_up_direction=source_up_direction,
+        target_flow_axis=target_flow_axis,
+        rotation_degrees=rotation_degrees,
+        translation=translation,
+        rotation_center=center,
+    )
+    shape = array.shape
+    transformed = _apply_affine(array.reshape(-1, 3), matrix, offset)
+    return transformed.reshape(shape)
 
 
 def write_transformed_binary_stl(
@@ -642,9 +1075,13 @@ def write_transformed_binary_stl(
     translation: Vector = (0.0, 0.0, 0.0),
     rotation_center: Vector | None = None,
 ) -> None:
-    triangles, _ = read_stl_triangles(source_path)
-    transformed = transform_triangles(
-        triangles,
+    if not source_path.exists():
+        raise FileNotFoundError(source_path)
+    if source_path.suffix.lower() != ".stl":
+        raise ValueError(f"Only STL files are supported right now: {source_path}")
+    array, _ = _read_stl_array(source_path)
+    transformed = _transform_array(
+        array,
         scale=scale,
         source_flow_direction=source_flow_direction,
         source_up_direction=source_up_direction,
@@ -653,7 +1090,7 @@ def write_transformed_binary_stl(
         translation=translation,
         rotation_center=rotation_center,
     )
-    write_binary_stl_triangles(target_path, transformed, header="AeroLab transformed body in solver meters")
+    _write_binary_stl_array(target_path, transformed, header="AeroLab transformed body in solver meters")
 
 
 def write_binary_stl_triangles(
@@ -661,16 +1098,25 @@ def write_binary_stl_triangles(
     triangles: Iterable[Triangle],
     header: str = "AeroLab binary STL",
 ) -> None:
-    triangle_list = list(triangles)
+    _write_binary_stl_array(target_path, _as_array(triangles), header=header)
+
+
+def _write_binary_stl_array(
+    target_path: Path,
+    array: np.ndarray,
+    header: str = "AeroLab binary STL",
+) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     header_bytes = header.encode("ascii", errors="replace")[:80].ljust(80, b" ")
+    records = np.zeros(len(array), dtype=_BINARY_STL_DTYPE)
+    normals = _triangle_normals(array) if len(array) else np.zeros((0, 3))
+    records["normal"] = normals.astype(np.float32)
+    records["vertices"] = array.astype(np.float32)
+    records["attribute"] = 0
     with target_path.open("wb") as stream:
         stream.write(header_bytes)
-        stream.write(struct.pack("<I", len(triangle_list)))
-        for triangle in triangle_list:
-            normal = _normal(triangle)
-            values = normal + triangle[0] + triangle[1] + triangle[2]
-            stream.write(struct.pack("<12fH", *values, 0))
+        stream.write(struct.pack("<I", len(array)))
+        records.tofile(stream)
 
 
 def write_transformed_ascii_stl(
@@ -684,9 +1130,13 @@ def write_transformed_ascii_stl(
     translation: Vector = (0.0, 0.0, 0.0),
     rotation_center: Vector | None = None,
 ) -> None:
-    triangles, _ = read_stl_triangles(source_path)
-    transformed = transform_triangles(
-        triangles,
+    if not source_path.exists():
+        raise FileNotFoundError(source_path)
+    if source_path.suffix.lower() != ".stl":
+        raise ValueError(f"Only STL files are supported right now: {source_path}")
+    array, _ = _read_stl_array(source_path)
+    transformed = _transform_array(
+        array,
         scale=scale,
         source_flow_direction=source_flow_direction,
         source_up_direction=source_up_direction,
@@ -696,20 +1146,18 @@ def write_transformed_ascii_stl(
         rotation_center=rotation_center,
     )
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    with target_path.open("w", encoding="utf-8") as f:
-        f.write("solid body_meters\n")
-        for triangle in transformed:
-            normal = _normal(triangle)
-            f.write(f"  facet normal {normal[0]:.9g} {normal[1]:.9g} {normal[2]:.9g}\n")
-            f.write("    outer loop\n")
-            for vertex in triangle:
-                f.write(
-                    "      vertex "
-                    f"{vertex[0]:.9g} {vertex[1]:.9g} {vertex[2]:.9g}\n"
-                )
-            f.write("    endloop\n")
-            f.write("  endfacet\n")
-        f.write("endsolid body_meters\n")
+    normals = _triangle_normals(transformed)
+    lines = ["solid body_meters"]
+    append = lines.append
+    for triangle, normal in zip(transformed, normals, strict=False):
+        append(f"  facet normal {normal[0]:.9g} {normal[1]:.9g} {normal[2]:.9g}")
+        append("    outer loop")
+        for vertex in triangle:
+            append(f"      vertex {vertex[0]:.9g} {vertex[1]:.9g} {vertex[2]:.9g}")
+        append("    endloop")
+        append("  endfacet")
+    append("endsolid body_meters")
+    target_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def transform_triangles(
@@ -722,26 +1170,18 @@ def transform_triangles(
     translation: Vector = (0.0, 0.0, 0.0),
     rotation_center: Vector | None = None,
 ) -> list[Triangle]:
-    center = _triangle_center(triangles) if rotation_center is None else _finite_vector(
-        rotation_center,
-        "Rotation center",
+    array = _as_array(triangles)
+    transformed = _transform_array(
+        array,
+        scale=scale,
+        source_flow_direction=source_flow_direction,
+        source_up_direction=source_up_direction,
+        target_flow_axis=target_flow_axis,
+        rotation_degrees=rotation_degrees,
+        translation=translation,
+        rotation_center=rotation_center,
     )
-    return [
-        tuple(
-            transform_point(
-                vertex,
-                scale=scale,
-                source_flow_direction=source_flow_direction,
-                source_up_direction=source_up_direction,
-                target_flow_axis=target_flow_axis,
-                rotation_degrees=rotation_degrees,
-                translation=translation,
-                rotation_center=center,
-            )
-            for vertex in triangle
-        )  # type: ignore[misc]
-        for triangle in triangles
-    ]
+    return _as_tuples(transformed)
 
 
 def transform_point(
@@ -758,27 +1198,17 @@ def transform_point(
     """Transform a source-frame point with the same contract used for solver STL geometry."""
     source_point = _finite_vector(point, "Point")
     center = _finite_vector(rotation_center, "Rotation center")
-    offset = _finite_vector(translation, "Translation")
-    factor = float(scale)
-    if not math.isfinite(factor) or factor <= 0:
-        raise ValueError("Geometry scale must be a finite positive value.")
-    rotation = _finite_vector(rotation_degrees, "Rotation")
-    rotation_radians: Vector = (
-        math.radians(rotation[0]),
-        math.radians(rotation[1]),
-        math.radians(rotation[2]),
+    matrix, offset = _transform_affine(
+        scale=scale,
+        source_flow_direction=source_flow_direction,
+        source_up_direction=source_up_direction,
+        target_flow_axis=target_flow_axis,
+        rotation_degrees=rotation_degrees,
+        translation=translation,
+        rotation_center=center,
     )
-    basis = _orientation_basis(source_flow_direction, source_up_direction, target_flow_axis)
-    transformed = _transform_vertex(
-        _rotate_vertex(source_point, center, rotation_radians),
-        basis,
-        factor,
-    )
-    return (
-        transformed[0] + offset[0],
-        transformed[1] + offset[1],
-        transformed[2] + offset[2],
-    )
+    result = _apply_affine(np.asarray([source_point], dtype=np.float64), matrix, offset)[0]
+    return (float(result[0]), float(result[1]), float(result[2]))
 
 
 def transform_direction(
@@ -797,9 +1227,10 @@ def transform_direction(
         math.radians(rotation[1]),
         math.radians(rotation[2]),
     )
-    rotated = _rotate_vertex(source_direction, (0.0, 0.0, 0.0), rotation_radians)
-    basis = _orientation_basis(source_flow_direction, source_up_direction, target_flow_axis)
-    return _normalize(_transform_vertex(rotated, basis, 1.0))
+    rotated = _euler_matrix(rotation_radians) @ np.asarray(source_direction, dtype=np.float64)
+    basis = _basis_matrix(source_flow_direction, source_up_direction, target_flow_axis)
+    result = basis @ rotated
+    return _normalize((float(result[0]), float(result[1]), float(result[2])))
 
 
 def _coerce_float(value: object) -> float:
@@ -860,24 +1291,13 @@ def translated_report(report: StlReport, translation: Vector) -> StlReport:
     )
 
 
-def _triangle_center(triangles: list[Triangle]) -> Vector:
-    bounds = _bounds(triangles)
-    return tuple((bounds.minimum[index] + bounds.maximum[index]) / 2.0 for index in range(3))  # type: ignore[return-value]
-
-
-def _rotate_vertex(vertex: Vector, center: Vector, rotation_radians: Vector) -> Vector:
-    x = vertex[0] - center[0]
-    y = vertex[1] - center[1]
-    z = vertex[2] - center[2]
-    rx, ry, rz = rotation_radians
-
-    cos_x, sin_x = math.cos(rx), math.sin(rx)
-    y, z = y * cos_x - z * sin_x, y * sin_x + z * cos_x
-    cos_y, sin_y = math.cos(ry), math.sin(ry)
-    x, z = x * cos_y + z * sin_y, -x * sin_y + z * cos_y
-    cos_z, sin_z = math.cos(rz), math.sin(rz)
-    x, y = x * cos_z - y * sin_z, x * sin_z + y * cos_z
-    return (x + center[0], y + center[1], z + center[2])
+def _array_center(array: np.ndarray) -> Vector:
+    bounds = _bounds_array(array)
+    return (
+        (bounds.minimum[0] + bounds.maximum[0]) / 2.0,
+        (bounds.minimum[1] + bounds.maximum[1]) / 2.0,
+        (bounds.minimum[2] + bounds.maximum[2]) / 2.0,
+    )
 
 
 def _orientation_basis(
@@ -897,22 +1317,6 @@ def _orientation_basis(
     return (source_flow, source_side, source_up, target_flow, target_side, target_up)
 
 
-def _transform_vertex(
-    vertex: Vector,
-    basis: tuple[Vector, Vector, Vector, Vector, Vector, Vector],
-    scale: float,
-) -> Vector:
-    source_flow, source_side, source_up, target_flow, target_side, target_up = basis
-    flow_component = _dot(vertex, source_flow) * scale
-    side_component = _dot(vertex, source_side) * scale
-    up_component = _dot(vertex, source_up) * scale
-    return (
-        flow_component * target_flow[0] + side_component * target_side[0] + up_component * target_up[0],
-        flow_component * target_flow[1] + side_component * target_side[1] + up_component * target_up[1],
-        flow_component * target_flow[2] + side_component * target_side[2] + up_component * target_up[2],
-    )
-
-
 def _signed_axis(axis: str) -> Vector:
     key = axis.strip().lower()
     if key in SIGNED_AXES:
@@ -930,297 +1334,62 @@ def mesh_preview(
     source_up_direction: str | None = None,
     target_flow_axis: str = "x",
 ) -> dict[str, object]:
-    triangles, stl_format = read_stl_triangles(path)
+    array, stl_format = _read_stl_array(path)
     if source_flow_direction or source_up_direction:
         if not source_flow_direction or not source_up_direction:
             raise ValueError("Both source flow and source up are required for an oriented preview.")
-        triangles = transform_triangles(
-            triangles,
+        array = _transform_array(
+            array,
             source_flow_direction=source_flow_direction,
             source_up_direction=source_up_direction,
             target_flow_axis=target_flow_axis,
         )
-    bounds = _bounds(triangles)
-    center = (
-        (bounds.minimum[0] + bounds.maximum[0]) / 2.0,
-        (bounds.minimum[1] + bounds.maximum[1]) / 2.0,
-        (bounds.minimum[2] + bounds.maximum[2]) / 2.0,
+    bounds = _bounds_array(array)
+    center = np.asarray(
+        (
+            (bounds.minimum[0] + bounds.maximum[0]) / 2.0,
+            (bounds.minimum[1] + bounds.maximum[1]) / 2.0,
+            (bounds.minimum[2] + bounds.maximum[2]) / 2.0,
+        ),
+        dtype=np.float64,
     )
     max_dim = max(bounds.dimensions) or 1.0
     preview_scale = 3.8 / max_dim
-    if len(triangles) <= max_triangles:
+    triangle_total = len(array)
+    if triangle_total <= max_triangles:
         sample_step = 1.0
-        sampled = triangles
+        sampled = array
     else:
-        sample_step = len(triangles) / max_triangles
-        sampled = [
-            triangles[min(len(triangles) - 1, math.floor(index * sample_step))]
-            for index in range(max_triangles)
-        ]
-    normalized = []
+        sample_step = triangle_total / max_triangles
+        indices = np.minimum(
+            (np.arange(max_triangles) * sample_step).astype(np.int64),
+            triangle_total - 1,
+        )
+        sampled = array[indices]
 
-    for triangle in sampled:
-        normal = _normal(triangle)
+    normals = _triangle_normals(sampled)
+    normalized = []
+    scaled = (sampled - center) * preview_scale
+    for triangle, normal in zip(scaled, normals, strict=False):
         normalized.append(
             {
-                "v": [
-                    round((vertex[0] - center[0]) * preview_scale, 6)
-                    if axis == 0
-                    else round((vertex[1] - center[1]) * preview_scale, 6)
-                    if axis == 1
-                    else round((vertex[2] - center[2]) * preview_scale, 6)
-                    for vertex in triangle
-                    for axis in range(3)
-                ],
-                "n": [round(value, 6) for value in normal],
+                "v": [round(float(value), 6) for value in triangle.reshape(-1)],
+                "n": [round(float(value), 6) for value in normal],
             }
         )
 
     return {
         "format": stl_format,
-        "triangleCount": len(triangles),
+        "triangleCount": triangle_total,
         "sampledTriangleCount": len(normalized),
         "sampleStep": sample_step,
         "previewTriangleLimit": max_triangles,
-        "isComplete": len(normalized) == len(triangles),
+        "isComplete": len(normalized) == triangle_total,
         "bounds": bounds.to_dict(),
-        "normalizedCenter": [round(value, 9) for value in center],
+        "normalizedCenter": [round(float(value), 9) for value in center],
         "normalizedScale": preview_scale,
         "triangles": normalized,
     }
-
-
-def _load_stl(data: bytes) -> tuple[list[Triangle], str]:
-    if _looks_like_binary_stl(data):
-        return _load_binary_stl(data), "binary"
-    return _load_ascii_stl(data), "ascii"
-
-
-def _looks_like_binary_stl(data: bytes) -> bool:
-    if len(data) < 84:
-        return False
-    triangle_count = struct.unpack("<I", data[80:84])[0]
-    expected_size = 84 + triangle_count * 50
-    return expected_size == len(data)
-
-
-def _load_binary_stl(data: bytes) -> list[Triangle]:
-    triangle_count = struct.unpack("<I", data[80:84])[0]
-    triangles: list[Triangle] = []
-    offset = 84
-    for _ in range(triangle_count):
-        chunk = data[offset : offset + 50]
-        values = struct.unpack("<12fH", chunk)
-        vertices = values[3:12]
-        triangles.append(
-            (
-                (vertices[0], vertices[1], vertices[2]),
-                (vertices[3], vertices[4], vertices[5]),
-                (vertices[6], vertices[7], vertices[8]),
-            )
-        )
-        offset += 50
-    return triangles
-
-
-def _load_ascii_stl(data: bytes) -> list[Triangle]:
-    text = data.decode("utf-8", errors="ignore")
-    vertices: list[Vector] = []
-    triangles: list[Triangle] = []
-
-    for line in text.splitlines():
-        parts = line.strip().split()
-        if len(parts) == 4 and parts[0].lower() == "vertex":
-            vertex = (float(parts[1]), float(parts[2]), float(parts[3]))
-            vertices.append(vertex)
-            if len(vertices) == 3:
-                triangles.append((vertices[0], vertices[1], vertices[2]))
-                vertices = []
-
-    return triangles
-
-
-def _bounds(triangles: Iterable[Triangle]) -> Bounds:
-    vertices = [vertex for triangle in triangles for vertex in triangle]
-    return Bounds(
-        minimum=(
-            min(v[0] for v in vertices),
-            min(v[1] for v in vertices),
-            min(v[2] for v in vertices),
-        ),
-        maximum=(
-            max(v[0] for v in vertices),
-            max(v[1] for v in vertices),
-            max(v[2] for v in vertices),
-        ),
-    )
-
-
-def _edge_counts(triangles: Iterable[Triangle]) -> Counter[tuple[Vector, Vector]]:
-    counts: Counter[tuple[Vector, Vector]] = Counter()
-    for triangle in triangles:
-        vertices = [_quantize_vertex(v) for v in triangle]
-        edges = (
-            _edge_key(vertices[0], vertices[1]),
-            _edge_key(vertices[1], vertices[2]),
-            _edge_key(vertices[2], vertices[0]),
-        )
-        counts.update(edges)
-    return counts
-
-
-def _edge_key(a: Vector, b: Vector) -> tuple[Vector, Vector]:
-    return (a, b) if a <= b else (b, a)
-
-
-def _quantize_vertex(vertex: Vector) -> Vector:
-    return (round(vertex[0], 9), round(vertex[1], 9), round(vertex[2], 9))
-
-
-def _triangle_area(triangle: Triangle) -> float:
-    a, b, c = triangle
-    ab = _sub(b, a)
-    ac = _sub(c, a)
-    return 0.5 * _length(_cross(ab, ac))
-
-
-def _projected_areas(triangles: list[Triangle], areas: list[float]) -> ProjectedAreas:
-    projected = [0.0, 0.0, 0.0]
-    for triangle, area in zip(triangles, areas):
-        normal = _normal(triangle)
-        for axis in range(3):
-            projected[axis] += abs(normal[axis]) * area * 0.5
-    return ProjectedAreas(x=projected[0], y=projected[1], z=projected[2])
-
-
-def silhouette_projected_areas_for_triangles(
-    triangles: Iterable[Triangle],
-    scanline_count: int | None = None,
-) -> ProjectedAreas:
-    """Estimate the visible projected union without filling concave model gaps."""
-    triangle_list = list(triangles)
-    if not triangle_list:
-        return ProjectedAreas(x=0.0, y=0.0, z=0.0)
-    if scanline_count is None:
-        scanline_count = _silhouette_scanline_count(len(triangle_list))
-    scanline_count = max(128, int(scanline_count))
-    planes = ((1, 2), (0, 2), (0, 1))
-    areas = [
-        _projected_triangle_union_area(triangle_list, first, second, scanline_count)
-        for first, second in planes
-    ]
-    return ProjectedAreas(x=areas[0], y=areas[1], z=areas[2])
-
-
-def silhouette_projected_area_for_axis(
-    triangles: Iterable[Triangle],
-    axis: str | int,
-    scanline_count: int | None = None,
-) -> float:
-    triangle_list = list(triangles)
-    if not triangle_list:
-        return 0.0
-    axis_index = {"x": 0, "y": 1, "z": 2}.get(axis, axis) if isinstance(axis, str) else axis
-    if axis_index not in (0, 1, 2):
-        raise ValueError(f"Unsupported silhouette axis: {axis}")
-    if scanline_count is None:
-        scanline_count = _silhouette_scanline_count(len(triangle_list))
-    planes = ((1, 2), (0, 2), (0, 1))
-    first, second = planes[int(axis_index)]
-    return _projected_triangle_union_area(
-        triangle_list,
-        first,
-        second,
-        max(128, int(scanline_count)),
-    )
-
-
-def _silhouette_scanline_count(triangle_count: int) -> int:
-    if triangle_count <= 100_000:
-        return 512
-    if triangle_count <= 500_000:
-        return 384
-    return 256
-
-
-def _projected_triangle_union_area(
-    triangles: list[Triangle],
-    first_axis: int,
-    second_axis: int,
-    scanline_count: int,
-) -> float:
-    projected = [
-        tuple((vertex[first_axis], vertex[second_axis]) for vertex in triangle)
-        for triangle in triangles
-    ]
-    second_min = min(point[1] for triangle in projected for point in triangle)
-    second_max = max(point[1] for triangle in projected for point in triangle)
-    span = second_max - second_min
-    if span <= 1e-15:
-        return 0.0
-    step = span / float(scanline_count)
-    rows: list[list[tuple[float, float]]] = [[] for _ in range(scanline_count)]
-    epsilon = max(span, 1.0) * 1e-13
-
-    for triangle in projected:
-        area_twice = (
-            (triangle[1][0] - triangle[0][0]) * (triangle[2][1] - triangle[0][1])
-            - (triangle[1][1] - triangle[0][1]) * (triangle[2][0] - triangle[0][0])
-        )
-        if abs(area_twice) <= epsilon * epsilon:
-            continue
-        low = min(point[1] for point in triangle)
-        high = max(point[1] for point in triangle)
-        first_row = max(0, int(math.ceil((low - second_min) / step - 0.5 - 1e-12)))
-        stop_row = min(
-            scanline_count,
-            int(math.ceil((high - second_min) / step - 0.5 - 1e-12)),
-        )
-        for row_index in range(first_row, stop_row):
-            coordinate = second_min + (row_index + 0.5) * step
-            crossings: list[float] = []
-            for edge_index in range(3):
-                edge_start = triangle[edge_index]
-                edge_end = triangle[(edge_index + 1) % 3]
-                edge_low = min(edge_start[1], edge_end[1])
-                edge_high = max(edge_start[1], edge_end[1])
-                if edge_high - edge_low <= epsilon or not (edge_low <= coordinate < edge_high):
-                    continue
-                fraction = (coordinate - edge_start[1]) / (edge_end[1] - edge_start[1])
-                crossings.append(edge_start[0] + fraction * (edge_end[0] - edge_start[0]))
-            if len(crossings) >= 2:
-                interval = (min(crossings), max(crossings))
-                if interval[1] - interval[0] > epsilon:
-                    rows[row_index].append(interval)
-
-    integrated_width = 0.0
-    for intervals in rows:
-        if not intervals:
-            continue
-        intervals.sort()
-        current_start, current_end = intervals[0]
-        for interval_start, interval_end in intervals[1:]:
-            if interval_start <= current_end + epsilon:
-                current_end = max(current_end, interval_end)
-            else:
-                integrated_width += current_end - current_start
-                current_start, current_end = interval_start, interval_end
-        integrated_width += current_end - current_start
-    return integrated_width * step
-
-
-def _normal(triangle: Triangle) -> Vector:
-    a, b, c = triangle
-    normal = _cross(_sub(b, a), _sub(c, a))
-    length = _length(normal)
-    if length <= 1e-12:
-        return (0.0, 0.0, 0.0)
-    return (normal[0] / length, normal[1] / length, normal[2] / length)
-
-
-def _signed_tetra_volume(triangle: Triangle) -> float:
-    a, b, c = triangle
-    return _dot(a, _cross(b, c)) / 6.0
 
 
 def _readiness(
@@ -1327,10 +1496,6 @@ def _warnings(
     return warnings
 
 
-def _sub(a: Vector, b: Vector) -> Vector:
-    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
-
-
 def _cross(a: Vector, b: Vector) -> Vector:
     return (
         a[1] * b[2] - a[2] * b[1],
@@ -1341,7 +1506,3 @@ def _cross(a: Vector, b: Vector) -> Vector:
 
 def _dot(a: Vector, b: Vector) -> float:
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-
-
-def _length(a: Vector) -> float:
-    return math.sqrt(_dot(a, a))
